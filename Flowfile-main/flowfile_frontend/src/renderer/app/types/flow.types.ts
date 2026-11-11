@@ -1,0 +1,429 @@
+// Flow-related TypeScript interfaces and types
+
+import type { NodeResult } from "./node.types";
+import type { NodeConnection, NodePromise } from "./canvas.types";
+import type { Position } from "@vue-flow/core";
+
+// Flow Execution Types
+
+export type ExecutionMode = "Development" | "Performance";
+// "auto" or a backend id; core answers "local" or "remote" with the compute protocol off.
+export type ExecutionLocation = string;
+
+// Flow Parameters
+
+export type FlowParamType = "string" | "integer" | "float" | "boolean" | "enum";
+
+export interface FlowParameter {
+  name: string;
+  default_value: string;
+  description: string;
+  // Missing type means "string" (pre-typed-parameters flows).
+  type?: FlowParamType;
+  enum_values?: string[] | null;
+}
+
+// Flow Settings
+
+export interface FlowSettings {
+  flow_id: number;
+  name: string;
+  description?: string;
+  source_registration_id?: number | null;
+  save_location?: string;
+  auto_save: boolean;
+  modified_on?: number;
+  path?: string;
+  execution_mode: ExecutionMode;
+  execution_location: ExecutionLocation;
+  show_detailed_progress: boolean;
+  show_edge_labels: boolean;
+  is_running: boolean;
+  is_canceled: boolean;
+  max_parallel_workers: number;
+  parameters?: FlowParameter[];
+  has_unsaved_changes?: boolean;
+  display_name?: string | null;
+  validate_settings: boolean;
+}
+
+// Settings Validation (backend static check for missing column references)
+
+export interface SettingsValidationIssue {
+  input_handle: "main" | "left" | "right";
+  missing_columns: string[];
+  message: string;
+  kind: "missing_columns" | "invalid_expression" | "duplicate_output" | "invalid_path";
+}
+
+export interface NodeSettingsValidation {
+  node_id: number;
+  issues: SettingsValidationIssue[];
+}
+
+export interface FlowSettingsValidation {
+  enabled: boolean;
+  nodes: NodeSettingsValidation[];
+}
+
+// Where a run would place each node now (GET /flow/placement); `available` is false with the protocol off.
+export interface PlacementFallback {
+  node_id: number;
+  backend_id: string;
+  fallback_id: string;
+  reason: string;
+}
+
+export interface PlacementRefusal {
+  node_id: number;
+  backend_id: string;
+  reason: string;
+  remedy?: string | null;
+}
+
+export interface PlacementPreview {
+  available: boolean;
+  assignment: Record<number, string>;
+  fallbacks: PlacementFallback[];
+  refusals: PlacementRefusal[];
+  boundaries: [number, number][];
+}
+
+// Run Information
+
+export interface RunInformation {
+  flow_id: number;
+  start_time: string | null; // datetime in ISO format; null when the flow never ran
+  end_time: string | null; // datetime in ISO format
+  success: boolean | null; // null while the flow is still running
+  is_running: boolean;
+  execution_mode: ExecutionMode | null;
+  nodes_completed: number;
+  number_of_nodes: number;
+  node_step_result: NodeResult[];
+  run_type: "fetch_one" | "full_run" | "init";
+  // The edges the run's placement put between two backends; absent from an older core.
+  boundaries?: [number, number][];
+}
+
+export interface RunInformationDictionary {
+  [flow_id: number]: RunInformation;
+}
+
+// History/Undo-Redo Types
+
+export interface HistoryState {
+  // The flow this state describes; null only for the local default.
+  flow_id: number | null;
+  can_undo: boolean;
+  can_redo: boolean;
+  undo_description: string | null;
+  redo_description: string | null;
+  undo_count: number;
+  redo_count: number;
+  // Core's monotonic change counter for the flow; the change feed reports moves of it.
+  revision?: number;
+}
+
+export interface UndoRedoResult {
+  success: boolean;
+  action_description: string | null;
+  error_message: string | null;
+  history: HistoryState | null;
+}
+
+export interface OperationResponse {
+  success: boolean;
+  message: string | null;
+  history: HistoryState;
+  /** After a save of one node's settings: that node's fingerprint now, the next save's expectation. */
+  settings_fingerprint?: string | null;
+}
+
+// Local File Types
+
+export interface LocalFileInfo {
+  path: string;
+  file_name: string;
+  file_type: string;
+  last_modified_date_timestamp?: number;
+  exists: boolean;
+}
+
+// Node Template Types (for flow designer)
+
+export interface NodeTemplate {
+  name: string;
+  color: string;
+  item: string;
+  input: number;
+  output: number;
+  image: string;
+  multi: boolean;
+  node_group: string;
+  // Display name for dynamic (custom-category) palette groups; null for built-ins.
+  node_group_label?: string | null;
+  prod_ready: boolean;
+  drawer_title: string;
+  drawer_intro: string;
+  custom_node: boolean;
+  // "local" | "kernel" for custom nodes; null for built-ins.
+  execution_environment?: string | null;
+  dependencies?: string[] | null;
+  tags?: string[];
+  output_names?: string[];
+  // Display-only names for the input handles, index i ↔ handle input-${i}.
+  // Rendered as the handle tooltip; the canvas letter stays positional.
+  input_labels?: string[] | null;
+  // Cosmetic: input indices rendered as bottom "parameter" pips instead of
+  // left data handles (gate's control input).
+  control_input_indices?: number[] | null;
+  // True for nodes whose handles come from per-instance input_names/output_names
+  // (run_flow); every handle of such a node accepts exactly one edge.
+  dynamic_inputs?: boolean;
+}
+
+export interface NodeInput extends NodeTemplate {
+  id: number;
+  pos_x: number;
+  pos_y: number;
+  group_id?: number | null;
+  node_reference?: string;
+  // run_flow instances: ["Parameters", ...input_slots]; index i ↔ handle input-${i}.
+  input_names?: string[] | null;
+  // Resolved by core (user text, else auto); seeds the description cache on open.
+  description?: string;
+  is_auto_generated?: boolean;
+}
+
+// Handle Types
+
+export interface NodeHandle {
+  id: string;
+  position: Position;
+  label?: string;
+  title?: string;
+  kind?: "data" | "parameter";
+}
+
+// Input Name Info (for kernel node autocomplete)
+
+export interface InputNameInfo {
+  name: string;
+  source_node_id: number;
+  source_node_type: string;
+}
+
+// Edge Types
+
+export interface EdgeInput {
+  id: string;
+  source: string;
+  target: string;
+  sourceHandle: string;
+  targetHandle: string;
+  label?: string;
+}
+
+// Vue Flow Types
+
+export interface VueFlowInput {
+  node_edges: EdgeInput[];
+  node_inputs: NodeInput[];
+  groups: GroupInput[];
+  comments?: CommentInput[];
+}
+
+// Node Group Types (visual containers; organizational only)
+// Mirror flowfile_core/.../schemas.py field-for-field (no OpenAPI codegen).
+
+// mirrors schemas.GroupColor
+export const GROUP_COLORS = ["slate", "blue", "green", "amber", "rose", "violet", "cyan"] as const;
+export type GroupColor = (typeof GROUP_COLORS)[number];
+
+// mirrors schemas.FlowfileGroup
+export interface GroupInput {
+  id: number;
+  name: string;
+  color?: GroupColor | null;
+  x_position: number;
+  y_position: number;
+  width: number;
+  height: number;
+  collapsed?: boolean;
+  parent_group_id?: number | null;
+}
+
+// VueFlow node `data` payload for a group container node.
+export interface GroupNodeData {
+  id: number;
+  label: string;
+  color?: GroupColor | null;
+  collapsed?: boolean;
+}
+
+// mirrors schemas.CreateGroupRequest
+export interface CreateGroupRequest {
+  node_ids: number[];
+  name?: string;
+  color?: GroupColor | null;
+  x_position?: number | null;
+  y_position?: number | null;
+  width?: number | null;
+  height?: number | null;
+  parent_group_id?: number | null;
+  child_group_ids?: number[];
+  // a batch names the group it creates; must be above every id the flow has held
+  group_id?: number | null;
+}
+
+// mirrors schemas.UpdateGroupRequest
+export interface UpdateGroupRequest {
+  name?: string;
+  color?: GroupColor | null;
+  x_position?: number | null;
+  y_position?: number | null;
+  width?: number | null;
+  height?: number | null;
+  collapsed?: boolean | null;
+  clear_color?: boolean | null;
+}
+
+// mirrors schemas.NodePositionUpdate
+export interface NodePositionUpdate {
+  node_id: number;
+  pos_x: number;
+  pos_y: number;
+}
+
+// mirrors schemas.GroupBoundsUpdate
+export interface GroupBoundsUpdate {
+  group_id: number;
+  x_position: number;
+  y_position: number;
+  width: number;
+  height: number;
+}
+
+// mirrors schemas.CommentBoundsUpdate
+export interface CommentBoundsUpdate {
+  comment_id: number;
+  x_position: number;
+  y_position: number;
+  width: number;
+  height: number;
+}
+
+// mirrors schemas.UpdateLayoutRequest
+export interface UpdateLayoutRequest {
+  node_positions: NodePositionUpdate[];
+  group_bounds: GroupBoundsUpdate[];
+  comment_bounds?: CommentBoundsUpdate[];
+  // false -> apply layout without a new undo entry (fold into a preceding op's snapshot)
+  record_history?: boolean;
+}
+
+// One primitive step of POST /editor/apply_operations/ (mirrors the backend's op union).
+export type GraphOperation =
+  | { op: "add_node"; node_id: number; node_type: string; pos_x: number; pos_y: number }
+  | { op: "update_settings"; node_type: string; settings: Record<string, unknown> }
+  | { op: "delete_node"; node_id: number }
+  | { op: "connect"; connection: NodeConnection }
+  | { op: "delete_connection"; connection: NodeConnection }
+  // Replaces the existing edge in place: A -> node_id (input-0), node_id (output-0) -> B's same slot.
+  | { op: "insert_on_edge"; node_id: number; connection: NodeConnection }
+  | { op: "delete_comment"; comment_id: number }
+  | { op: "update_layout"; layout: UpdateLayoutRequest }
+  | {
+      op: "copy_node";
+      node_id_to_copy_from: number;
+      flow_id_to_copy_from: number;
+      node_promise: NodePromise;
+    };
+
+// mirrors routes.GroupOperationResponse
+export interface GroupOperationResponse extends OperationResponse {
+  group: GroupInput | null;
+}
+
+// Canvas Comment Types (free text notes; organizational only)
+
+// mirrors schemas.FlowfileComment
+export interface CommentInput {
+  id: number;
+  text: string;
+  x_position: number;
+  y_position: number;
+  width: number;
+  height: number;
+}
+
+// VueFlow node `data` payload for a comment node.
+export interface CommentNodeData {
+  id: number;
+  text: string;
+  // open the editor as soon as the node mounts (freshly added comments)
+  autoEdit?: boolean;
+}
+
+// mirrors schemas.CreateCommentRequest
+export interface CreateCommentRequest {
+  text?: string;
+  x_position: number;
+  y_position: number;
+  width?: number | null;
+  height?: number | null;
+}
+
+// mirrors schemas.UpdateCommentRequest
+export interface UpdateCommentRequest {
+  text?: string | null;
+  x_position?: number | null;
+  y_position?: number | null;
+  width?: number | null;
+  height?: number | null;
+}
+
+// mirrors routes.CommentOperationResponse
+export interface CommentOperationResponse extends OperationResponse {
+  comment: CommentInput | null;
+}
+
+// Artifact Visualization Types
+
+export interface ArtifactPublished {
+  name: string;
+  type_name: string;
+  module: string;
+  has_preview?: boolean;
+  preview_mime?: string | null;
+}
+
+export interface ArtifactConsumed {
+  name: string;
+  source_node_id: number | null;
+  type_name: string;
+}
+
+export interface NodeArtifactSummary {
+  published_count: number;
+  consumed_count: number;
+  deleted_count: number;
+  published: ArtifactPublished[];
+  consumed: ArtifactConsumed[];
+  deleted: string[];
+  kernel_id: string;
+}
+
+export interface ArtifactEdge {
+  source: number;
+  target: number;
+  artifact_name: string;
+  artifact_type: string;
+  kernel_id: string;
+}
+
+export interface FlowArtifactData {
+  nodes: Record<string, NodeArtifactSummary>;
+  edges: ArtifactEdge[];
+}

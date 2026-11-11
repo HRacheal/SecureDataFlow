@@ -1,0 +1,39 @@
+# flowfile_core/flowfile_core/configs/__init__.py
+import logging
+import os
+import sys
+from pathlib import Path
+from tempfile import gettempdir
+
+if "FLOWFILE_MODE" not in os.environ:
+    os.environ["FLOWFILE_MODE"] = "electron"
+
+logger = logging.getLogger("PipelineHandler")
+logger.setLevel(logging.INFO)
+logger.propagate = False
+
+if logger.hasHandlers():
+    logger.handlers.clear()
+
+output_stream = None
+if hasattr(sys.stderr, "isatty") and sys.stderr.isatty():
+    output_stream = sys.stderr
+else:
+    # Use __stderr__ for debugger environments (PyDev, PyCharm, etc.)
+    output_stream = sys.__stderr__
+
+console_handler = logging.StreamHandler(output_stream)
+console_handler.setLevel(logging.INFO)
+
+formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+console_handler.setFormatter(formatter)
+
+logger.addHandler(console_handler)
+
+try:
+    log_dir = Path(gettempdir()) / "flowfile_logs"
+    log_dir.mkdir(exist_ok=True)
+except Exception as e:
+    logger.warning(f"Failed to create logs directory: {e}")
+
+logger.debug("Logging system initialized")

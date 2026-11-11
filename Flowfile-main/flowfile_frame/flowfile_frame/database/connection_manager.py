@@ -1,0 +1,197 @@
+"""Database connection management for flowfile_frame.
+
+This module provides functions for managing database connections,
+similar to how cloud_storage/secret_manager.py handles cloud storage connections.
+"""
+
+from pydantic import SecretStr
+
+from flowfile_core.database.connection import get_db_context
+from flowfile_core.flowfile.database_connection_manager.db_connections import (
+    get_database_connection,
+    store_database_connection,
+)
+from flowfile_core.schemas.input_schema import (
+    FullDatabaseConnection,
+    FullDatabaseConnectionInterface,
+)
+from flowfile_frame import _metadata
+from flowfile_frame._identity import current_user_id
+from flowfile_frame.notebook import refuse
+from shared.db_dialects import KNOWN_DIALECT_NAMES, get_dialect_or_generic
+
+
+def get_current_user_id() -> int:
+    """Get the current user ID for database operations.
+
+    Returns:
+        int: The current user ID; see ``_identity.current_user_id``.
+    """
+    return current_user_id()
+
+
+def create_database_connection(
+    connection_name: str,
+    *,
+    database_type: str = "postgresql",
+    host: str | None = None,
+    port: int | None = None,
+    database: str | None = None,
+    username: str | None = None,
+    password: str | SecretStr | None = None,
+    ssl_enabled: bool = False,
+    url: str | None = None,
+) -> FullDatabaseConnection:
+    """Create and store a new database connection.
+
+    Args:
+        connection_name: Unique name for this connection.
+        database_type: Type of database (one of shared.db_dialects.KNOWN_DIALECT_NAMES,
+            e.g. postgresql, mysql, sqlite, duckdb, mssql, denodo).
+        host: Database server hostname.
+        port: Database server port.
+        database: Database name.
+        username: Database username (not needed for file-based types like sqlite/duckdb).
+        password: Database password (not needed for file-based types like sqlite/duckdb).
+        ssl_enabled: Whether to use SSL for the connection.
+        url: Full database URL (overrides other connection parameters).
+
+    Returns:
+        FullDatabaseConnection: The created connection object.
+
+    Raises:
+        ValueError: If a connection with this name already exists, or the
+            database_type is not a supported dialect.
+    """
+    refuse("ff.create_database_connection")
+    if database_type.lower() not in KNOWN_DIALECT_NAMES:
+        raise ValueError(
+            f"Unsupported database type '{database_type}'. Supported types: {', '.join(KNOWN_DIALECT_NAMES)}"
+        )
+    user_id = get_current_user_id()
+
+    if isinstance(password, str):
+        password = SecretStr(password)
+
+    if get_dialect_or_generic(database_type).file_based:
+        # No credentials for file-based databases; the stored model requires strings
+        username = username or ""
+        password = password if password is not None else SecretStr("")
+
+    connection = FullDatabaseConnection(
+        connection_name=connection_name,
+        database_type=database_type,
+        host=host,
+        port=port,
+        database=database,
+        username=username,
+        password=password,
+        ssl_enabled=ssl_enabled,
+        url=url,
+    )
+
+    with get_db_context() as db:
+        store_database_connection(db, connection, user_id)
+
+    return connection
+
+
+def create_database_connection_if_not_exists(
+    connection_name: str,
+    *,
+    database_type: str = "postgresql",
+    host: str | None = None,
+    port: int | None = None,
+    database: str | None = None,
+    username: str | None = None,
+    password: str | SecretStr | None = None,
+    ssl_enabled: bool = False,
+    url: str | None = None,
+) -> FullDatabaseConnection:
+    """Create a database connection if it doesn't already exist.
+
+    Args:
+        connection_name: Unique name for this connection.
+        database_type: Type of database (one of shared.db_dialects.KNOWN_DIALECT_NAMES,
+            e.g. postgresql, mysql, sqlite, duckdb, mssql, denodo).
+        host: Database server hostname.
+        port: Database server port.
+        database: Database name.
+        username: Database username (not needed for file-based types like sqlite/duckdb).
+        password: Database password (not needed for file-based types like sqlite/duckdb).
+        ssl_enabled: Whether to use SSL for the connection.
+        url: Full database URL (overrides other connection parameters).
+
+    Returns:
+        FullDatabaseConnection: The existing or newly created connection.
+    """
+    refuse("ff.create_database_connection_if_not_exists")
+    get_current_user_id()
+
+    existing = get_database_connection_by_name(connection_name)
+    if existing:
+        return existing
+
+    return create_database_connection(
+        connection_name,
+        database_type=database_type,
+        host=host,
+        port=port,
+        database=database,
+        username=username,
+        password=password,
+        ssl_enabled=ssl_enabled,
+        url=url,
+    )
+
+
+def get_database_connection_by_name(connection_name: str) -> FullDatabaseConnection | None:
+    """Get a database connection by its name.
+
+    In a notebook kernel session the connection comes from the app and its ``password`` is empty: no
+    secret reaches the kernel. In a script it is the stored (encrypted) value.
+
+    Args:
+        connection_name: The name of the connection to retrieve.
+
+    Returns:
+        FullDatabaseConnection if found, None otherwise.
+    """
+    return _metadata.database_connection(connection_name)
+
+
+def get_all_available_database_connections() -> list[FullDatabaseConnectionInterface]:
+    """Get all available database connections for the current user.
+
+    Returns:
+        List of database connection interfaces (without passwords).
+    """
+    return _metadata.database_connections()
+
+
+def del_database_connection(connection_name: str) -> bool:
+    """Delete a database connection by its name.
+
+    Args:
+        connection_name: The name of the connection to delete.
+
+    Returns:
+        True if the connection was deleted, False if it didn't exist.
+    """
+    refuse("ff.del_database_connection")
+    from flowfile_core.database.models import Secret
+
+    user_id = get_current_user_id()
+    with get_db_context() as db:
+        connection = get_database_connection(db, connection_name, user_id)
+        if connection:
+            # Delete the associated password secret
+            if connection.password_id:
+                secret = db.query(Secret).filter(Secret.id == connection.password_id).first()
+                if secret:
+                    db.delete(secret)
+
+            db.delete(connection)
+            db.commit()
+            return True
+        return False

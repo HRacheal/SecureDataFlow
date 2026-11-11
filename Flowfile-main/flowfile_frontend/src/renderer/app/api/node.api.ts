@@ -1,0 +1,267 @@
+import axios from "../services/axios.config";
+import { withExpectation } from "./settingsExpectation";
+import type {
+  NodeData,
+  FileColumn,
+  TableExample,
+  NodeDescriptionResponse,
+  FormulaInput,
+  FormulaChainCheck,
+  InstantFuncResult,
+  OperationResponse,
+} from "../types";
+
+export class NodeApi {
+  /**
+   * Get node data for a specific node.
+   *
+   * `includeOutput` controls whether the backend computes the node's own output
+   * preview (`main_output`). The settings panel only needs the input schemas, so
+   * it defaults to false to avoid the potentially expensive output-schema
+   * prediction (e.g. a pivot must materialize data to list its output columns).
+   *
+   * `includeInputs=false` additionally skips the input schemas — resolving them
+   * can execute un-run upstream custom nodes (kernel/worker). The custom-node
+   * drawer uses it to render instantly, then hydrates columns with a full fetch.
+   */
+  static async getNodeData(
+    flowId: number,
+    nodeId: number,
+    includeOutput = false,
+    includeInputs = true,
+  ): Promise<NodeData> {
+    const response = await axios.get<NodeData>("/node", {
+      params: {
+        flow_id: flowId,
+        node_id: nodeId,
+        include_output: includeOutput,
+        include_inputs: includeInputs,
+      },
+      headers: { accept: "application/json" },
+    });
+    return response.data;
+  }
+
+  /**
+   * Get table example/preview data for a node
+   */
+  static async getTableExample(
+    flowId: number,
+    nodeId: number,
+    outputHandle?: string,
+  ): Promise<TableExample> {
+    const params: Record<string, string | number> = { flow_id: flowId, node_id: nodeId };
+    if (outputHandle) params.output_handle = outputHandle;
+    const response = await axios.get<TableExample>("/node/data", {
+      params,
+      headers: { accept: "application/json" },
+    });
+    return response.data;
+  }
+
+  /**
+   * Compute on-demand statistics for one column of a node's cached result.
+   * Returns the column's updated FileColumn — the same shape table_schema
+   * ships, with the stat fields now filled in. 409 means the node has not
+   * run yet — callers should surface that, not swallow it.
+   */
+  static async getColumnStats(
+    flowId: number,
+    nodeId: number,
+    columnName: string,
+    outputHandle?: string,
+  ): Promise<FileColumn> {
+    const params: Record<string, string | number> = {
+      flow_id: flowId,
+      node_id: nodeId,
+      column_name: columnName,
+    };
+    if (outputHandle) params.output_handle = outputHandle;
+    const response = await axios.get<FileColumn>("/node/column_stats", {
+      params,
+      headers: { accept: "application/json" },
+    });
+    return response.data;
+  }
+
+  /**
+   * Export up to 10,000 rows of a node's cached result as a CSV/TSV file body. 409 means
+   * the node has no current result (not run or stale); read it with blobErrorDetail.
+   */
+  static async exportNodeData(
+    flowId: number,
+    nodeId: number,
+    opts: { outputHandle?: string; format: "csv" | "tsv"; limit?: number },
+  ): Promise<Blob> {
+    const params: Record<string, string | number> = {
+      flow_id: flowId,
+      node_id: nodeId,
+      format: opts.format,
+    };
+    if (opts.outputHandle) params.output_handle = opts.outputHandle;
+    if (opts.limit !== undefined) params.limit = opts.limit;
+    const response = await axios.get<Blob>("/node/data/export", { params, responseType: "blob" });
+    return response.data;
+  }
+
+  /**
+   * Get downstream node IDs for a given node
+   */
+  static async getDownstreamNodeIds(flowId: number, nodeId: number): Promise<number[]> {
+    const response = await axios.get<number[]>("/node/downstream_node_ids", {
+      params: { flow_id: flowId, node_id: nodeId },
+      headers: { accept: "application/json" },
+    });
+    return response.data;
+  }
+
+  /**
+   * Get node description
+   */
+  static async getNodeDescription(
+    flowId: number,
+    nodeId: number,
+  ): Promise<NodeDescriptionResponse> {
+    const response = await axios.get<NodeDescriptionResponse>("/node/description", {
+      params: { node_id: nodeId, flow_id: flowId },
+    });
+    return response.data;
+  }
+
+  /**
+   * Set/update node description
+   */
+  static async setNodeDescription(
+    flowId: number,
+    nodeId: number,
+    description: string,
+  ): Promise<OperationResponse> {
+    const response = await axios.post("/node/description/", JSON.stringify(description), {
+      params: { flow_id: flowId, node_id: nodeId },
+      headers: { "Content-Type": "application/json" },
+    });
+    return response.data;
+  }
+
+  /**
+   * Get node reference
+   */
+  static async getNodeReference(flowId: number, nodeId: number): Promise<string> {
+    const response = await axios.get<string>("/node/reference", {
+      params: { node_id: nodeId, flow_id: flowId },
+    });
+    return response.data;
+  }
+
+  /**
+   * Set/update node reference
+   */
+  static async setNodeReference(
+    flowId: number,
+    nodeId: number,
+    reference: string,
+  ): Promise<OperationResponse> {
+    const response = await axios.post("/node/reference/", JSON.stringify(reference), {
+      params: { flow_id: flowId, node_id: nodeId },
+      headers: { "Content-Type": "application/json" },
+    });
+    return response.data;
+  }
+
+  /**
+   * Validate node reference (check lowercase, no spaces, uniqueness)
+   */
+  static async validateNodeReference(
+    flowId: number,
+    nodeId: number,
+    reference: string,
+  ): Promise<{ valid: boolean; error: string | null }> {
+    const response = await axios.get<{ valid: boolean; error: string | null }>(
+      "/node/validate_reference",
+      {
+        params: { flow_id: flowId, node_id: nodeId, reference },
+      },
+    );
+    return response.data;
+  }
+
+  /**
+   * Validate a formula chain: per-entry issues plus the schema each entry sees.
+   */
+  static async checkFormulaChain(
+    flowId: number,
+    nodeId: number,
+    entries: FormulaInput[],
+  ): Promise<FormulaChainCheck> {
+    const response = await axios.post<FormulaChainCheck>("/custom_functions/formula_chain_check", {
+      flow_id: flowId,
+      node_id: nodeId,
+      entries,
+    });
+    return response.data;
+  }
+
+  /**
+   * Evaluate one entry of a formula chain against the schema its predecessors build.
+   */
+  static async getFormulaChainInstantResult(
+    flowId: number,
+    nodeId: number,
+    entries: FormulaInput[],
+    index: number,
+  ): Promise<InstantFuncResult> {
+    const response = await axios.post<InstantFuncResult>(
+      "/custom_functions/formula_chain_instant_result",
+      { flow_id: flowId, node_id: nodeId, entries, index },
+    );
+    return response.data;
+  }
+
+  /**
+   * Update node settings directly
+   */
+  static async updateSettingsDirectly(
+    nodeType: string,
+    inputData: any,
+    expectedFingerprint?: string,
+  ): Promise<OperationResponse> {
+    const response = await axios.post(
+      "/update_settings/",
+      withExpectation(inputData, expectedFingerprint),
+      {
+        params: { node_type: nodeType },
+      },
+    );
+    return response.data;
+  }
+
+  /**
+   * Update user-defined node settings
+   */
+  static async updateUserDefinedSettings(
+    nodeType: string,
+    inputData: any,
+    expectedFingerprint?: string,
+  ): Promise<OperationResponse> {
+    const response = await axios.post(
+      "/user_defined_components/update_user_defined_node",
+      withExpectation(inputData, expectedFingerprint),
+      {
+        params: { node_type: nodeType },
+      },
+    );
+    return response.data;
+  }
+}
+
+/** The `{detail}` of an axios error whose body arrived as a Blob (responseType "blob"). */
+export async function blobErrorDetail(error: unknown): Promise<string | null> {
+  const data = (error as { response?: { data?: unknown } })?.response?.data;
+  if (!(data instanceof Blob)) return null;
+  try {
+    const detail = JSON.parse(await data.text())?.detail;
+    return typeof detail === "string" ? detail : null;
+  } catch {
+    return null;
+  }
+}

@@ -1,0 +1,2990 @@
+<template>
+  <div class="catalog-view">
+    <!-- Tab Bar. Compact mode (persisted) folds every label but the active tab's;
+         the section captions stay, and hovering a section unfolds its labels. -->
+    <div class="catalog-tabs" :class="{ 'is-compact': tabsCompact }">
+      <template v-for="(group, gi) in tabGroups" :key="group.key">
+        <div v-if="gi > 0" class="tab-group-divider" aria-hidden="true"></div>
+        <div class="tab-group">
+          <span v-if="group.label" class="tab-group-label" aria-hidden="true">
+            {{ group.label }}
+          </span>
+          <button
+            v-for="tab in group.tabs"
+            :key="tab.key"
+            class="catalog-tab"
+            :class="{ active: catalogStore.activeTab === tab.key }"
+            :title="tabsCompact && catalogStore.activeTab !== tab.key ? tab.label : undefined"
+            @click="handleTabClick(tab.key)"
+          >
+            <i :class="tab.icon"></i>
+            <span class="tab-label">{{ tab.label }}</span>
+            <span v-if="tab.badge !== null" class="tab-badge">{{ tab.badge }}</span>
+          </button>
+        </div>
+      </template>
+      <div class="tab-spacer"></div>
+      <el-tooltip
+        :content="tabsCompact ? 'Show tab labels' : 'Compact tabs'"
+        placement="bottom"
+        :show-after="400"
+      >
+        <button class="catalog-tab info-btn" @click="setTabsCompact(!tabsCompact)">
+          <i :class="tabsCompact ? 'fa-solid fa-angles-right' : 'fa-solid fa-angles-left'"></i>
+        </button>
+      </el-tooltip>
+      <template v-if="!isExtensionsSection">
+        <el-tooltip content="Refresh" placement="bottom" :show-after="400">
+          <button class="catalog-tab info-btn" :disabled="refreshing" @click="refreshAll">
+            <i class="fa-solid fa-arrows-rotate" :class="{ 'fa-spin': refreshing }"></i>
+          </button>
+        </el-tooltip>
+        <el-tooltip content="About the Catalog" placement="bottom" :show-after="400">
+          <button class="catalog-tab info-btn" @click="showInfoModal = true">
+            <i class="fa-solid fa-circle-info"></i>
+          </button>
+        </el-tooltip>
+      </template>
+    </div>
+
+    <!-- Main Content -->
+    <div class="catalog-content">
+      <!-- Sidebar: catalog tree, collapsible to a thin rail; absent on the extension pages -->
+      <div
+        v-if="!isExtensionsSection"
+        class="catalog-sidebar"
+        :class="{ 'is-collapsed': treeCollapsed }"
+      >
+        <button
+          v-if="treeCollapsed"
+          type="button"
+          class="tree-rail"
+          title="Show catalogs"
+          aria-label="Show catalogs"
+          @click="setTreeCollapsed(false)"
+        >
+          <i class="fa-solid fa-angles-right"></i>
+          <span class="tree-rail-label">Catalogs</span>
+        </button>
+        <div class="sidebar-header">
+          <h3>Catalogs</h3>
+          <button
+            type="button"
+            class="tree-collapse-btn"
+            title="Hide catalogs"
+            aria-label="Hide catalogs"
+            @click="setTreeCollapsed(true)"
+          >
+            <i class="fa-solid fa-angles-left"></i>
+          </button>
+          <el-dropdown trigger="click" placement="bottom-end" class="sidebar-new-dropdown">
+            <button class="btn btn-primary btn-sm sidebar-new-btn">
+              <i class="fa-solid fa-plus"></i>
+              New
+              <i class="fa-solid fa-chevron-down caret"></i>
+            </button>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item @click="showCreateNamespace = true">
+                  <i class="fa-solid fa-plus fa-fw"></i> New catalog
+                </el-dropdown-item>
+                <el-dropdown-item @click="openRegisterTableGlobal">
+                  <i class="fa-solid fa-table fa-fw"></i> Register table
+                </el-dropdown-item>
+                <el-dropdown-item @click="openRegisterFlowGlobal">
+                  <i class="fa-solid fa-file-circle-plus fa-fw"></i> Register flow
+                </el-dropdown-item>
+                <el-dropdown-item @click="showCreateVirtualTable = true">
+                  <i class="fa-solid fa-bolt fa-fw"></i> Create virtual table
+                </el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
+        </div>
+
+        <!-- Catalog Tree -->
+        <div class="tree-container">
+          <div class="sidebar-filters">
+            <input v-model="searchQuery" class="search-input" placeholder="Search..." />
+            <label class="unavailable-toggle">
+              <input v-model="showUnavailable" type="checkbox" />
+              <span>Show unavailable</span>
+            </label>
+          </div>
+          <div v-if="catalogStore.loading" class="loading-state">Loading...</div>
+          <div v-else-if="catalogStore.tree.length === 0" class="empty-state">
+            <p>No catalogs yet.</p>
+            <button class="btn btn-primary btn-sm" @click="showCreateNamespace = true">
+              <i class="fa-solid fa-plus"></i> Create your first catalog
+            </button>
+            <button
+              class="btn btn-secondary btn-sm"
+              :disabled="demoBusy"
+              @click="handleLoadDemoData"
+            >
+              <i class="fa-solid fa-flask"></i> Load demo data
+            </button>
+          </div>
+          <div v-else>
+            <p v-if="treeSearchFilter.query && searchMatchCount === 0" class="search-empty">
+              No matches for "{{ searchQuery.trim() }}".
+              <template v-if="hiddenUnavailableMatches > 0">
+                Tick "Show unavailable" — the only matches are items whose files are missing.
+              </template>
+            </p>
+            <CatalogTreeNode
+              v-for="node in catalogStore.tree"
+              :key="node.id"
+              :node="node"
+              :selected-flow-id="catalogStore.selectedFlowId"
+              :selected-artifact-id="catalogStore.selectedArtifactId"
+              :selected-table-id="catalogStore.selectedTableId"
+              :selected-namespace-id="catalogStore.selectedNamespaceId"
+              :search-query="searchQuery"
+              :show-unavailable="showUnavailable"
+              @select-flow="selectFlow($event)"
+              @select-artifact="selectArtifact($event)"
+              @select-table="selectTable($event)"
+              @select-namespace="selectNamespace($event)"
+              @table-context-menu="onTableContextMenu($event)"
+              @artifact-context-menu="onArtifactContextMenu($event)"
+              @flow-context-menu="onFlowContextMenu($event)"
+              @select-visualization="openVisualization($event)"
+              @select-notebook="openNotebook($event)"
+              @delete-notebook="handleDeleteNotebook($event)"
+              @toggle-favorite="catalogStore.toggleFavorite($event)"
+              @toggle-table-favorite="catalogStore.toggleTableFavorite($event)"
+              @register-flow="openRegisterFlow($event)"
+              @register-table="openRegisterTable($event)"
+              @create-schema="openCreateSchema($event)"
+              @delete-table="handleDeleteTable($event)"
+              @delete-flow="handleDeleteFlow($event)"
+              @namespace-share="openNamespaceShare($event)"
+              @cleanup-namespace="handleCleanupNamespace($event)"
+              @delete-namespace="handleDeleteSchema($event)"
+            />
+          </div>
+        </div>
+      </div>
+
+      <!-- Detail Panel -->
+      <div class="catalog-detail">
+        <!-- Nested page (dashboards); first so a lingering selection can't shadow it -->
+        <router-view v-if="nestedPageTab" />
+        <!-- Run detail view -->
+        <RunDetailPanel
+          v-else-if="catalogStore.selectedRunDetail"
+          :run="catalogStore.selectedRunDetail"
+          @close="handleCloseDetail"
+          @open-snapshot="openRunSnapshot($event)"
+          @view-flow="navigateToFlow($event)"
+          @view-schedule-runs="navigateToScheduleRuns"
+        />
+        <!-- Schedule detail view -->
+        <ScheduleDetailPanel
+          v-else-if="catalogStore.selectedSchedule"
+          :schedule="catalogStore.selectedSchedule"
+          @close="handleCloseDetail"
+          @view-run="handleViewRun"
+          @view-flow="navigateToFlow"
+          @view-schedule-runs="navigateToScheduleRuns"
+          @toggle-schedule="handleToggleScheduleFromDetail"
+          @delete-schedule="handleDeleteScheduleFromDetail"
+          @run-now="handleRunNowFromDetail"
+          @cancel-schedule-run="handleCancelScheduleRun"
+          @open-snapshot="openRunSnapshot($event)"
+        />
+        <!-- Artifact detail view -->
+        <ArtifactDetailPanel
+          v-else-if="catalogStore.selectedArtifact"
+          :artifact="catalogStore.selectedArtifact"
+          :versions="catalogStore.artifactVersions"
+          :total-versions="catalogStore.artifactVersionsTotal"
+          :page="catalogStore.artifactVersionsPage"
+          :loading-versions="catalogStore.loadingArtifactVersions"
+          @close="handleCloseDetail"
+          @navigate-to-flow="navigateToFlow($event)"
+          @delete-artifact="handleDeleteArtifact($event)"
+          @delete-version="handleDeleteArtifactVersion($event)"
+          @promote-version="handlePromoteArtifactVersion($event)"
+          @set-versions-page="catalogStore.setArtifactVersionsPage($event)"
+          @versions-changed="refreshArtifactVersions()"
+        />
+        <!-- Namespace (catalog) settings view -->
+        <NamespaceDetailPanel
+          v-else-if="catalogStore.selectedNamespace"
+          :namespace="catalogStore.selectedNamespace"
+          @close="handleCloseDetail"
+        />
+        <!-- Table detail view -->
+        <TableDetailPanel
+          v-else-if="catalogStore.selectedTable"
+          :table="catalogStore.selectedTable"
+          :preview="catalogStore.tablePreview"
+          :loading-preview="catalogStore.loadingTablePreview"
+          :preview-error="catalogStore.previewError"
+          :table-history="catalogStore.tableHistory"
+          :loading-table-history="catalogStore.loadingTableHistory"
+          :table-history-stale="catalogStore.tableHistoryStale"
+          :selected-version="catalogStore.selectedVersion"
+          @close="handleCloseDetail"
+          @delete-table="handleDeleteTable($event)"
+          @toggle-table-favorite="catalogStore.toggleTableFavorite($event)"
+          @navigate-to-flow="navigateToFlow($event)"
+          @select-version="catalogStore.selectVersion($event)"
+          @query-table="handleQueryTable($event)"
+          @edit-sql="handleEditTableSql($event)"
+          @recover-from-run="openRunSnapshot($event)"
+          @load-preview="catalogStore.loadSelectedPreview()"
+          @refresh-history="catalogStore.refreshTableHistory()"
+          @edits-saved="catalogStore.handleTableEdited($event)"
+        />
+        <!-- Flow detail view -->
+        <FlowDetailPanel
+          v-else-if="catalogStore.selectedFlow"
+          :flow="catalogStore.selectedFlow"
+          :artifacts="catalogStore.flowArtifacts"
+          :focus-runs="flowDetailFocusRuns"
+          @runs-focused="flowDetailFocusRuns = false"
+          @close="handleCloseDetail"
+          @view-run="handleViewRun"
+          @view-flow="navigateToFlow($event)"
+          @view-schedule-runs="navigateToScheduleRuns"
+          @toggle-favorite="catalogStore.toggleFavorite($event)"
+          @toggle-follow="catalogStore.toggleFollow($event)"
+          @open-flow="catalogStore.selectedFlow && openFlowInDesigner(catalogStore.selectedFlow)"
+          @modify-in-notebook="
+            catalogStore.selectedFlow &&
+            openFlowInDesigner(catalogStore.selectedFlow, { codePane: 'notebook' })
+          "
+          @select-table="selectTable($event)"
+          @delete-flow="handleDeleteFlow($event)"
+          @rename-flow="handleRenameFlow"
+          @add-schedule="handleAddFlowSchedule"
+          @run-flow="handleRunFlow"
+          @cancel-flow-run="handleCancelFlowRun"
+          @select-schedule="selectSchedule"
+          @recover-from-snapshot="openRunSnapshot($event)"
+          @open-snapshot="openRunSnapshot($event)"
+        />
+        <!-- Run history overview -->
+        <RunOverviewPanel
+          v-else-if="catalogStore.activeTab === 'runs'"
+          @view-run="handleViewRun"
+          @view-flow="navigateToFlow($event)"
+          @view-schedule-runs="navigateToScheduleRuns"
+          @open-snapshot="openRunSnapshot($event)"
+        />
+        <!-- Schedule overview -->
+        <ScheduleOverviewPanel
+          v-else-if="catalogStore.activeTab === 'schedules'"
+          @create-schedule="showCreateSchedule = true"
+          @toggle-schedule="handleToggleSchedule"
+          @delete-schedule="handleDeleteSchedule"
+          @run-now="handleRunNow"
+          @cancel-schedule-run="handleCancelScheduleRun"
+          @view-flow="navigateToFlow"
+          @select-schedule="selectSchedule"
+        />
+        <!-- Alerts (notification channels, account-wide rules, delivery history) -->
+        <AlertsPanel v-else-if="catalogStore.activeTab === 'alerts'" />
+        <!-- Favorites list -->
+        <div v-else-if="catalogStore.activeTab === 'favorites'" class="favorites-panel">
+          <h2>Favorites</h2>
+          <EmptyState
+            v-if="catalogStore.favorites.length === 0"
+            icon="fa-solid fa-star"
+            title="No favorites yet"
+            description="Star flows from the catalog tree to see them here."
+          />
+          <template v-else>
+            <div class="favorites-filter-bar">
+              <el-input
+                v-model="favoritesSearch"
+                placeholder="Search favorites"
+                clearable
+                size="small"
+                style="width: 240px"
+              />
+            </div>
+            <div class="favorites-list">
+              <FlowListItem
+                v-for="flow in filteredFavorites"
+                :key="flow.id"
+                :flow="flow"
+                :selected="catalogStore.selectedFlowId === flow.id"
+                @select="selectFlow(flow.id)"
+                @toggle-favorite="catalogStore.toggleFavorite(flow.id)"
+              />
+            </div>
+          </template>
+        </div>
+        <!-- SQL Editor -->
+        <SqlEditorPanel
+          v-else-if="catalogStore.activeTab === 'sql'"
+          @view-table="selectTable($event)"
+        />
+        <!-- Notebook (mixed Python / Markdown exploration console) -->
+        <NotebookPanel v-else-if="catalogStore.activeTab === 'notebook'" />
+        <!-- Visuals (charts + dashboards) -->
+        <VisualsPanel
+          v-else-if="catalogStore.activeTab === 'visuals'"
+          @view-table="selectTable($event)"
+        />
+        <!-- Published APIs -->
+        <ApisPanel
+          v-else-if="catalogStore.activeTab === 'apis'"
+          @view-flow="navigateToFlow($event)"
+        />
+        <!-- Custom nodes (root-level: default dir + mounted folders) -->
+        <CustomNodesPanel v-else-if="catalogStore.activeTab === 'customNodes'" />
+        <!-- Community nodes (browse + install from the registry) -->
+        <CommunityNodesPanel v-else-if="isCommunityTab" />
+        <!-- Stats overview -->
+        <StatsPanel
+          v-else
+          :stats="catalogStore.stats"
+          :flows="catalogStore.allFlows"
+          :tables="catalogStore.allTables"
+          :favorites="catalogStore.favorites"
+          :runs="catalogStore.runs"
+          @view-run="handleViewRun"
+          @view-flow="navigateToFlow($event)"
+          @view-schedule-runs="navigateToScheduleRuns"
+          @open-snapshot="openRunSnapshot($event)"
+          @view-table="selectTable($event)"
+          @create-schedule="showCreateSchedule = true"
+          @toggle-schedule="handleToggleSchedule"
+          @delete-schedule="handleDeleteSchedule"
+          @run-now="handleRunNow"
+          @cancel-schedule-run="handleCancelScheduleRun"
+          @select-schedule="selectSchedule"
+          @open-tab="handleTabClick($event)"
+        />
+      </div>
+    </div>
+
+    <!-- Modals -->
+    <CreateNamespaceModal
+      :visible="showCreateNamespace"
+      :parent-id="createSchemaParentId"
+      @close="
+        showCreateNamespace = false;
+        createSchemaParentId = null;
+      "
+    />
+
+    <RegisterFlowModal
+      :visible="showRegisterFlow"
+      :namespace-id="registerFlowNamespaceId"
+      :default-namespace-id="defaultNamespaceId"
+      @close="showRegisterFlow = false"
+    />
+
+    <RegisterTableModal
+      :visible="showRegisterTable"
+      :namespace-id="registerTableNamespaceId"
+      :default-namespace-id="defaultNamespaceId"
+      @close="showRegisterTable = false"
+    />
+
+    <CreateVirtualTableModal
+      :visible="showCreateVirtualTable"
+      :namespace-id="registerTableNamespaceId"
+      :default-namespace-id="defaultNamespaceId"
+      @close="showCreateVirtualTable = false"
+    />
+
+    <CreateScheduleModal
+      :visible="showCreateSchedule"
+      :flows="catalogStore.allFlows"
+      :tables="catalogStore.allTables"
+      :preselected-flow-id="preselectedFlowId"
+      @close="
+        showCreateSchedule = false;
+        preselectedFlowId = null;
+      "
+      @create="handleCreateSchedule"
+    />
+
+    <!-- Saved-viz viewer (opened from the catalog tree) -->
+    <el-dialog
+      v-model="vizViewerOpen"
+      title="Visualization"
+      width="92vw"
+      destroy-on-close
+      append-to-body
+      :before-close="onVizViewerBeforeClose"
+      @close="closeVizViewer"
+    >
+      <VisualizationViewer
+        v-if="vizViewerOpen && activeVizId !== null"
+        ref="vizViewerRef"
+        :viz-id="activeVizId"
+        :appearance="vizViewerAppearance"
+      />
+    </el-dialog>
+
+    <!-- New visualization editor (opened from a table's right-click menu) -->
+    <el-dialog
+      v-model="vizEditorOpen"
+      title="New visualization"
+      width="92vw"
+      destroy-on-close
+      append-to-body
+      :before-close="onVizEditorBeforeClose"
+    >
+      <VisualizationEditor
+        v-if="vizEditorOpen && vizEditorSource"
+        ref="vizEditorRef"
+        :source="vizEditorSource"
+        :viz="null"
+        :appearance="vizViewerAppearance"
+        @saved="onVizCreated"
+        @cancel="vizEditorOpen = false"
+      />
+    </el-dialog>
+
+    <ShareDialog
+      v-if="shareNamespace"
+      v-model="showNamespaceShareDialog"
+      resource-type="catalog_namespace"
+      :resource-id="shareNamespace.id"
+      :resource-name="shareNamespace.name"
+      :can-manage-grants="canManageGrants(shareNamespace)"
+    />
+
+    <!-- Right-click context menus for catalog tables and flows -->
+    <Teleport to="body">
+      <ContextMenu
+        v-if="tableMenu"
+        :position="{ x: tableMenu.x, y: tableMenu.y }"
+        :options="tableMenuOptions"
+        @select="onTableMenuSelect"
+        @close="tableMenu = null"
+      />
+      <ContextMenu
+        v-if="flowMenu"
+        :position="{ x: flowMenu.x, y: flowMenu.y }"
+        :options="flowMenuOptions"
+        @select="onFlowMenuSelect"
+        @close="flowMenu = null"
+      />
+      <ContextMenu
+        v-if="artifactMenu"
+        :position="{ x: artifactMenu.x, y: artifactMenu.y }"
+        :options="artifactMenuOptions"
+        @select="onArtifactMenuSelect"
+        @close="artifactMenu = null"
+      />
+    </Teleport>
+
+    <!-- Info Modal -->
+    <el-dialog
+      v-model="showInfoModal"
+      title="About the Catalog"
+      width="600px"
+      :append-to-body="true"
+    >
+      <div class="info-modal-content">
+        <div class="info-card">
+          <div class="info-card-header">
+            <i class="fa-solid fa-folder-tree"></i>
+            <h4>Organization</h4>
+          </div>
+          <p>
+            Flows and tables are organized into <strong>catalogs</strong> and
+            <strong>schemas</strong>. Use catalogs for broad groupings (e.g. by team or domain) and
+            schemas for finer separation within them.
+          </p>
+        </div>
+        <div class="info-card">
+          <div class="info-card-header">
+            <i class="fa-solid fa-clock-rotate-left"></i>
+            <h4>Run history</h4>
+          </div>
+          <p>
+            Every registered flow tracks its executions automatically. View status, duration, and
+            node-level progress for each run, or open a snapshot to inspect a past state.
+          </p>
+        </div>
+        <div class="info-card">
+          <div class="info-card-header">
+            <i class="fa-solid fa-table"></i>
+            <h4>Tables &amp; artifacts</h4>
+          </div>
+          <p>
+            Register datasets as catalog tables to preview and track them centrally. Artifacts
+            produced by flows are versioned and linked back to the run that created them.
+          </p>
+        </div>
+        <div class="info-card">
+          <div class="info-card-header">
+            <i class="fa-solid fa-bolt"></i>
+            <h4>Virtual Flow Tables</h4>
+          </div>
+          <p>
+            Virtual flow tables do not store data on disk. When queried, they execute a registered
+            flow on-demand to produce results. They appear with a
+            <strong>bolt</strong> icon and a <strong>virtual</strong> badge in the catalog tree.
+            Optimized virtual tables can push query predicates into the flow for faster execution.
+          </p>
+        </div>
+        <div class="info-card">
+          <div class="info-card-header">
+            <i class="fa-solid fa-calendar-days"></i>
+            <h4>Schedules</h4>
+          </div>
+          <p>
+            Automate flow execution with cron-based or table-trigger schedules. Monitor active runs
+            and manage schedules from the Schedules tab.
+          </p>
+        </div>
+        <div class="info-card">
+          <div class="info-card-header">
+            <i class="fa-solid fa-flask"></i>
+            <h4>Demo data</h4>
+          </div>
+          <p>
+            Load a self-contained <strong>Demo</strong> catalog with sample tables and a daily
+            foreign-exchange sync flow to explore Flowfile. Remove it again at any time.
+          </p>
+          <button
+            v-if="!hasDemoCatalog"
+            class="btn btn-primary btn-sm demo-card-btn"
+            :disabled="demoBusy"
+            @click="handleLoadDemoData"
+          >
+            <i class="fa-solid fa-flask"></i> Load demo data
+          </button>
+          <button
+            v-else
+            class="btn btn-ghost btn-sm demo-card-btn"
+            :disabled="demoBusy"
+            @click="handleRemoveDemoData"
+          >
+            <i class="fa-solid fa-broom"></i> Remove demo data
+          </button>
+        </div>
+      </div>
+    </el-dialog>
+  </div>
+</template>
+
+<script setup lang="ts">
+// TODO(refactor): God component (~1700 LOC). Plan to extract:
+//   - useModalState composable: 8 dialog refs at lines 472-490
+//   - 19 async handlers: move into catalog-store.ts as Pinia actions (~lines 657-927)
+//   - useRouteSync composable: applyRouteToStore (~lines 930-993)
+import { computed, h, onMounted, onUnmounted, ref, watch } from "vue";
+import { ElCheckbox, ElLoading, ElMessage, ElMessageBox } from "element-plus";
+import { useRoute, useRouter } from "vue-router";
+import { useCatalogStore } from "../../stores/catalog-store";
+import { useProjectStore } from "../../stores/project-store";
+import { useNotebookStore } from "../../stores/notebook-store";
+import { useSqlEditorStore } from "../../stores/sql-editor-store";
+import { useFlowStore } from "../../stores/flow-store";
+import { useEditorStore } from "../../stores/editor-store";
+import type { CodeMode } from "../DesignerView/CodeGenerator/codeMode";
+import { useNotificationsStore } from "../../stores/notifications-store";
+import { CatalogApi } from "../../api/catalog.api";
+import { FlowApi } from "../../api/flow.api";
+import { copyToClipboard } from "../../utils/clipboardUtils";
+import { addConfiguredNodeOperations } from "../../utils/graphOperations";
+import type { NotebookSummary } from "../../api/notebook.api";
+import { EmptyState } from "../../components/common";
+import ContextMenu from "../../components/common/ContextMenu/ContextMenu.vue";
+import CatalogTreeNode from "./CatalogTreeNode.vue";
+import FlowListItem from "./FlowListItem.vue";
+import FlowDetailPanel from "./FlowDetailPanel.vue";
+import ArtifactDetailPanel from "./ArtifactDetailPanel.vue";
+import TableDetailPanel from "./TableDetailPanel.vue";
+import NamespaceDetailPanel from "./NamespaceDetailPanel.vue";
+import RunDetailPanel from "./RunDetailPanel.vue";
+import StatsPanel from "./StatsPanel.vue";
+import CreateNamespaceModal from "./CreateNamespaceModal.vue";
+import RegisterFlowModal from "./RegisterFlowModal.vue";
+import RegisterTableModal from "./RegisterTableModal.vue";
+import RunOverviewPanel from "./RunOverviewPanel.vue";
+import ScheduleOverviewPanel from "./ScheduleOverviewPanel.vue";
+import ScheduleDetailPanel from "./ScheduleDetailPanel.vue";
+import CreateScheduleModal from "./CreateScheduleModal.vue";
+import AlertsPanel from "./AlertsPanel.vue";
+import CreateVirtualTableModal from "./CreateVirtualTableModal.vue";
+import SqlEditorPanel from "./SqlEditorPanel.vue";
+import NotebookPanel from "./NotebookPanel.vue";
+import VisualsPanel from "./VisualsPanel.vue";
+import ApisPanel from "./ApisPanel.vue";
+import CustomNodesPanel from "./CustomNodesPanel.vue";
+import CommunityNodesPanel from "./CommunityNodesPanel.vue";
+import VisualizationViewer from "./VisualizationViewer.vue";
+import VisualizationEditor from "./VisualizationEditor.vue";
+import ShareDialog from "../../components/sharing/ShareDialog.vue";
+import { useResourceSharing } from "../../composables/useResourceSharing";
+import { useWritableNamespaces } from "../../composables/useWritableNamespaces";
+import { useFlowOpener } from "../../composables/useFlowOpener";
+import { useRecentFlows } from "../../composables/useRecentFlows";
+import { countMatches, normalizeQuery } from "./catalogTreeFilter";
+import { apiErrorMessage, artifactRef, pageAfterDelete } from "./artifactVersions";
+import { useCatalogTreeExpansion } from "./useCatalogTreeExpansion";
+import { findNamespacePath } from "../../types";
+import { CATALOG_TAB_GROUP_LABELS, catalogSectionOfTab, catalogTabsInSection } from "./catalogTabs";
+import { useGraphicWalkerAppearance } from "../../composables/useGraphicWalkerAppearance";
+import type {
+  ArtifactVersionInfo,
+  CatalogTab,
+  CatalogTable,
+  FlowRegistration,
+  FlowSchedule,
+  FlowScheduleCreate,
+  GlobalArtifact,
+  NamespaceTree,
+  VizSourceDescriptor,
+} from "../../types";
+import type { ContextMenuOption } from "../../components/common/ContextMenu/types";
+
+const router = useRouter();
+const route = useRoute();
+
+const catalogStore = useCatalogStore();
+const projectStore = useProjectStore();
+const notebookStore = useNotebookStore();
+const sqlEditorStore = useSqlEditorStore();
+const flowStore = useFlowStore();
+const notificationsStore = useNotificationsStore();
+const { openFlow } = useFlowOpener();
+const { renameFlow: renameRecentFlow, reconcileWithCatalog } = useRecentFlows();
+
+// Namespace sharing (one dialog for the whole tree).
+const { canManageGrants } = useResourceSharing();
+const { writableSchemaNamespaces } = useWritableNamespaces();
+const shareNamespace = ref<NamespaceTree | null>(null);
+const showNamespaceShareDialog = ref(false);
+const openNamespaceShare = (node: NamespaceTree) => {
+  shareNamespace.value = node;
+  showNamespaceShareDialog.value = true;
+};
+
+// Only the rail section the active tab belongs to (Data / Operate / Extensions) is
+// shown; group captions are noise when the section is a single group.
+const tabs = computed(() => {
+  const section = catalogSectionOfTab(catalogStore.activeTab) ?? "catalog";
+  const shown = catalogTabsInSection(section);
+  const captioned = new Set(shown.map((t) => t.group)).size > 1;
+  return shown.map((tab, i) => ({
+    key: tab.key as CatalogTab,
+    label: tab.label,
+    icon: tab.icon,
+    groupStart: i > 0 && tab.group !== shown[i - 1].group,
+    groupLabel:
+      captioned && (i === 0 || tab.group !== shown[i - 1].group)
+        ? CATALOG_TAB_GROUP_LABELS[tab.group]
+        : null,
+    badge:
+      tab.key === "favorites"
+        ? (catalogStore.stats?.total_favorites ?? null)
+        : tab.key === "schedules"
+          ? (catalogStore.stats?.total_schedules ?? null)
+          : null,
+  }));
+});
+
+// Tabs chunked per group so a section can be captioned and hover-expanded as one unit.
+const tabGroups = computed(() => {
+  const groups: { key: string; label: string | null; tabs: typeof tabs.value }[] = [];
+  for (const tab of tabs.value) {
+    if (tab.groupStart || groups.length === 0) {
+      groups.push({ key: tab.key, label: tab.groupLabel, tabs: [] });
+    }
+    groups[groups.length - 1].tabs.push(tab);
+  }
+  return groups;
+});
+
+// Custom / community nodes are extension pages: no catalog tree, refresh or info controls.
+const isExtensionsSection = computed(
+  () => catalogSectionOfTab(catalogStore.activeTab) === "extend",
+);
+
+// "community" is a catalogTabs entry not (yet) in the CatalogTab union; guard via
+// a string compare so the panel renders without widening the shared type here.
+const isCommunityTab = computed(() => (catalogStore.activeTab as string) === "community");
+
+// Pages nested under the catalog (dashboards) pin the tab they belong to via route meta
+// and render in the nested <router-view> in place of the detail panels.
+const nestedPageTab = computed(() => route.meta.catalogTab as CatalogTab | undefined);
+
+// Search and filter state
+const searchQuery = ref("");
+const showUnavailable = ref(false);
+
+const treeSearchFilter = computed(() => ({
+  query: normalizeQuery(searchQuery.value),
+  showUnavailable: showUnavailable.value,
+}));
+const { resetSearchOverrides } = useCatalogTreeExpansion();
+watch(() => treeSearchFilter.value.query, resetSearchOverrides);
+
+const searchMatchCount = computed(() =>
+  treeSearchFilter.value.query ? countMatches(catalogStore.tree, treeSearchFilter.value) : 0,
+);
+// Only nudge toward "Show unavailable" when it would actually reveal something.
+const hiddenUnavailableMatches = computed(() => {
+  if (!treeSearchFilter.value.query || showUnavailable.value || searchMatchCount.value > 0) {
+    return 0;
+  }
+  return countMatches(catalogStore.tree, { ...treeSearchFilter.value, showUnavailable: true });
+});
+
+// Client-side filter for the Favorites tab (fully-loaded list).
+const favoritesSearch = ref("");
+const filteredFavorites = computed(() => {
+  const q = favoritesSearch.value.trim().toLowerCase();
+  if (!q) return catalogStore.favorites;
+  return catalogStore.favorites.filter((f) => (f.name ?? "").toLowerCase().includes(q));
+});
+
+// Modal state
+const showInfoModal = ref(false);
+
+// Tree panel collapse is a per-browser convenience, so it lives in localStorage.
+const TREE_COLLAPSED_KEY = "flowfile-catalog-tree-collapsed";
+const savedTreeCollapsed = ref(false);
+try {
+  savedTreeCollapsed.value = localStorage.getItem(TREE_COLLAPSED_KEY) === "true";
+} catch {
+  // storage unavailable — start expanded
+}
+// Nested pages (dashboards) want the width: their tree starts collapsed, and the
+// toggle there is session-local so it never leaks into the saved preference.
+const pageTreeCollapsed = ref(true);
+const treeCollapsed = computed(() =>
+  nestedPageTab.value ? pageTreeCollapsed.value : savedTreeCollapsed.value,
+);
+function setTreeCollapsed(value: boolean) {
+  if (nestedPageTab.value) {
+    pageTreeCollapsed.value = value;
+    return;
+  }
+  savedTreeCollapsed.value = value;
+  try {
+    localStorage.setItem(TREE_COLLAPSED_KEY, String(value));
+  } catch {
+    // storage unavailable — the toggle still works for this session
+  }
+}
+// Tab-bar compact mode: same per-browser convenience as the tree collapse.
+const TABS_COMPACT_KEY = "flowfile-catalog-tabs-compact";
+const tabsCompact = ref(false);
+try {
+  tabsCompact.value = localStorage.getItem(TABS_COMPACT_KEY) === "true";
+} catch {
+  // storage unavailable — start expanded
+}
+function setTabsCompact(value: boolean) {
+  tabsCompact.value = value;
+  try {
+    localStorage.setItem(TABS_COMPACT_KEY, String(value));
+  } catch {
+    // storage unavailable — the toggle still works for this session
+  }
+}
+const showCreateNamespace = ref(false);
+const createSchemaParentId = ref<number | null>(null);
+const showRegisterFlow = ref(false);
+const registerFlowNamespaceId = ref<number | null>(null);
+const showRegisterTable = ref(false);
+const registerTableNamespaceId = ref<number | null>(null);
+const showCreateSchedule = ref(false);
+const preselectedFlowId = ref<number | null>(null);
+
+// Saved-viz viewer modal (opened from the catalog tree's Visualizations section).
+const vizViewerOpen = ref(false);
+const activeVizId = ref<number | null>(null);
+const vizViewerAppearance = useGraphicWalkerAppearance();
+const vizViewerRef = ref<InstanceType<typeof VisualizationViewer> | null>(null);
+
+// Flush while GW is still mounted; a failed flush gets a lose-changes confirm.
+const onVizViewerBeforeClose = async (done: () => void) => {
+  const clean = (await vizViewerRef.value?.flushAutosave()) ?? true;
+  if (clean) {
+    done();
+    return;
+  }
+  try {
+    await ElMessageBox.confirm(
+      "Some chart changes couldn't be saved. Close anyway and lose them?",
+      "Unsaved changes",
+      { confirmButtonText: "Close", cancelButtonText: "Keep editing", type: "warning" },
+    );
+    done();
+  } catch {
+    // stay open
+  }
+};
+
+const vizEditorRef = ref<InstanceType<typeof VisualizationEditor> | null>(null);
+
+const onVizEditorBeforeClose = async (done: () => void) => {
+  const editor = vizEditorRef.value;
+  if (!editor?.isDirty) {
+    done();
+    return;
+  }
+  await editor.flushDraft();
+  try {
+    await ElMessageBox.confirm(
+      "Close the chart builder? Your work is kept as a draft on this device.",
+      "Close chart builder",
+      { confirmButtonText: "Close", cancelButtonText: "Keep editing", type: "warning" },
+    );
+    done();
+  } catch {
+    // stay open
+  }
+};
+
+// New-visualization editor (opened from a table's right-click menu)
+const vizEditorOpen = ref(false);
+const vizEditorSource = ref<VizSourceDescriptor | null>(null);
+
+// Right-click context menu for catalog tables
+const tableMenu = ref<{ table: CatalogTable; x: number; y: number } | null>(null);
+const tableMenuOptions: ContextMenuOption[] = [
+  { label: "View table", action: "view" },
+  { label: "Use in flow", action: "read" },
+  { label: "Insert into notebook", action: "notebook" },
+  { label: "Query in SQL", action: "sql" },
+  { label: "Create visual", action: "visuals" },
+  { label: "Copy reference", action: "copy" },
+];
+
+// Right-click context menu for catalog models (artifacts)
+const artifactMenu = ref<{ artifact: GlobalArtifact; x: number; y: number } | null>(null);
+const artifactMenuOptions = computed<ContextMenuOption[]>(() => [
+  { label: "View model", action: "view" },
+  {
+    label: "Read in flow",
+    action: "read",
+    disabled: artifactMenu.value?.artifact.blob_exists === false,
+  },
+  { label: "Delete model", action: "delete", danger: true },
+]);
+
+// Right-click context menu for catalog flows
+const flowMenu = ref<{ flow: FlowRegistration; x: number; y: number } | null>(null);
+const flowMenuOptions = computed<ContextMenuOption[]>(() => [
+  { label: "Open flow in editor", action: "open", disabled: !flowMenu.value?.flow.file_exists },
+  { label: "Flow overview", action: "view" },
+  { label: "Run history", action: "runs" },
+]);
+// One-shot signal: scroll the flow detail panel to its Run History section.
+const flowDetailFocusRuns = ref(false);
+
+const showCreateVirtualTable = ref(false);
+
+const defaultNamespaceId = computed(() => catalogStore.defaultNamespaceId);
+
+// Polling
+let pollInterval: ReturnType<typeof setInterval> | null = null;
+const refreshing = ref(false);
+
+async function pollActiveRuns() {
+  const hadActiveRuns = catalogStore.activeRuns.length > 0;
+  await Promise.all([catalogStore.loadActiveRuns(), catalogStore.loadSchedulerStatus()]);
+  const hasActiveRuns = catalogStore.activeRuns.length > 0;
+
+  // When runs finish, refresh related data
+  if (hadActiveRuns && !hasActiveRuns) {
+    const loads: Promise<void>[] = [
+      catalogStore.loadRuns(catalogStore.selectedFlowId),
+      catalogStore.loadSchedules(),
+      catalogStore.loadStats(),
+    ];
+    if (catalogStore.selectedScheduleId !== null) {
+      loads.push(catalogStore.loadScheduleRuns(catalogStore.selectedScheduleId));
+      loads.push(catalogStore.loadScheduleDetail(catalogStore.selectedScheduleId));
+    }
+    await Promise.all(loads);
+  }
+}
+
+async function refreshAll() {
+  refreshing.value = true;
+  try {
+    await Promise.all([
+      catalogStore.loadActiveRuns(),
+      catalogStore.loadRuns(catalogStore.selectedFlowId),
+      catalogStore.loadSchedules(),
+      catalogStore.loadStats(),
+      catalogStore.loadTree(),
+      catalogStore.loadAllFlows(),
+      catalogStore.loadAllTables(),
+      catalogStore.loadSchedulerStatus(),
+    ]);
+  } finally {
+    refreshing.value = false;
+  }
+}
+
+// --- Demo catalog (optional sample data) ---
+
+const demoBusy = ref(false);
+const hasDemoCatalog = computed(() => catalogStore.tree.some((n) => n.name === "Demo"));
+
+async function handleLoadDemoData() {
+  demoBusy.value = true;
+  try {
+    await CatalogApi.seedDemoCatalog();
+    await refreshAll();
+    ElMessage.success("Demo catalog loaded");
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail ?? "Failed to load demo data");
+  } finally {
+    demoBusy.value = false;
+  }
+}
+
+async function handleRemoveDemoData() {
+  try {
+    await ElMessageBox.confirm(
+      "This removes the Demo catalog and all of its sample tables, flows and schedules. This cannot be undone.",
+      "Remove demo data",
+      { confirmButtonText: "Remove", cancelButtonText: "Cancel", type: "warning" },
+    );
+  } catch {
+    return;
+  }
+  demoBusy.value = true;
+  try {
+    await CatalogApi.removeDemoCatalog();
+    await refreshAll();
+    ElMessage.success("Demo catalog removed");
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail ?? "Failed to remove demo data");
+  } finally {
+    demoBusy.value = false;
+  }
+}
+
+// --- Route-based navigation ---
+
+function handleTabClick(tab: CatalogTab) {
+  router.push({ name: "catalog", query: { tab } });
+}
+
+function selectFlow(flowId: number) {
+  // Flow detail only renders on the catalog tab, so switch to it (the tree is
+  // visible on every tab).
+  router.push({
+    name: "catalog",
+    query: { tab: "catalog", flowId: String(flowId) },
+  });
+}
+
+function selectTable(tableId: number) {
+  router.push({
+    name: "catalog",
+    query: { tab: "catalog", tableId: String(tableId) },
+  });
+}
+
+function selectNamespace(namespaceId: number) {
+  router.push({
+    name: "catalog",
+    query: { tab: "catalog", namespaceId: String(namespaceId) },
+  });
+}
+
+function openVisualization(vizId: number) {
+  activeVizId.value = vizId;
+  vizViewerOpen.value = true;
+}
+
+function openNotebook(notebookId: number) {
+  void notebookStore.openNotebook(notebookId);
+  if (catalogStore.activeTab !== "notebook") {
+    router.push({ name: "catalog", query: { tab: "notebook" } });
+  }
+}
+
+async function handleDeleteNotebook(nb: NotebookSummary) {
+  try {
+    await ElMessageBox.confirm(
+      `Delete notebook "${nb.name}"? This cannot be undone.`,
+      "Delete notebook",
+      { confirmButtonText: "Delete", cancelButtonText: "Cancel", type: "warning" },
+    );
+  } catch {
+    return; // User cancelled
+  }
+  try {
+    await notebookStore.deleteNotebook(nb.id);
+    await Promise.all([catalogStore.loadTree(), catalogStore.loadStats()]);
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail ?? e?.message ?? "Failed to delete notebook");
+  }
+}
+
+function closeVizViewer() {
+  vizViewerOpen.value = false;
+  activeVizId.value = null;
+  // Keep the namespace tree in sync if the user renamed/deleted from the viewer.
+  catalogStore.loadTree().catch((err) => console.warn("[catalog] tree refresh failed", err));
+}
+
+function onTableContextMenu(payload: { table: CatalogTable; x: number; y: number }) {
+  tableMenu.value = payload;
+}
+
+function onTableMenuSelect(action: string) {
+  const table = tableMenu.value?.table;
+  if (!table) return;
+  if (action === "view") selectTable(table.id);
+  else if (action === "read") createReadInFlow(table);
+  else if (action === "notebook") openReadInNotebook(table);
+  else if (action === "sql") handleQueryTable(tableReference(table));
+  else if (action === "visuals") openCreateViz(table);
+  else if (action === "copy") copyTableReference(table);
+}
+
+function tableReference(table: CatalogTable): string {
+  return table.qualified_name ?? table.full_table_name ?? table.name;
+}
+
+function openReadInNotebook(table: CatalogTable) {
+  // The panel hydrates on mount, but the cell must exist before we navigate.
+  notebookStore.ensureHydrated();
+  notebookStore.insertReadCell(tableReference(table));
+  catalogStore.clearTableSelection();
+  router.push({ name: "catalog", query: { tab: "notebook" } });
+}
+
+async function copyTableReference(table: CatalogTable) {
+  const ref = buildTableRef(tableReference(table));
+  const ok = await copyToClipboard(ref);
+  if (ok) ElMessage.success(`Copied ${ref}`);
+  else ElMessage.error("Failed to copy reference");
+}
+
+function onArtifactContextMenu(payload: { artifact: GlobalArtifact; x: number; y: number }) {
+  artifactMenu.value = payload;
+}
+
+function onArtifactMenuSelect(action: string) {
+  const artifact = artifactMenu.value?.artifact;
+  if (!artifact) return;
+  if (action === "view") selectArtifact(artifact.id);
+  else if (action === "read") createReadInFlowFromArtifact(artifact);
+  else if (action === "delete") handleDeleteArtifact(artifact);
+}
+
+function onFlowContextMenu(payload: { flow: FlowRegistration; x: number; y: number }) {
+  flowMenu.value = payload;
+}
+
+function onFlowMenuSelect(action: string) {
+  const flow = flowMenu.value?.flow;
+  if (!flow) return;
+  if (action === "view") selectFlow(flow.id);
+  else if (action === "open") openFlowInDesigner(flow);
+  else if (action === "runs") {
+    flowDetailFocusRuns.value = true;
+    selectFlow(flow.id);
+  }
+}
+
+const NEW_FLOW_NODE_POSITION = { x: 200, y: 200 };
+
+// Spin up a fresh flow whose only node is a catalog reader pre-configured for the
+// given table, then open it in the designer. Mirrors the setting_input the
+// CatalogReader node persists for a configured table (is_setup: true).
+async function createReadInFlow(table: CatalogTable) {
+  try {
+    const flowId = await FlowApi.createFlow(null, null, null, false);
+    await FlowApi.applyOperations(
+      flowId,
+      "Add catalog_reader node",
+      addConfiguredNodeOperations(flowId, 1, "catalog_reader", NEW_FLOW_NODE_POSITION, {
+        catalog_table_id: table.id,
+        catalog_table_name: table.name,
+        catalog_full_table_name: null,
+        catalog_namespace_id: table.namespace_id,
+        delta_version: null,
+        sql_query: null,
+        cache_results: false,
+        is_setup: true,
+        description: "",
+      }),
+    );
+    flowStore.setFlowId(flowId);
+    router.push({ name: "designer" });
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail ?? "Failed to create read flow");
+  }
+}
+
+// Spin up a fresh flow whose only node is a Python Script that loads the given
+// model from the catalog, then open it in the designer. Mirrors createReadInFlow
+// (tables) but targets the kernel-backed python_script node where flowfile_ctx lives.
+async function createReadInFlowFromArtifact(artifact: GlobalArtifact) {
+  try {
+    const flowId = await FlowApi.createFlow(null, null, null, false);
+    const id = artifact.namespace_id;
+    let nsArg = "";
+    if (id !== null && id !== undefined) {
+      const nsName = catalogStore.getNamespaceName(id);
+      nsArg = nsName ? `, namespace=${JSON.stringify(nsName)}` : `, namespace_id=${id}`;
+    }
+    // Omit version so the flow always reads the latest model (picks up retrains).
+    const code = `obj = flowfile_ctx.get_global("${artifact.name}"${nsArg})\nobj`;
+    await FlowApi.applyOperations(
+      flowId,
+      "Add python_script node",
+      addConfiguredNodeOperations(flowId, 1, "python_script", NEW_FLOW_NODE_POSITION, {
+        cache_results: false,
+        is_setup: true,
+        description: "",
+        depending_on_ids: [],
+        output_names: ["main"],
+        python_script_input: { code, kernel_id: null },
+      }),
+    );
+    flowStore.setFlowId(flowId);
+    router.push({ name: "designer" });
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail ?? "Failed to create read flow");
+  }
+}
+
+function openCreateViz(table: CatalogTable) {
+  vizEditorSource.value = { source_type: "table", table_id: table.id };
+  vizEditorOpen.value = true;
+}
+
+function onVizCreated() {
+  vizEditorOpen.value = false;
+  vizEditorSource.value = null;
+  catalogStore.loadTree().catch((err) => console.warn("[catalog] tree refresh failed", err));
+}
+
+function selectArtifact(artifactId: number) {
+  router.push({
+    name: "catalog",
+    query: { tab: "catalog", artifactId: String(artifactId) },
+  });
+}
+
+function handleViewRun(runId: number) {
+  const q: Record<string, string> = { tab: catalogStore.activeTab };
+  if (catalogStore.selectedScheduleId !== null) {
+    q.scheduleId = String(catalogStore.selectedScheduleId);
+  } else if (catalogStore.selectedFlowId !== null) {
+    q.flowId = String(catalogStore.selectedFlowId);
+  }
+  q.runId = String(runId);
+  router.push({ name: "catalog", query: q });
+}
+
+// Set by the route watcher below, so it is false only on the entry navigation.
+const navigatedWithinCatalog = ref(false);
+
+function handleCloseDetail() {
+  // The sidebar can restore straight onto a detail panel, where the previous history entry
+  // belongs to another page — clear the selection rather than leaving the catalog.
+  if (navigatedWithinCatalog.value) router.back();
+  else router.push({ name: "catalog", query: { tab: catalogStore.activeTab } });
+}
+
+// Namespace-qualified reference so same-named models in other schemas can't bleed
+// into this artifact's version list.
+function selectedArtifactRef(a: GlobalArtifact): string {
+  const path = a.namespace_id === null ? [] : findNamespacePath(catalogStore.tree, a.namespace_id);
+  return artifactRef(a.name, path);
+}
+
+watch(
+  () => {
+    const a = catalogStore.selectedArtifact;
+    return a ? `${a.namespace_id ?? ""}::${a.name}` : null;
+  },
+  () => {
+    const a = catalogStore.selectedArtifact;
+    if (!a) {
+      catalogStore.clearArtifactVersions();
+      return;
+    }
+    catalogStore.loadArtifactVersions(selectedArtifactRef(a), a.namespace_id, 1);
+  },
+  { immediate: true },
+);
+
+/**
+ * Post-mutation refresh: reload the version page (stepping back when the current
+ * page emptied out) and re-resolve the artifact itself, since promote mints a new
+ * latest row and the panel's stat cards must stay truthful.
+ */
+async function refreshArtifactVersions(page?: number) {
+  await catalogStore.reloadArtifactVersions(page);
+  const settled = pageAfterDelete(
+    catalogStore.artifactVersionsPage,
+    catalogStore.artifactVersionsTotal,
+  );
+  if (settled !== catalogStore.artifactVersionsPage) {
+    await catalogStore.reloadArtifactVersions(settled);
+  }
+  const previousId = catalogStore.selectedArtifactId;
+  await catalogStore.refreshSelectedArtifact();
+  const nextId = catalogStore.selectedArtifactId;
+  if (nextId !== null && nextId !== previousId) {
+    router.replace({ name: "catalog", query: { tab: "catalog", artifactId: String(nextId) } });
+  }
+  catalogStore.loadStats();
+}
+
+async function handleDeleteArtifactVersion(version: ArtifactVersionInfo) {
+  const name = catalogStore.selectedArtifact?.name ?? "";
+  try {
+    await ElMessageBox.confirm(
+      `Delete version v${version.version} of "${name}"? Its data file is removed permanently.`,
+      "Delete version",
+      { confirmButtonText: "Delete", cancelButtonText: "Cancel", type: "warning" },
+    );
+  } catch {
+    return; // User cancelled
+  }
+  try {
+    await catalogStore.deleteArtifactVersion(version.id);
+    await refreshArtifactVersions();
+  } catch (e: any) {
+    ElMessage.error(apiErrorMessage(e, "Failed to delete version"));
+  }
+}
+
+async function handlePromoteArtifactVersion(version: ArtifactVersionInfo) {
+  const name = catalogStore.selectedArtifact?.name ?? "";
+  try {
+    await ElMessageBox.confirm(
+      `Restore v${version.version} of "${name}"? It is copied forward as a new version, ` +
+        "so nothing is deleted and you can always come back.",
+      "Restore version",
+      { confirmButtonText: "Restore", cancelButtonText: "Cancel", type: "warning" },
+    );
+  } catch {
+    return; // User cancelled
+  }
+  try {
+    const promoted = await catalogStore.promoteArtifactVersion(version.id);
+    ElMessage.success(`Restored v${version.version} as v${promoted.version}`);
+    await refreshArtifactVersions(1);
+  } catch (e: any) {
+    ElMessage.error(apiErrorMessage(e, "Failed to restore version"));
+  }
+}
+
+function openCreateSchema(parentId: number) {
+  createSchemaParentId.value = parentId;
+  showCreateNamespace.value = true;
+}
+
+function openRegisterFlow(namespaceId: number) {
+  registerFlowNamespaceId.value = namespaceId;
+  showRegisterFlow.value = true;
+}
+
+function openRegisterTable(namespaceId: number) {
+  registerTableNamespaceId.value = namespaceId;
+  showRegisterTable.value = true;
+}
+
+/** Open register table modal from the sidebar header (no pre-selected namespace). */
+function openRegisterTableGlobal() {
+  registerTableNamespaceId.value =
+    defaultNamespaceId.value ?? writableSchemaNamespaces.value[0]?.id ?? null;
+  showRegisterTable.value = true;
+}
+
+function openRegisterFlowGlobal() {
+  registerFlowNamespaceId.value = defaultNamespaceId.value ?? null;
+  showRegisterFlow.value = true;
+}
+
+function quoteSqlName(name: string): string {
+  return /^[a-zA-Z_]\w*$/.test(name) ? name : `"${name}"`;
+}
+
+// Quote each dotted segment of a (fully-qualified) reference so catalog.schema.table
+// resolves collision-free. Splitting on '.' is safe — names can't contain a dot.
+function buildTableRef(reference: string): string {
+  return reference.split(".").map(quoteSqlName).join(".");
+}
+
+function handleQueryTable(reference: string) {
+  sqlEditorStore.openQuery(`SELECT * FROM ${buildTableRef(reference)}`, reference.split(".").pop());
+  // Clear selected table so the SQL editor panel shows
+  catalogStore.clearTableSelection();
+  router.push({ name: "catalog", query: { tab: "sql" } });
+}
+
+function handleEditTableSql({ table, link }: { table: CatalogTable; link: boolean }) {
+  sqlEditorStore.openVirtualTable(table, { link });
+  catalogStore.clearTableSelection();
+  router.push({ name: "catalog", query: { tab: "sql" } });
+}
+
+// Confirm dialog with an "also delete from disk" checkbox (default on). Returns
+// the checkbox state on confirm, or null when the user cancels.
+async function confirmDeleteWithFile(opts: {
+  title: string;
+  question: string;
+  fileLabel: string;
+}): Promise<{ deleteFile: boolean } | null> {
+  const deleteFile = ref(true);
+  try {
+    await ElMessageBox.confirm(
+      () =>
+        h("div", [
+          h("p", { style: "margin: 0 0 12px" }, opts.question),
+          h(
+            ElCheckbox,
+            {
+              modelValue: deleteFile.value,
+              "onUpdate:modelValue": (v: boolean | string | number) =>
+                (deleteFile.value = Boolean(v)),
+            },
+            () => opts.fileLabel,
+          ),
+        ]),
+      opts.title,
+      { confirmButtonText: "Delete", cancelButtonText: "Cancel", type: "warning" },
+    );
+  } catch {
+    return null; // User cancelled
+  }
+  return { deleteFile: deleteFile.value };
+}
+
+async function handleDeleteTable(tableId: number) {
+  const result = await confirmDeleteWithFile({
+    title: "Delete Table",
+    question: "Delete this table from the catalog?",
+    fileLabel: "Also delete the table data from disk",
+  });
+  if (!result) return;
+  try {
+    await CatalogApi.deleteTable(tableId, result.deleteFile);
+    catalogStore.clearTableSelection();
+    await Promise.all([
+      catalogStore.loadTree(),
+      catalogStore.loadAllTables(),
+      catalogStore.loadStats(),
+    ]);
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail ?? "Failed to delete table");
+  }
+}
+
+// Delete a model (all versions). Backend hard-deletes the blobs; mirrors the
+// table delete flow (confirm -> API -> clear selection -> refresh).
+async function handleDeleteArtifact(artifact: GlobalArtifact) {
+  try {
+    await ElMessageBox.confirm(
+      `Are you sure you want to delete the model "${artifact.name}"? All versions and their data will be removed.`,
+      "Delete Model",
+      {
+        confirmButtonText: "Delete",
+        cancelButtonText: "Cancel",
+        type: "warning",
+      },
+    );
+  } catch {
+    return; // User cancelled
+  }
+  try {
+    await CatalogApi.deleteArtifact(artifact.name, artifact.namespace_id);
+    catalogStore.clearArtifactSelection();
+    await Promise.all([catalogStore.loadTree(), catalogStore.loadStats()]);
+  } catch (e: any) {
+    ElMessage.error(apiErrorMessage(e, "Failed to delete model"));
+  }
+}
+
+async function handleDeleteFlow(flowId: number) {
+  const result = await confirmDeleteWithFile({
+    title: "Delete Flow",
+    question: "Delete this flow from the catalog? Run history will also be removed.",
+    fileLabel: "Also delete the flow file from disk",
+  });
+  if (!result) return;
+  try {
+    await CatalogApi.deleteFlow(flowId, result.deleteFile);
+    projectStore.onSourceChanged();
+    catalogStore.selectedFlowId = null;
+    await Promise.all([
+      catalogStore.loadTree(),
+      catalogStore.loadAllFlows(),
+      catalogStore.loadFavorites(),
+      catalogStore.loadFollowing(),
+      catalogStore.loadStats(),
+    ]);
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail ?? "Failed to delete flow");
+  }
+}
+
+async function handleDeleteSchema(schema: NamespaceTree) {
+  try {
+    await ElMessageBox.confirm(`Delete the empty schema "${schema.name}"?`, "Delete schema", {
+      confirmButtonText: "Delete",
+      cancelButtonText: "Cancel",
+      type: "warning",
+    });
+  } catch {
+    return;
+  }
+  try {
+    await CatalogApi.deleteNamespace(schema.id);
+    ElMessage.success(`Deleted schema ${schema.name}`);
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail ?? "Could not delete the schema");
+  }
+  await Promise.all([catalogStore.loadTree(), catalogStore.loadStats()]);
+  // The open catalog panel reads its schemas from the selected node, which the reload replaced
+  if (catalogStore.selectedNamespaceId !== null) {
+    catalogStore.selectedNamespace = catalogStore.findNamespaceInTree(
+      catalogStore.selectedNamespaceId,
+    );
+  }
+}
+
+const cleanupInProgress = ref(false);
+
+async function handleCleanupNamespace(node: NamespaceTree) {
+  if (cleanupInProgress.value) return;
+  try {
+    await ElMessageBox.confirm(
+      `Delete all ${node.flows.length} flow registrations in "${node.name}" and their scratch files? ` +
+        "Flows with published artifacts are kept. Deleted files cannot be recovered, and a draft " +
+        "that is still open re-registers here if you run it again.",
+      "Clean up flows",
+      { confirmButtonText: "Delete all", cancelButtonText: "Cancel", type: "warning" },
+    );
+  } catch {
+    return;
+  }
+  cleanupInProgress.value = true;
+  // Full-screen lock: the sweep deletes row-by-row and can take seconds on a big
+  // backlog; leaving the tree clickable invites a second, racing sweep.
+  const loading = ElLoading.service({
+    lock: true,
+    text: `Cleaning up "${node.name}"…`,
+  });
+  try {
+    const result = await CatalogApi.cleanupNamespaceFlows(node.id);
+    ElMessage.success(
+      result.kept > 0
+        ? `Removed ${result.deleted} flows (${result.kept} kept)`
+        : `Removed ${result.deleted} flows`,
+    );
+    projectStore.onSourceChanged();
+    catalogStore.selectedFlowId = null;
+    await Promise.all([
+      catalogStore.loadTree(),
+      catalogStore.loadAllFlows(),
+      catalogStore.loadFavorites(),
+      catalogStore.loadFollowing(),
+      catalogStore.loadStats(),
+    ]);
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail ?? "Cleanup failed");
+  } finally {
+    loading.close();
+    cleanupInProgress.value = false;
+  }
+}
+
+async function handleRenameFlow(flowId: number, newName: string) {
+  try {
+    const updated = await CatalogApi.updateFlow(flowId, { name: newName });
+    // Recents are keyed by path and the rename doesn't move the file.
+    if (updated?.flow_path) renameRecentFlow(updated.flow_path, updated.name);
+    void reconcileWithCatalog();
+    await Promise.all([
+      catalogStore.loadTree(),
+      catalogStore.loadAllFlows(),
+      catalogStore.loadFavorites(),
+      catalogStore.loadFollowing(),
+    ]);
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail ?? "Failed to rename flow");
+  }
+}
+
+let openingSnapshot = false;
+
+async function openRunSnapshot(runId: number) {
+  if (openingSnapshot) return;
+  openingSnapshot = true;
+  const loading = ElLoading.service({ text: "Opening flow version…" });
+  try {
+    const flowId = await CatalogApi.openRunSnapshot(runId);
+    flowStore.setFlowId(flowId);
+    const failure = await router.push({ name: "designer" });
+    if (failure) ElMessage.error("Could not open the designer");
+  } catch (e: any) {
+    console.error("Failed to open run snapshot:", e);
+    ElMessage.error(e?.response?.data?.detail ?? "Failed to open flow snapshot");
+  } finally {
+    loading.close();
+    openingSnapshot = false;
+  }
+}
+
+async function openFlowInDesigner(
+  flow: Pick<FlowRegistration, "flow_path" | "name" | "namespace_id" | "id">,
+  options: { codePane?: CodeMode } = {},
+) {
+  // openFlow owns the shared contract: reuse an already-open session by catalog
+  // id (falling back to importFlow), set the flow id, record recents, and notify
+  // on failure. We only build catalogRef (exactly like reconcileWithCatalog) and
+  // navigate to the designer once the open succeeds.
+  const nsPath =
+    flow.namespace_id != null ? findNamespacePath(catalogStore.tree, flow.namespace_id) : [];
+  const flowId = await openFlow(flow.flow_path, {
+    name: flow.name,
+    catalogRef: nsPath.length ? `${nsPath.join(".")}.${flow.name}` : undefined,
+    catalogId: flow.id,
+  });
+  if (flowId !== null) {
+    // Requested before the navigation so the code pane applies it as it mounts.
+    if (options.codePane) useEditorStore().openCodePane(options.codePane);
+    router.push({ name: "designer" });
+  }
+}
+
+function navigateToFlow(registrationId: number) {
+  router.push({
+    name: "catalog",
+    query: { tab: "catalog", flowId: String(registrationId) },
+  });
+}
+
+function selectSchedule(scheduleId: number) {
+  router.push({
+    name: "catalog",
+    query: { tab: catalogStore.activeTab, scheduleId: String(scheduleId) },
+  });
+}
+
+function navigateToScheduleRuns(scheduleId: number) {
+  selectSchedule(scheduleId);
+}
+
+function handleAddFlowSchedule(flowId: number) {
+  preselectedFlowId.value = flowId;
+  showCreateSchedule.value = true;
+}
+
+/**
+ * `notifyChannelId` is the modal's optional "Notify on failure" pick. Wiring the
+ * alert up is best-effort: the schedule already exists, so a failure there warns
+ * instead of surfacing as a failed creation.
+ */
+async function handleCreateSchedule(body: FlowScheduleCreate, notifyChannelId?: number | null) {
+  try {
+    const created = await CatalogApi.createSchedule(body);
+    showCreateSchedule.value = false;
+    preselectedFlowId.value = null;
+    if (notifyChannelId) {
+      try {
+        await notificationsStore.createRule({
+          channel_id: notifyChannelId,
+          schedule_id: created.id,
+          on_failure: true,
+          on_recovery: true,
+          on_success: false,
+        });
+      } catch {
+        ElMessage.warning("Schedule created, but the failure alert could not be set up.");
+      }
+    }
+    const loads: Promise<void>[] = [catalogStore.loadSchedules(), catalogStore.loadStats()];
+    if (catalogStore.selectedFlowId) {
+      loads.push(catalogStore.loadFlowSchedules(catalogStore.selectedFlowId));
+    }
+    await Promise.all(loads);
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail ?? "Failed to create schedule");
+  }
+}
+
+async function handleRunNow(scheduleId: number) {
+  try {
+    await CatalogApi.triggerScheduleNow(scheduleId);
+    await Promise.all([
+      catalogStore.loadActiveRuns(),
+      catalogStore.loadRuns(catalogStore.selectedFlowId),
+      catalogStore.loadSchedules(),
+    ]);
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail ?? "Failed to trigger run");
+  }
+}
+
+async function handleToggleSchedule(id: number, enabled: boolean) {
+  try {
+    await CatalogApi.updateSchedule(id, { enabled });
+    await catalogStore.loadSchedules();
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail ?? "Failed to update schedule");
+  }
+}
+
+async function handleDeleteSchedule(id: number) {
+  try {
+    await ElMessageBox.confirm(
+      "Are you sure you want to delete this schedule?",
+      "Delete Schedule",
+      {
+        confirmButtonText: "Delete",
+        cancelButtonText: "Cancel",
+        type: "warning",
+      },
+    );
+  } catch {
+    return; // User cancelled
+  }
+  try {
+    await CatalogApi.deleteSchedule(id);
+    await Promise.all([catalogStore.loadSchedules(), catalogStore.loadStats()]);
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail ?? "Failed to delete schedule");
+  }
+}
+
+async function handleCancelScheduleRun(schedule: FlowSchedule) {
+  try {
+    const activeRuns = catalogStore.activeRuns.filter((r) => r.schedule_id === schedule.id);
+    for (const run of activeRuns) {
+      await catalogStore.cancelRun(run.id);
+    }
+    await Promise.all([
+      catalogStore.loadActiveRuns(),
+      catalogStore.loadSchedules(),
+      catalogStore.loadRuns(catalogStore.selectedFlowId),
+      catalogStore.loadStats(),
+    ]);
+    ElMessage.success("Run cancelled");
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail ?? "Failed to cancel run");
+  }
+}
+
+async function handleToggleScheduleFromDetail(id: number, enabled: boolean) {
+  try {
+    await CatalogApi.updateSchedule(id, { enabled });
+    await Promise.all([catalogStore.loadScheduleDetail(id), catalogStore.loadSchedules()]);
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail ?? "Failed to update schedule");
+  }
+}
+
+async function handleDeleteScheduleFromDetail(id: number) {
+  try {
+    await ElMessageBox.confirm(
+      "Are you sure you want to delete this schedule?",
+      "Delete Schedule",
+      {
+        confirmButtonText: "Delete",
+        cancelButtonText: "Cancel",
+        type: "warning",
+      },
+    );
+  } catch {
+    return; // User cancelled
+  }
+  try {
+    await CatalogApi.deleteSchedule(id);
+    catalogStore.clearScheduleSelection();
+    router.push({ name: "catalog", query: { tab: catalogStore.activeTab } });
+    await Promise.all([catalogStore.loadSchedules(), catalogStore.loadStats()]);
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail ?? "Failed to delete schedule");
+  }
+}
+
+async function handleRunNowFromDetail(scheduleId: number) {
+  try {
+    await CatalogApi.triggerScheduleNow(scheduleId);
+    await Promise.all([
+      catalogStore.loadActiveRuns(),
+      catalogStore.loadScheduleRuns(scheduleId),
+      catalogStore.loadScheduleDetail(scheduleId),
+      catalogStore.loadSchedules(),
+    ]);
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail ?? "Failed to trigger run");
+  }
+}
+
+async function handleRunFlow(flowId: number) {
+  try {
+    await CatalogApi.runFlow(flowId);
+    await Promise.all([catalogStore.loadActiveRuns(), catalogStore.loadRuns(flowId)]);
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail ?? "Failed to trigger run");
+  }
+}
+
+async function handleCancelFlowRun(flowId: number) {
+  try {
+    const activeRuns = catalogStore.activeRuns.filter((r) => r.registration_id === flowId);
+    for (const run of activeRuns) {
+      await catalogStore.cancelRun(run.id);
+    }
+    await Promise.all([
+      catalogStore.loadActiveRuns(),
+      catalogStore.loadRuns(flowId),
+      catalogStore.loadStats(),
+    ]);
+    ElMessage.success("Run cancelled");
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail ?? "Failed to cancel run");
+  }
+}
+
+// --- Route → Store sync ---
+
+function routeTab(): CatalogTab {
+  return nestedPageTab.value ?? ((route.query.tab as CatalogTab) || "runs");
+}
+
+function applyRouteToStore() {
+  // A nested page owns its own state; only its tab is pinned.
+  if (nestedPageTab.value) {
+    catalogStore.activeTab = nestedPageTab.value;
+    return;
+  }
+  const q = route.query;
+  const tab = routeTab();
+  const flowId = q.flowId ? Number(q.flowId) : null;
+  const runId = q.runId ? Number(q.runId) : null;
+  const artifactId = q.artifactId ? Number(q.artifactId) : null;
+  const tableId = q.tableId ? Number(q.tableId) : null;
+  const scheduleId = q.scheduleId ? Number(q.scheduleId) : null;
+  const scheduleFlowId = q.scheduleFlowId ? Number(q.scheduleFlowId) : null;
+  const namespaceId = q.namespaceId ? Number(q.namespaceId) : null;
+
+  // Update tab (set directly to avoid setActiveTab clearing selections)
+  if (catalogStore.activeTab !== tab) {
+    catalogStore.activeTab = tab;
+    if (tab === "favorites") catalogStore.loadFavorites();
+    else if (tab === "runs" && !flowId) catalogStore.loadRuns();
+    else if (tab === "schedules") catalogStore.loadSchedules();
+    else if (tab === "catalog") catalogStore.loadTree();
+  }
+
+  // Namespace (catalog) settings is exclusive with all other selections; selectNamespace
+  // clears them, and the chain below leaves namespace untouched when one of them is in the URL.
+  if (namespaceId !== null) {
+    if (namespaceId !== catalogStore.selectedNamespaceId) catalogStore.selectNamespace(namespaceId);
+  } else if (catalogStore.selectedNamespace) {
+    catalogStore.clearNamespaceSelection();
+  }
+
+  // Handle selections (mutually exclusive: table, artifact, schedule, or flow+run)
+  if (tableId !== null) {
+    if (tableId !== catalogStore.selectedTableId) catalogStore.selectTable(tableId);
+    if (catalogStore.selectedArtifact) catalogStore.clearArtifactSelection();
+    if (catalogStore.selectedSchedule) catalogStore.clearScheduleSelection();
+  } else if (scheduleId !== null) {
+    if (scheduleId !== catalogStore.selectedScheduleId) catalogStore.selectSchedule(scheduleId);
+    if (catalogStore.selectedArtifact) catalogStore.clearArtifactSelection();
+    if (catalogStore.selectedTable) catalogStore.clearTableSelection();
+  } else if (artifactId !== null) {
+    if (artifactId !== catalogStore.selectedArtifactId) {
+      catalogStore.selectedFlowId = null;
+      catalogStore.clearTableSelection();
+      catalogStore.clearScheduleSelection();
+      catalogStore.selectArtifact(artifactId);
+    }
+  } else {
+    // Clear table, artifact, and schedule if not in URL
+    if (catalogStore.selectedTable) catalogStore.clearTableSelection();
+    if (catalogStore.selectedArtifact) catalogStore.clearArtifactSelection();
+    if (catalogStore.selectedSchedule) catalogStore.clearScheduleSelection();
+
+    // Flow selection (set manually to avoid selectFlow clearing run detail)
+    if (flowId !== null) {
+      if (flowId !== catalogStore.selectedFlowId) {
+        catalogStore.selectedFlowId = flowId;
+        catalogStore.clearTableSelection();
+        catalogStore.clearArtifactSelection();
+        catalogStore.clearScheduleSelection();
+        catalogStore.loadRuns(flowId);
+        catalogStore.loadFlowArtifacts(flowId);
+        catalogStore.loadFlowSchedules(flowId);
+      }
+    } else if (catalogStore.selectedFlowId !== null) {
+      catalogStore.selectedFlowId = null;
+    }
+  }
+
+  // Run detail can coexist with any selection (schedule, flow, etc.)
+  if (runId !== null) {
+    if (runId !== catalogStore.selectedRunId) catalogStore.loadRunDetail(runId);
+  } else if (catalogStore.selectedRunDetail) {
+    catalogStore.selectedRunId = null;
+    catalogStore.selectedRunDetail = null;
+  }
+
+  // Deep link from the Kafka sync flow: open the schedule modal preselected to
+  // the new flow, then strip the param so it doesn't re-fire on later navigation.
+  if (scheduleFlowId !== null) {
+    preselectedFlowId.value = scheduleFlowId;
+    showCreateSchedule.value = true;
+    const rest = { ...route.query };
+    delete rest.scheduleFlowId;
+    router.replace({ query: rest });
+  }
+}
+
+// Watch route changes (handles browser back/forward)
+watch(
+  () => route.query,
+  () => {
+    navigatedWithinCatalog.value = true;
+    applyRouteToStore();
+  },
+);
+
+onMounted(async () => {
+  // Pin the route's tab before the overview loads, or the store's previous (or default)
+  // tab renders first and the page visibly jumps once the data arrives.
+  catalogStore.activeTab = routeTab();
+  await catalogStore.initialize();
+  applyRouteToStore(); // Restore selections from URL after data is loaded
+  pollInterval = setInterval(pollActiveRuns, 20_000);
+});
+
+onUnmounted(() => {
+  if (pollInterval !== null) {
+    clearInterval(pollInterval);
+    pollInterval = null;
+  }
+});
+</script>
+
+<!-- Shared catalog styles: inherited by all child components via .catalog-view ancestor -->
+<style>
+/* ========== Back Button ========== */
+.catalog-view .back-btn {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-1);
+  padding: var(--spacing-1) var(--spacing-2);
+  border: 1px solid var(--color-border-primary);
+  border-radius: var(--border-radius-md);
+  background: var(--color-background-primary);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+  margin-bottom: var(--spacing-3);
+}
+
+.catalog-view .back-btn:hover {
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+}
+
+/* ========== Meta Grid ========== */
+.catalog-view .meta-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: var(--spacing-3);
+  margin-bottom: var(--spacing-5);
+}
+
+.catalog-view .meta-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-1);
+  padding: var(--spacing-3);
+  background: var(--color-background-secondary);
+  border-radius: var(--border-radius-md);
+  border: 1px solid var(--color-border-light);
+}
+
+.catalog-view .meta-label {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.catalog-view .meta-value {
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-primary);
+}
+
+.catalog-view .meta-value.mono {
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-xs);
+  word-break: break-all;
+}
+
+/* ========== Sections ========== */
+.catalog-view .section {
+  margin-bottom: var(--spacing-5);
+}
+
+.catalog-view .section h3 {
+  display: flex;
+  align-items: center;
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-semibold);
+  margin: 0 0 var(--spacing-3) 0;
+  color: var(--color-text-primary);
+}
+
+.catalog-view .section-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: var(--spacing-2);
+}
+
+.catalog-view .section-header h3 {
+  margin: 0;
+}
+
+.catalog-view .section-icon {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+  margin-right: var(--spacing-1);
+}
+
+/* ========== Summary Cards ========== */
+.catalog-view .summary-cards {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: var(--spacing-3);
+  margin-bottom: var(--spacing-4);
+}
+
+.catalog-view .summary-cards-3 {
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.catalog-view .summary-card {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-3);
+  padding: var(--spacing-3);
+  background: var(--color-background-secondary);
+  border-radius: var(--border-radius-md);
+  border: 1px solid var(--color-border-light);
+}
+
+.catalog-view .summary-icon {
+  font-size: var(--font-size-lg);
+  color: var(--color-primary);
+}
+
+.catalog-view .success-icon {
+  color: var(--color-success);
+}
+
+.catalog-view .failure-icon {
+  color: var(--color-danger);
+}
+
+.catalog-view .running-icon {
+  color: var(--color-info);
+}
+
+.catalog-view .enabled-icon {
+  color: var(--color-success);
+}
+
+.catalog-view .summary-info {
+  display: flex;
+  flex-direction: column;
+}
+
+.catalog-view .summary-value {
+  font-size: var(--font-size-lg);
+  font-weight: var(--font-weight-bold);
+  color: var(--color-text-primary);
+  line-height: 1.2;
+}
+
+.catalog-view .summary-label {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+}
+
+/* ========== Status Badges ========== */
+.catalog-view .status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: var(--border-radius-full);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-medium);
+}
+
+.catalog-view .status-badge.success,
+.catalog-view .status-badge.active {
+  background: color-mix(in srgb, var(--color-success) 12%, transparent);
+  color: var(--color-success);
+}
+
+.catalog-view .status-badge.failure {
+  background: color-mix(in srgb, var(--color-danger) 12%, transparent);
+  color: var(--color-danger);
+}
+
+.catalog-view .status-badge.pending {
+  background: color-mix(in srgb, var(--color-warning) 12%, transparent);
+  color: var(--color-warning);
+}
+
+.catalog-view .status-badge.running {
+  background: color-mix(in srgb, var(--color-info) 12%, transparent);
+  color: var(--color-info);
+}
+
+.catalog-view .status-badge.enabled {
+  background: color-mix(in srgb, var(--color-success) 12%, transparent);
+  color: var(--color-success);
+}
+
+.catalog-view .status-badge.paused {
+  background: rgba(156, 163, 175, 0.15);
+  color: var(--color-text-muted);
+}
+
+.catalog-view .status-badge.deleted {
+  background: color-mix(in srgb, var(--color-danger) 12%, transparent);
+  color: var(--color-danger);
+}
+
+.catalog-view .status-badge.unavailable {
+  background: color-mix(in srgb, var(--color-warning) 12%, transparent);
+  color: var(--color-warning);
+}
+
+/* ========== Notification channel tags ========== */
+/* Shared by the Alerts panel and every rules list, so it lives here rather than in
+   one component's scoped block (scoped styles don't cross component boundaries). */
+.catalog-view .channel-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  padding: 2px 8px;
+  border-radius: var(--border-radius-full);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-medium);
+  background: rgba(156, 163, 175, 0.15);
+  color: var(--color-text-muted);
+}
+
+.catalog-view .channel-tag.slack {
+  background: rgba(74, 21, 75, 0.12);
+  color: #6d28d9;
+}
+
+.catalog-view .channel-tag.discord {
+  background: rgba(88, 101, 242, 0.14);
+  color: #4c51cf;
+}
+
+.catalog-view .channel-tag.teams {
+  background: rgba(70, 90, 200, 0.14);
+  color: #3f4aa8;
+}
+
+.catalog-view .channel-tag.generic {
+  background: color-mix(in srgb, var(--color-info) 12%, transparent);
+  color: var(--color-info);
+}
+
+/* Brand hues legible on dark backgrounds (the light values sink into them). */
+[data-theme="dark"] .catalog-view .channel-tag.slack {
+  background: rgba(124, 58, 237, 0.22);
+  color: #b794f4;
+}
+
+[data-theme="dark"] .catalog-view .channel-tag.discord {
+  background: rgba(88, 101, 242, 0.22);
+  color: #a5b0fb;
+}
+
+[data-theme="dark"] .catalog-view .channel-tag.teams {
+  background: rgba(75, 83, 188, 0.25);
+  color: #a3aaf0;
+}
+
+/* Small "what does this mean?" affordance next to a table header or label;
+   pair with an el-tooltip. Shared across the alerts tables. The tooltip stamps
+   `el-tooltip__trigger` onto the <i> itself, which drags in the global
+   `[class*=" el-"]` app-font rule — restore the icon font explicitly. */
+.catalog-view .header-help {
+  margin-left: 4px;
+  color: var(--color-text-muted);
+  opacity: 0.8;
+  cursor: help;
+  font-family: var(--fa-style-family-classic, "Font Awesome 6 Free");
+  font-weight: 400;
+}
+
+/* Muted one-line empty text for lists inside a section (rules, history). */
+.catalog-view .rules-empty {
+  margin: 0;
+  font-size: var(--font-size-sm);
+  color: var(--color-text-muted);
+}
+
+/* ========== Catalog dialog family ==========
+   Shared chrome for CreateScheduleModal / CreateChannelModal (both carry the
+   .catalog-dialog class and render in place, so .catalog-view reaches them):
+   rounded dialog, compact form rhythm, icon header, type-card picker. */
+.catalog-view .catalog-dialog .el-dialog {
+  border-radius: var(--border-radius-lg);
+  overflow: hidden;
+}
+
+.catalog-view .catalog-dialog .el-dialog__header {
+  margin-right: 0;
+  padding-bottom: var(--spacing-2);
+  border-bottom: 1px solid var(--el-border-color-lighter);
+}
+
+.catalog-view .catalog-dialog .el-dialog__body {
+  padding-top: var(--spacing-3);
+  padding-bottom: var(--spacing-1);
+}
+
+/* :where keeps this overridable by scoped per-panel rules (options-panel, value-row). */
+.catalog-view .catalog-dialog :where(.el-form-item) {
+  margin-bottom: var(--spacing-3);
+}
+
+.catalog-view .catalog-dialog .el-form-item__label {
+  padding-bottom: 3px;
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+  color: var(--el-text-color-regular);
+  line-height: 1.3;
+}
+
+.catalog-view .dialog-header {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-3);
+}
+
+.catalog-view .dialog-header-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+  border-radius: var(--border-radius-md);
+  background: var(--el-color-primary-light-9);
+  color: var(--el-color-primary);
+  font-size: 15px;
+}
+
+.catalog-view .dialog-header-text {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.25;
+}
+
+.catalog-view .dialog-title {
+  font-size: var(--font-size-xl);
+  font-weight: var(--font-weight-semibold);
+  color: var(--el-text-color-primary);
+}
+
+.catalog-view .dialog-subtitle {
+  font-size: var(--font-size-sm);
+  color: var(--el-text-color-secondary);
+}
+
+.catalog-view .type-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+}
+
+.catalog-view .type-card {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-3);
+  width: 100%;
+  padding: var(--spacing-2) var(--spacing-3);
+  border: 1px solid var(--el-border-color);
+  border-radius: var(--border-radius-md);
+  background: var(--el-bg-color);
+  cursor: pointer;
+  text-align: left;
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+.catalog-view .type-card:hover {
+  border-color: var(--el-color-primary-light-5);
+  background: var(--el-fill-color-light);
+}
+
+.catalog-view .type-card.active {
+  border-color: var(--el-color-primary);
+  background: var(--el-color-primary-light-9);
+  box-shadow: inset 0 0 0 1px var(--el-color-primary);
+}
+
+.catalog-view .type-card-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  flex-shrink: 0;
+  border-radius: var(--border-radius-md);
+  background: var(--el-fill-color);
+  color: var(--el-text-color-regular);
+  font-size: 14px;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease;
+}
+
+.catalog-view .type-card.active .type-card-icon {
+  background: var(--el-color-primary);
+  color: #fff;
+}
+
+.catalog-view .type-card-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.catalog-view .type-card-title {
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-medium);
+  color: var(--el-text-color-primary);
+}
+
+.catalog-view .type-card-sub {
+  font-size: var(--font-size-sm);
+  color: var(--el-text-color-secondary);
+}
+
+.catalog-view .type-card-check {
+  color: var(--el-color-primary);
+  font-size: 16px;
+  flex-shrink: 0;
+}
+
+.catalog-view .catalog-dialog .hint-text {
+  font-size: var(--font-size-sm);
+  color: var(--el-text-color-secondary);
+  margin-top: 4px;
+}
+
+/* ========== Overview Table ========== */
+.catalog-view .overview-table,
+.catalog-view .runs-table,
+.catalog-view .schedules-table {
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--border-radius-md);
+  overflow: hidden;
+}
+
+.catalog-view .table-header {
+  display: grid;
+  gap: var(--spacing-2);
+  padding: var(--spacing-2) var(--spacing-3);
+  background: var(--color-background-secondary);
+  border-bottom: 1px solid var(--color-border-light);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.catalog-view .table-row {
+  display: grid;
+  gap: var(--spacing-2);
+  padding: var(--spacing-3);
+  border-bottom: 1px solid var(--color-border-light);
+  font-size: var(--font-size-sm);
+  align-items: center;
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+
+.catalog-view .table-row:last-child {
+  border-bottom: none;
+}
+
+.catalog-view .table-row:hover {
+  background: var(--color-background-hover);
+}
+
+.catalog-view .table-row.row-disabled {
+  opacity: 0.6;
+}
+
+/* ========== Common Column Styles ========== */
+.catalog-view .col-trigger {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
+}
+
+.catalog-view .trigger-icon {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-xs);
+}
+
+.catalog-view .type-icon {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-xs);
+}
+
+.catalog-view .col-started,
+.catalog-view .col-duration,
+.catalog-view .col-last {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
+}
+
+.catalog-view .col-nodes {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
+  font-family: var(--font-family-mono);
+}
+
+.catalog-view .col-type {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+}
+
+.catalog-view .col-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-1);
+}
+
+.catalog-view .col-flow {
+  min-width: 0;
+}
+
+/* ========== Flow Name / Link / Snapshot ========== */
+.catalog-view .flow-name {
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.catalog-view .flow-link {
+  cursor: pointer;
+  transition: color var(--transition-fast);
+  user-select: none;
+}
+
+.catalog-view .flow-link:hover {
+  color: var(--color-primary);
+}
+
+.catalog-view .snapshot-link {
+  color: var(--color-primary);
+  cursor: pointer;
+  font-size: var(--font-size-xs);
+  user-select: none;
+  /* Oversized hit target: sloppy trackpad clicks that drift a few px must
+     still release inside the element, or no click event fires at all. */
+  display: inline-block;
+  padding: var(--spacing-1) var(--spacing-2);
+  margin: calc(-1 * var(--spacing-1)) calc(-1 * var(--spacing-2));
+}
+
+.catalog-view .no-snapshot {
+  color: var(--color-text-muted);
+}
+
+/* ========== Description Editing ========== */
+.catalog-view .col-description {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-1);
+  min-width: 0;
+}
+
+.catalog-view .col-description .btn-icon-inline {
+  opacity: 0;
+  transition: opacity var(--transition-fast);
+  flex-shrink: 0;
+}
+
+.catalog-view .table-row:hover .col-description .btn-icon-inline {
+  opacity: 1;
+}
+
+.catalog-view .btn-icon-inline {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: none;
+  background: transparent;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  border-radius: var(--border-radius-md);
+  transition: all var(--transition-fast);
+  flex-shrink: 0;
+}
+
+.catalog-view .btn-icon-inline:hover {
+  background: var(--color-background-hover);
+  color: var(--color-primary);
+}
+
+.catalog-view .description-text {
+  cursor: pointer;
+  transition: color var(--transition-fast);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+}
+
+.catalog-view .description-text:hover {
+  color: var(--color-text-primary);
+}
+
+.catalog-view .description-text.placeholder {
+  font-style: italic;
+  opacity: 0.6;
+}
+
+.catalog-view .edit-description-input {
+  width: 100%;
+  padding: var(--spacing-1) var(--spacing-2);
+  border: 1px solid var(--color-primary);
+  border-radius: var(--border-radius-md);
+  background: var(--color-background-primary);
+  color: var(--color-text-primary);
+  font-size: var(--font-size-xs);
+  outline: none;
+}
+
+/* ========== Pagination ========== */
+.catalog-view .pagination-bar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--spacing-2);
+  padding: var(--spacing-4) 0;
+}
+
+.catalog-view .page-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--color-border-primary);
+  border-radius: var(--border-radius-md);
+  background: var(--color-background-primary);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.catalog-view .page-btn:hover:not(:disabled) {
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+}
+
+.catalog-view .page-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.catalog-view .page-info {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+  padding: 0 var(--spacing-2);
+}
+
+/* ========== Empty State (catalog variant) ========== */
+.catalog-view .empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--spacing-2);
+  padding: var(--spacing-5) var(--spacing-4);
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+  text-align: center;
+}
+
+.catalog-view .empty-state-icon,
+.catalog-view .empty-icon {
+  font-size: var(--font-size-xl);
+  opacity: 0.4;
+}
+
+.catalog-view .empty-state h3 {
+  margin: 0 0 var(--spacing-2);
+  font-size: var(--font-size-lg);
+  color: var(--color-text-primary);
+}
+
+.catalog-view .empty-state p {
+  margin: 0;
+  font-size: var(--font-size-sm);
+}
+
+/* ========== Text Status Colors ========== */
+.catalog-view .text-success {
+  color: var(--color-success);
+}
+
+.catalog-view .text-danger {
+  color: var(--color-danger);
+}
+
+.catalog-view .text-pending {
+  color: var(--color-warning);
+}
+
+/* ========== Mono ========== */
+.catalog-view .mono {
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-xs);
+}
+
+/* ========== Info Card (CatalogView + StatsPanel) ========== */
+.catalog-view .info-card {
+  padding: var(--spacing-4);
+  background: var(--color-background-secondary);
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--border-radius-md);
+}
+
+.catalog-view .info-card-header {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-2);
+  margin-bottom: var(--spacing-2);
+  color: var(--color-primary);
+}
+
+.catalog-view .info-card-header h4 {
+  margin: 0;
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-primary);
+}
+
+.catalog-view .info-card p {
+  margin: 0;
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+  line-height: 1.5;
+}
+
+.catalog-view .info-card .demo-card-btn {
+  margin-top: var(--spacing-3);
+}
+</style>
+
+<style scoped>
+.catalog-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background-color: var(--color-background-primary);
+  font-family: var(--font-family-base);
+}
+
+/* ========== Tab Bar ========== */
+.catalog-tabs {
+  display: flex;
+  gap: 2px;
+  padding: var(--spacing-2) var(--spacing-4);
+  background: var(--color-background-secondary);
+  border-bottom: 1px solid var(--color-border-primary);
+}
+
+.catalog-tab {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-2);
+  padding: var(--spacing-2) var(--spacing-4);
+  border: none;
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+  border-radius: var(--border-radius-md);
+  transition: all var(--transition-fast);
+}
+
+.catalog-tab:hover {
+  background: var(--color-background-hover);
+  color: var(--color-text-primary);
+}
+
+.catalog-tab.active {
+  background: var(--color-background-primary);
+  color: var(--color-primary);
+  box-shadow: var(--shadow-xs);
+}
+
+.tab-badge {
+  background: var(--color-primary);
+  color: var(--color-text-inverse);
+  font-size: 11px;
+  padding: 0 6px;
+  border-radius: var(--border-radius-full);
+  min-width: 18px;
+  text-align: center;
+  line-height: 18px;
+}
+
+.tab-group-divider {
+  width: 1px;
+  align-self: stretch;
+  margin: var(--spacing-1) var(--spacing-1);
+  background: var(--color-border-primary);
+}
+
+/* Whisper-quiet group caption at the start of each tab cluster. */
+.tab-group-label {
+  flex-shrink: 0;
+  align-self: center;
+  margin: 0 2px 0 var(--spacing-2);
+  font-size: 9px;
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-text-tertiary);
+  opacity: 0.7;
+  white-space: nowrap;
+  user-select: none;
+  pointer-events: none;
+}
+
+/* The captions are a luxury: below this width they'd push the bar's
+   right-side controls out, so the dividers carry the grouping alone. */
+@media (max-width: 1550px) {
+  .tab-group-label {
+    display: none;
+  }
+}
+
+.tab-spacer {
+  flex: 1;
+}
+
+.tab-group {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+/* Compact: labels fold away (the active tab keeps its own) while the section
+   captions and dividers stay; hovering a section unfolds that section's labels. */
+.catalog-tabs.is-compact .catalog-tab {
+  padding-left: var(--spacing-3);
+  padding-right: var(--spacing-3);
+}
+.catalog-tabs.is-compact .tab-label {
+  display: inline-block;
+  max-width: 0;
+  opacity: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  /* Fold back after a short hold so a mouse slip off the section doesn't snap it shut. */
+  transition:
+    max-width var(--transition-fast) 400ms,
+    opacity var(--transition-fast) 400ms,
+    margin-left var(--transition-fast) 400ms;
+}
+.catalog-tabs.is-compact .catalog-tab.active .tab-label,
+.catalog-tabs.is-compact .tab-group:hover .tab-label {
+  max-width: 140px;
+  opacity: 1;
+  transition-delay: 0s;
+}
+/* Fold the icon→label gap along with the label so a folded tab has no orphan gap. */
+.catalog-tabs.is-compact .catalog-tab {
+  gap: 0;
+}
+.catalog-tabs.is-compact .catalog-tab.active .tab-label,
+.catalog-tabs.is-compact .tab-group:hover .tab-label {
+  margin-left: var(--spacing-2);
+}
+.catalog-tabs.is-compact .catalog-tab .tab-badge {
+  margin-left: var(--spacing-1-5);
+}
+.catalog-tabs.is-compact .tab-group-label {
+  display: inline;
+}
+
+.info-btn {
+  color: var(--color-text-muted);
+}
+
+.info-btn:hover {
+  color: var(--color-primary);
+}
+
+/* ========== Content Layout ========== */
+.catalog-content {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+}
+
+.catalog-sidebar {
+  width: 340px;
+  min-width: 280px;
+  border-right: 1px solid var(--color-border-primary);
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+}
+
+.sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--spacing-3) var(--spacing-4);
+  border-bottom: 1px solid var(--color-border-light);
+}
+
+.sidebar-header h3 {
+  margin: 0;
+  margin-right: auto;
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-primary);
+}
+
+.tree-collapse-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  margin-right: var(--spacing-2);
+  padding: 0;
+  border: none;
+  border-radius: var(--border-radius-md);
+  background: transparent;
+  color: var(--color-text-tertiary);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.tree-collapse-btn:hover {
+  background: var(--color-background-hover);
+  color: var(--color-text-primary);
+}
+
+/* Collapsed: a 40px rail with one expand affordance; everything else is hidden. */
+.catalog-sidebar.is-collapsed {
+  width: 40px;
+  min-width: 40px;
+  overflow: hidden;
+}
+
+.catalog-sidebar.is-collapsed > :not(.tree-rail) {
+  display: none;
+}
+
+.tree-rail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--spacing-3);
+  width: 100%;
+  height: 100%;
+  padding: var(--spacing-3) 0;
+  border: none;
+  background: transparent;
+  color: var(--color-text-tertiary);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.tree-rail:hover {
+  background: var(--color-background-hover);
+  color: var(--color-text-primary);
+}
+
+.tree-rail-label {
+  writing-mode: vertical-rl;
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-medium);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.sidebar-new-btn .caret {
+  font-size: 0.7em;
+  opacity: 0.85;
+}
+
+.catalog-detail {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--spacing-4) var(--spacing-6);
+}
+
+/* ========== Sidebar Filters ========== */
+.sidebar-filters {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-2);
+  padding: var(--spacing-2) var(--spacing-3);
+  border-bottom: 1px solid var(--color-border-light);
+}
+
+.search-input {
+  flex: 1;
+  padding: var(--spacing-1) var(--spacing-2);
+  border: 1px solid var(--color-border-primary);
+  border-radius: var(--border-radius-md);
+  background: var(--color-background-primary);
+  color: var(--color-text-primary);
+  font-size: var(--font-size-xs);
+  min-width: 0;
+}
+
+.search-input:focus {
+  outline: none;
+  border-color: var(--color-primary);
+}
+
+.search-empty {
+  margin: 0 0 var(--spacing-2);
+  padding: var(--spacing-2) var(--spacing-3);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+  line-height: 1.5;
+}
+
+.unavailable-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.unavailable-toggle input {
+  margin: 0;
+}
+
+/* ========== Tree / List Containers ========== */
+.tree-container,
+.list-container {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--spacing-2);
+}
+
+/* ========== States ========== */
+.loading-state {
+  padding: var(--spacing-6);
+  text-align: center;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+}
+
+.empty-state .muted {
+  margin-top: var(--spacing-1);
+  font-size: var(--font-size-xs);
+}
+
+/* ========== Favorites Panel ========== */
+.favorites-panel {
+  max-width: 1000px;
+  margin: 0 auto;
+}
+
+.favorites-panel h2 {
+  margin: 0 0 var(--spacing-5) 0;
+  font-size: var(--font-size-xl);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-primary);
+}
+
+.favorites-panel .empty-icon {
+  font-size: 48px;
+  color: var(--color-primary);
+  opacity: 0.5;
+  margin-bottom: var(--spacing-4);
+}
+
+.favorites-panel .empty-state h3 {
+  margin: 0 0 var(--spacing-2);
+  font-size: var(--font-size-lg);
+  color: var(--color-text-primary);
+}
+
+.favorites-panel .empty-state p {
+  margin: 0;
+  font-size: var(--font-size-sm);
+}
+
+.favorites-filter-bar {
+  margin-bottom: var(--spacing-3);
+}
+
+.favorites-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-1);
+}
+
+/* ========== Info Modal ========== */
+.info-modal-content {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-3);
+}
+</style>

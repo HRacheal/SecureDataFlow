@@ -1,0 +1,121 @@
+/* styles/components/_listbox.css - Modern Listbox Styles */
+
+.listbox-wrapper {
+  position: relative;
+  overflow: visible;
+  box-shadow: var(--shadow-sm);
+  border-radius: var(--border-radius-lg);
+  margin: var(--spacing-1);
+  background-color: var(--color-background-primary);
+  padding: var(--spacing-1-5);
+  z-index: var(--z-index-base);
+}
+
+.custom-component-container {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-2);
+  box-shadow: var(--shadow-sm);
+  border-radius: var(--border-radius-lg);
+}
+
+.listbox-subtitle {
+  display: flex;
+  align-items: center;
+  padding: var(--spacing-1) var(--spacing-4);
+  font-weight: var(--font-weight-normal);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-primary);
+  background-color: var(--color-background-muted);
+  border-bottom: 1px solid var(--color-border-light);
+  width: 100%;
+  border-top-left-radius: var(--border-radius-sm);
+  border-top-right-radius: var(--border-radius-sm);
+  height: 32px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  box-sizing: border-box;
+}
+
+.listbox-subtitle > * {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.listbox-subtitle span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+
+.listbox-title {
+  display: flex;
+  align-items: center;
+  padding: var(--spacing-2) var(--spacing-4);
+  font-weight: var(--font-weight-semibold);
+  font-size: var(--font-size-base);
+  color: var(--color-text-primary);
+  width: 100%;
+  border-top-left-radius: var(--border-radius-lg);
+  border-top-right-radius: var(--border-radius-lg);
+  height: 40px;
+}
+
+.listbox {
+  border: none;
+  padding: 0;
+  margin: 0;
+  list-style-type: none;
+  border-radius: var(--border-radius-lg);
+  overflow: hidden;
+  overflow-y: auto;
+  box-shadow: var(--shadow-sm);
+  max-height: 300px;
+  background-color: var(--color-background-primary);
+}
+
+.listbox li {
+  padding: var(--spacing-2) var(--spacing-4);
+  cursor: pointer;
+  background-color: var(--color-background-primary);
+  user-select: none;
+  border-bottom: 1px solid var(--color-border-light);
+  transition: background-color var(--transition-fast) var(--transition-timing);
+  font-size: var(--font-size-sm);
+}
+
+.listbox li:last-child {
+  border-bottom: none;
+}
+
+.listbox li:hover {
+  background-color: var(--color-background-tertiary);
+}
+
+.listbox li.is-selected {
+  background-color: var(--color-background-selected);
+  color: var(--color-text-selected);
+}
+
+/* Custom scrollbar */
+.listbox::-webkit-scrollbar {
+  width: 6px;
+}
+
+.listbox::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.listbox::-webkit-scrollbar-thumb {
+  background-color: var(--color-gray-300);
+  border-radius: var(--border-radius-full);
+}
+
+.listbox::-webkit-scrollbar-thumb:hover {
+  background-color: var(--color-gray-400);
+}

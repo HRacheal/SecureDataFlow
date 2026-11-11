@@ -1,0 +1,229 @@
+mod commands;
+mod drag_paths;
+mod env;
+mod menu;
+mod oauth;
+mod popout;
+mod sidecar;
+mod state;
+mod webview2_drop;
+mod window;
+
+use std::sync::Arc;
+use tauri::{Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri_plugin_log::{Target, TargetKind};
+
+use crate::state::{AppState, ServicePorts};
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    let shared_state: Arc<AppState> = Arc::new(AppState::default());
+
+    let mut builder = tauri::Builder::default()
+        .manage(shared_state.clone())
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .targets([
+                    Target::new(TargetKind::Stdout),
+                    Target::new(TargetKind::LogDir { file_name: Some("flowfile".into()) }),
+                ])
+                .level(log::LevelFilter::Info)
+                .build(),
+        )
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_os::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
+        // Pop-out windows are per flow and kind: remembering each would pile up and override the built size.
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_filter(|label| !popout::is_popout_label(label))
+                .build(),
+        );
+
+    #[cfg(desktop)]
+    {
+        builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+    }
+
+    builder
+        .invoke_handler(tauri::generate_handler![
+            commands::get_services_status,
+            commands::get_service_ports,
+            commands::get_app_version,
+            commands::quit_app,
+            commands::prepare_for_update,
+            commands::app_refresh,
+            commands::open_oauth,
+            commands::read_drag_paths,
+            commands::open_popout_window,
+            commands::focus_popout_window,
+            commands::close_popout_window,
+            commands::list_popout_windows,
+            commands::return_popout_window,
+            commands::rekey_popout_window,
+            commands::popout_window_ready,
+            commands::post_to_popout_window,
+        ])
+        .menu(menu::build)
+        .on_menu_event(|app, event| menu::on_menu_event(app, event.id().as_ref()))
+        .setup(|app| {
+            let handle = app.handle().clone();
+
+            tauri::async_runtime::spawn(async move {
+                // A hard-killed shell (SIGKILL/crash) can't run shutdown_all, but
+                // the sidecars carry FLOWFILE_SUPERVISOR_PID (set in env.rs) and run
+                // a parent-death watcher (shared/parent_watcher.py) that detects the
+                // reparent and exits gracefully on its own — so crashed-predecessor
+                // sidecars reap themselves rather than lingering until the next launch.
+                {
+                    let state: Arc<AppState> = handle.state::<Arc<AppState>>().inner().clone();
+                    let mut s = state.services_status.lock();
+                    s.status = "starting".into();
+                    s.error = None;
+                }
+                let _ = handle.emit(
+                    "services-status",
+                    serde_json::json!({ "status": "starting", "error": null }),
+                );
+
+                match sidecar::start_services(handle.clone()).await {
+                    Ok(ports) => {
+                        match create_main_window(&handle, ports) {
+                            Ok(window) => webview2_drop::attach(&window),
+                            Err(err) => {
+                                log::error!("failed to create main window: {}", err);
+                                // Services came up (readiness passed) but we have no window to
+                                // host them. They're healthy and listening on the allocated
+                                // ports, so reap them gracefully (HTTP /shutdown → signal)
+                                // rather than leaving them dangling.
+                                sidecar::shutdown::shutdown_all(&handle).await;
+                                window::show_error(
+                                    &handle,
+                                    format!("Failed to create main window: {err}"),
+                                );
+                                return;
+                            }
+                        }
+                        let _ = handle.emit("startup-success", ());
+                        window::show_main(&handle);
+                    }
+                    Err(err) => {
+                        log::error!("services failed to start: {}", err);
+                        // start_services spawns core+worker *before* awaiting readiness
+                        // (see sidecar/mod.rs), so a readiness timeout — or a worker spawn
+                        // failure after core already started — can leave live sidecars
+                        // here. Reap them before showing the error: otherwise each
+                        // sidecar's wait-task sees is_shutting_down == false and respawns
+                        // it up to MAX_RESTARTS, leaving self-restarting orphans behind the
+                        // error window (the dangling-process symptom). We kill by PID
+                        // instead of POSTing /shutdown because the ports may be unresponsive
+                        // (often *why* readiness failed) and, in the NoFreePortPair case,
+                        // were never ours — they may belong to another Flowfile instance.
+                        sidecar::shutdown::kill_spawned(&handle);
+                        {
+                            let state: Arc<AppState> =
+                                handle.state::<Arc<AppState>>().inner().clone();
+                            let mut s = state.services_status.lock();
+                            s.status = "error".into();
+                            s.error = Some(err.to_string());
+                        }
+                        window::show_error(&handle, err.to_string());
+                    }
+                }
+            });
+
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            // TODO(D): startup-phase exit race. If the user quits (closing this
+            // window or the loading window → RunEvent::ExitRequested below) while
+            // the setup task is still inside start_services, shutdown can run
+            // before the sidecar PIDs are stored, so the spawn that lands after
+            // shutdown is never reaped. Fix 1 + the is_shutting_down guard cover
+            // the common cases; closing the gap fully needs start_services to
+            // check is_shutting_down before each spawn (and abort cleanly).
+            if window.label() == "main" {
+                if let WindowEvent::CloseRequested { .. } = event {
+                    let app = window.app_handle().clone();
+                    // Pop-out windows go first: left open they would outlive the sidecars and keep the app alive.
+                    window::close_popout_windows(&app);
+                    tauri::async_runtime::block_on(async move {
+                        sidecar::shutdown::shutdown_all(&app).await;
+                    });
+                }
+            }
+        })
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // Both arms reap the sidecars; the `is_shutting_down` guard in
+            // shutdown_all makes the second call a no-op. We need both because
+            // the two macOS quit paths emit different events:
+            //   - red close button / all-windows-closed / app.exit() → ExitRequested
+            //   - Cmd+Q, app-menu Quit, dock right-click Quit → these go through
+            //     AppKit `terminate:` → applicationWillTerminate → tao LoopDestroyed,
+            //     which tauri surfaces as RunEvent::Exit (NOT ExitRequested). Without
+            //     the Exit arm those paths skip cleanup and orphan the sidecars.
+            if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
+                let app = app_handle.clone();
+                tauri::async_runtime::block_on(async move {
+                    sidecar::shutdown::shutdown_all(&app).await;
+                });
+            }
+        });
+}
+
+/// A window on the app's renderer with the discovered service ports injected into the page
+/// **before** any renderer script runs: the only place `window.__FLOWFILE_PORTS__` comes from,
+/// which lets the renderer build its axios baseURL against the right ports when multiple
+/// Flowfile instances coexist. `path` is the page relative to the renderer root, fragment
+/// included (`index.html`, `index.html#/notebook?flow=3`).
+pub(crate) fn build_app_window<'a>(
+    app: &'a tauri::AppHandle,
+    label: &str,
+    path: &str,
+    ports: ServicePorts,
+) -> WebviewWindowBuilder<'a, tauri::Wry, tauri::AppHandle> {
+    let init_script = format!(
+        "window.__FLOWFILE_PORTS__ = Object.freeze({{ core: {}, worker: {} }});",
+        ports.core, ports.worker
+    );
+
+    WebviewWindowBuilder::new(app, label, WebviewUrl::App(path.into()))
+        .resizable(true)
+        // tauri-runtime-wry's native drag handler returns true unconditionally on every
+        // platform, swallowing internal HTML5 drags too (VueFlow palette, AG Grid), so it
+        // stays off. OS file drops then arrive as plain HTML5 drops in the renderer
+        // (app/composables/useFileDropImport.ts), but WKWebView blanks file:// URLs out of
+        // DataTransfer — so on macOS the renderer recovers real paths via the
+        // read_drag_paths command (drag pasteboard), on Windows via webview2_drop
+        // (postMessageWithAdditionalObjects); other platforms upload to core.
+        .disable_drag_drop_handler()
+        // macOS delivers the first click on an unfocused window to focus only;
+        // opt in so that click also reaches the page (no-op on other platforms).
+        .accept_first_mouse(true)
+        .initialization_script(&init_script)
+}
+
+/// Create the main window programmatically (not from `tauri.conf.json`), so the ports can be
+/// injected; see `build_app_window`.
+fn create_main_window(
+    app: &tauri::AppHandle,
+    ports: ServicePorts,
+) -> tauri::Result<tauri::WebviewWindow> {
+    // If a previous setup attempt already created it, just hand it back.
+    if let Some(existing) = app.get_webview_window("main") {
+        return Ok(existing);
+    }
+
+    build_app_window(app, "main", "index.html", ports)
+        .title("Flowfile")
+        .inner_size(1600.0, 1000.0)
+        .min_inner_size(1024.0, 700.0)
+        .center()
+        .visible(false)
+        .build()
+}

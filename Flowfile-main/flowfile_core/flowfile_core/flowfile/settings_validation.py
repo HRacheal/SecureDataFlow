@@ -1,0 +1,567 @@
+"""Conservative static validation of node settings against predicted input schemas.
+
+Flags settings that reference input columns which are no longer available (e.g. after an
+upstream rename) so the frontend can warn on the node before the flow is run.
+
+Invariants:
+- Never executes data: only cached result schemas and the exec-free prediction ladder are read.
+- Warns only on certainty: every "cannot tell" path yields no issue — silence over noise.
+- Never mutates node settings.
+- ``validate_flow_settings`` never raises; a node that cannot be analyzed is skipped.
+
+Node types without a registered extractor (custom nodes, raw polars/SQL/python code, anything
+new) are never analyzed. To cover a node type, register a small pure function with
+``@_extractor`` that maps its settings model to the input columns **whose absence makes the node
+fail**, per input handle. That is the whole entry criterion: a node that skips missing columns and
+keeps running (select, dynamic_rename, the join-family select lists) gets no extractor, because a
+warning there is noise on a flow that works. Flowfile formulas (formula node, advanced filter) are
+covered by parsing the expression with polars_expr_transformer and collecting ``pl.col`` references
+from the parse tree — an unparseable expression yields no column references, never guessed-at ones.
+
+A second phase checks whether a flowfile expression can run at all: ``@_expression_probe``
+node types hand their expression to ``real_time_interface.check_expression``, which resolves it
+against an empty LazyFrame built from the predicted input schema (same parser as execution, no
+data touched). Only definite failures — a parse error, or a polars error raised while resolving
+the schema — are reported. The formula node takes a chained variant of the same phase
+(``check_expression_chain``): each entry is checked against the base schema plus the columns the
+entries above it produce, so a reference to an earlier output is correct and a forward reference
+is not.
+
+Cloud reader/writer nodes also get the run-time path guard's verdict (``validate_cloud_resource_path``).
+"""
+
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Literal
+
+from pydantic import BaseModel
+
+from flowfile_core.auth import sharing
+from flowfile_core.configs.flow_logger import main_logger
+from flowfile_core.flowfile.parameter_resolver import resolve_expression_parameters
+from flowfile_core.schemas import input_schema
+from shared.cloud_storage.utils import validate_cloud_resource_path
+
+if TYPE_CHECKING:
+    from flowfile_core.flowfile._extensions.real_time_interface import ExpressionIssue
+    from flowfile_core.flowfile.flow_graph import FlowGraph
+    from flowfile_core.flowfile.flow_node.flow_node import FlowNode
+
+InputHandle = Literal["main", "left", "right"]
+IssueKind = Literal["missing_columns", "invalid_expression", "duplicate_output", "invalid_path"]
+
+
+class SettingsValidationIssue(BaseModel):
+    input_handle: InputHandle
+    missing_columns: list[str] = []
+    message: str
+    kind: IssueKind = "missing_columns"
+
+
+class NodeSettingsValidation(BaseModel):
+    node_id: int
+    issues: list[SettingsValidationIssue]
+
+
+class FlowSettingsValidation(BaseModel):
+    enabled: bool
+    nodes: list[NodeSettingsValidation]
+
+
+@dataclass(frozen=True)
+class ColumnReferences:
+    """Input columns a node's settings reference, per input handle."""
+
+    main: Sequence[str] = ()
+    left: Sequence[str] = ()
+    right: Sequence[str] = ()
+
+
+def _collect_expression_columns(node: Any, out: list[str]) -> None:
+    func_ref = getattr(node, "func_ref", None)
+    args = getattr(node, "args", None) or []
+    if getattr(func_ref, "val", None) == "pl.col" and len(args) == 1:
+        val = getattr(args[0], "val", None)
+        if isinstance(val, str) and len(val) >= 2 and val[0] == '"' and val[-1] == '"':
+            out.append(val[1:-1])
+            return
+    for child in args:
+        _collect_expression_columns(child, out)
+    for condition_val in getattr(node, "conditions", None) or []:
+        _collect_expression_columns(condition_val.condition, out)
+        _collect_expression_columns(condition_val.val, out)
+    else_val = getattr(node, "else_val", None)
+    if else_val is not None:
+        _collect_expression_columns(else_val, out)
+
+
+def _expression_column_references(expression: str) -> list[str] | None:
+    """Column names a flowfile formula references, or None when they cannot be determined."""
+    if not expression or not expression.strip():
+        return None
+    try:
+        from polars_expr_transformer.process.polars_expr_transformer import build_func
+
+        tree = build_func(expression)
+        refs: list[str] = []
+        _collect_expression_columns(tree, refs)
+        return refs
+    except Exception:
+        return None  # unparseable expressions never warn; the node surfaces its own errors
+
+
+# Extractors return None when the configuration is not analyzable (unparseable expression,
+# dtype-based selection, unconfigured sub-model) — the node is then skipped entirely.
+# Deliberately absent: select and dynamic_rename skip missing columns and keep running, so a
+# warning there would fire on a flow that works. See test_warning_matches_runtime_behaviour.
+# Also absent: multi_field_formula — it skips missing selected columns and its [_Current*_]
+# placeholders are not real columns, so both analyses would warn on flows that run.
+# Also absent: run_flow — its parameter columns come from keyed handle input-0, but main_inputs is
+# a compacted projection, so a single data-only connection would be checked as if it were the
+# parameter input.
+_EXTRACTORS: dict[str, Callable[[Any], ColumnReferences | None]] = {}
+
+
+def _extractor(node_type: str):
+    def wrap(fn):
+        _EXTRACTORS[node_type] = fn
+        return fn
+
+    return wrap
+
+
+@_extractor("filter")
+def _filter(settings: input_schema.NodeFilter) -> ColumnReferences | None:
+    fi = settings.filter_input
+    if fi.mode == "basic":
+        if fi.basic_filter is None:
+            return None
+        return ColumnReferences(main=[fi.basic_filter.field])
+    refs = _expression_column_references(fi.advanced_filter)
+    if refs is None:
+        return None
+    return ColumnReferences(main=refs)
+
+
+@_extractor("formula")
+def _formula(settings: input_schema.NodeFormula) -> ColumnReferences | None:
+    """Columns the formula node reads from its INPUT.
+
+    Entries are chained, so a reference an earlier entry produced is not an input column:
+    each entry contributes its references minus the output names of the entries before it.
+    An unparseable entry contributes nothing, never guessed-at references.
+    """
+    produced: set[str] = set()
+    refs: list[str] = []
+    for _, entry in settings.active_entries():
+        entry_refs = _expression_column_references(entry.function)
+        if entry_refs is not None:
+            refs.extend(ref for ref in entry_refs if ref not in produced)
+        if entry.field and entry.field.name:
+            produced.add(entry.field.name)
+    return ColumnReferences(main=refs)
+
+
+@_extractor("group_by")
+def _group_by(settings: input_schema.NodeGroupBy) -> ColumnReferences | None:
+    if settings.groupby_input is None:
+        return None
+    return ColumnReferences(main=[c.old_name for c in settings.groupby_input.agg_cols])
+
+
+@_extractor("sort")
+def _sort(settings: input_schema.NodeSort) -> ColumnReferences:
+    return ColumnReferences(main=[s.column for s in settings.sort_input])
+
+
+@_extractor("unique")
+def _unique(settings: input_schema.NodeUnique) -> ColumnReferences:
+    return ColumnReferences(main=settings.unique_input.columns or ())
+
+
+@_extractor("record_id")
+def _record_id(settings: input_schema.NodeRecordId) -> ColumnReferences:
+    ri = settings.record_id_input
+    if not ri.group_by:
+        return ColumnReferences()
+    return ColumnReferences(main=ri.group_by_columns or ())
+
+
+@_extractor("text_to_rows")
+def _text_to_rows(settings: input_schema.NodeTextToRows) -> ColumnReferences:
+    t = settings.text_to_rows_input
+    refs = [t.column_to_split]
+    if not t.split_by_fixed_value and t.split_by_column:
+        refs.append(t.split_by_column)
+    return ColumnReferences(main=refs)
+
+
+@_extractor("graph_solver")
+def _graph_solver(settings: input_schema.NodeGraphSolver) -> ColumnReferences:
+    g = settings.graph_solver_input
+    return ColumnReferences(main=[g.col_from, g.col_to])
+
+
+@_extractor("explode_hierarchy")
+def _explode_hierarchy(settings: input_schema.NodeExplodeHierarchy) -> ColumnReferences:
+    h = settings.explode_hierarchy_input
+    refs = [h.parent_column, h.child_column]
+    if h.quantity_column:
+        refs.append(h.quantity_column)
+    return ColumnReferences(main=refs)
+
+
+@_extractor("pivot")
+def _pivot(settings: input_schema.NodePivot) -> ColumnReferences | None:
+    p = settings.pivot_input
+    if p is None:
+        return None
+    return ColumnReferences(main=[*p.index_columns, p.pivot_column, p.value_col])
+
+
+@_extractor("unpivot")
+def _unpivot(settings: input_schema.NodeUnpivot) -> ColumnReferences | None:
+    u = settings.unpivot_input
+    if u is None or u.data_type_selector_mode == "data_type":
+        return None
+    return ColumnReferences(main=[*u.index_columns, *u.value_columns])
+
+
+@_extractor("join")
+def _join(settings: input_schema.NodeJoin) -> ColumnReferences:
+    # Only join keys warn; the left/right select lists are auto-reconciled by the
+    # schema callbacks and would be noise.
+    mapping = settings.join_input.join_mapping
+    return ColumnReferences(
+        left=[m.left_col for m in mapping if m.left_col],
+        right=[m.right_col for m in mapping if m.right_col],
+    )
+
+
+@_extractor("fuzzy_match")
+def _fuzzy_match(settings: input_schema.NodeFuzzyMatch) -> ColumnReferences:
+    mapping = settings.join_input.join_mapping
+    return ColumnReferences(
+        left=[m.left_col for m in mapping if m.left_col],
+        right=[m.right_col for m in mapping if m.right_col],
+    )
+
+
+@_extractor("window_functions")
+def _window_functions(settings: input_schema.NodeWindowFunctions) -> ColumnReferences:
+    w = settings.window_input
+    refs = [*w.partition_by, *(s.column for s in w.order_by)]
+    refs += [f.column for f in w.window_functions if f.column and f.function != "tile"]
+    return ColumnReferences(main=refs)
+
+
+@_extractor("train_model")
+def _train_model(settings: input_schema.NodeTrainModel) -> ColumnReferences:
+    t = settings.train_input
+    return ColumnReferences(main=[t.target_column, *t.feature_columns])
+
+
+@_extractor("evaluate_model")
+def _evaluate_model(settings: input_schema.NodeEvaluateModel) -> ColumnReferences:
+    e = settings.evaluate_input
+    return ColumnReferences(main=[e.actual_column, e.predicted_column])
+
+
+@_extractor("catalog_writer")
+def _catalog_writer(settings: input_schema.NodeCatalogWriter) -> ColumnReferences:
+    c = settings.catalog_write_settings
+    refs = [*c.merge_keys, *c.partition_by]
+    if c.write_mode == "scd2":
+        cfg = c.scd2 or input_schema.Scd2Settings()
+        # is_current is a legal SCD2 partition column but is generated, not an input column.
+        system = set(cfg.system_columns)
+        refs = [r for r in refs if r not in system]
+        refs.extend(cfg.compare_columns)
+    return ColumnReferences(main=refs)
+
+
+@_extractor("cloud_storage_writer")
+def _cloud_storage_writer(settings: input_schema.NodeCloudStorageWriter) -> ColumnReferences:
+    """Delta merge keys and partition columns; merge keys are only read by the merge modes."""
+    c = settings.cloud_storage_settings
+    if c.file_format != "delta":
+        return ColumnReferences()
+    keys = c.merge_keys if c.write_mode in ("upsert", "update", "delete") else []
+    return ColumnReferences(main=[*keys, *(c.partition_by or [])])
+
+
+@dataclass(frozen=True)
+class ExpressionProbe:
+    """A flowfile expression that can be resolved against the node's main input schema."""
+
+    expression: str
+    as_predicate: bool  # True -> applied with filter(), mirroring FlowDataEngine.do_filter
+    label: str
+
+
+_EXPRESSION_PROBES: dict[str, Callable[[Any], ExpressionProbe | None]] = {}
+
+
+def _expression_probe(node_type: str):
+    def wrap(fn):
+        _EXPRESSION_PROBES[node_type] = fn
+        return fn
+
+    return wrap
+
+
+@_expression_probe("filter")
+def _filter_expression(settings: input_schema.NodeFilter) -> ExpressionProbe | None:
+    if not settings.filter_input.is_advanced():
+        return None
+    # split_mode also routes through .filter(), so a predicate probe is correct either way.
+    return ExpressionProbe(settings.filter_input.advanced_filter, True, "Invalid filter expression")
+
+
+def _clean_refs(refs: Sequence[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for ref in refs:
+        if ref and ref not in seen:
+            seen.add(ref)
+            out.append(ref)
+    return out
+
+
+def _input_node(node: "FlowNode", handle: InputHandle) -> "FlowNode | None":
+    inputs = node.node_inputs
+    main_inputs = inputs.main_inputs or []
+    if handle == "main":
+        return main_inputs[0] if len(main_inputs) == 1 else None
+    if handle == "left":
+        # Join-family left connections land in main_inputs (see add_join's schema_callback).
+        if inputs.left_input is not None:
+            return inputs.left_input
+        return main_inputs[0] if len(main_inputs) == 1 else None
+    return inputs.right_input
+
+
+def _resolved_schema(input_node: "FlowNode", allow_prediction: bool):
+    """Return the input node's schema only when it is confidently known, else None."""
+    try:
+        if input_node.node_schema.result_schema:
+            return input_node.node_schema.result_schema
+        if not allow_prediction:
+            return input_node.node_schema.predicted_schema or None
+        schema = input_node.schema
+    except Exception:
+        return None
+    if not schema:  # None and [] both mean "unknown": the schema-callback error path returns [].
+        return None
+    if input_node._schema_prediction_blocked:
+        return None
+    return schema
+
+
+def _polars_schema(schema) -> dict | None:
+    from flowfile_core.flowfile.flow_data_engine.flow_file_column.utils import cast_str_to_polars_type
+
+    try:
+        return {c.name: cast_str_to_polars_type(c.data_type) for c in schema}
+    except Exception:
+        return None
+
+
+def _resolved_expression(node: "FlowNode", expression: str) -> str | None:
+    """Expression with ``${param}`` refs substituted, or None when it cannot be resolved."""
+    if not expression or not expression.strip():
+        return None
+    if "${" not in expression:
+        return expression
+    params_getter = getattr(node, "_params_getter", None)
+    if params_getter is None:
+        return None
+    resolved = resolve_expression_parameters(expression, params_getter())
+    return None if "${" in resolved else resolved
+
+
+def node_expression_issue(node: "FlowNode", *, allow_prediction: bool) -> "ExpressionIssue | None":
+    """The problem in this node's formula/advanced-filter expression, or None when it resolves.
+
+    Data-free: delegates to ``check_expression`` (a zero-row collect, no data read). Shared by
+    the static validator, the run-time execution gate, and ``add_formula``/``add_filter`` so all
+    three classify an expression identically. Returns None whenever the input schema is not
+    confidently known — silence over a false positive. Callers decide which ``kind`` to act on.
+    """
+    from flowfile_core.flowfile._extensions.real_time_interface import check_expression
+
+    probe_factory = _EXPRESSION_PROBES.get(node.node_type)
+    if probe_factory is None or not node.is_setup:
+        return None
+    probe = probe_factory(node.setting_input)
+    if probe is None:
+        return None
+    expression = _resolved_expression(node, probe.expression)
+    if expression is None:
+        return None
+    pl_schema = _main_input_polars_schema(node, allow_prediction)
+    if pl_schema is None:
+        return None
+    return check_expression(pl_schema, expression, as_predicate=probe.as_predicate)
+
+
+def _expression_issues(node: "FlowNode", allow_prediction: bool) -> list[SettingsValidationIssue]:
+    issue = node_expression_issue(node, allow_prediction=allow_prediction)
+    if issue is None or issue.kind == "missing_column":
+        return []  # missing columns are reported by the column phase, with the exact names
+    probe = _EXPRESSION_PROBES[node.node_type](node.setting_input)
+    return [
+        SettingsValidationIssue(
+            kind="invalid_expression",
+            input_handle="main",
+            message=f"{probe.label}: {issue.message}",
+        )
+    ]
+
+
+def _main_input_polars_schema(node: "FlowNode", allow_prediction: bool) -> dict | None:
+    """The node's main-input schema as polars dtypes, or None when it is not confidently known."""
+    input_node = _input_node(node, "main")
+    if input_node is None:
+        return None
+    schema = _resolved_schema(input_node, allow_prediction)
+    return None if schema is None else _polars_schema(schema)
+
+
+def _formula_chain_entry_issues(
+    node: "FlowNode", allow_prediction: bool
+) -> list[tuple["ExpressionIssue", str | None]]:
+    """Each failing formula entry as ``(issue, row prefix)``, in entry order.
+
+    ``missing_column`` issues are dropped: the column phase reports those with exact names,
+    having already subtracted the columns earlier entries produce. The row prefix is None for
+    a single entry (there is no row to disambiguate) and the run-time ``Formula N ("name")``
+    label otherwise, so the editor and an ``add_formula`` return word a failure identically.
+    """
+    from flowfile_core.flowfile._extensions.real_time_interface import check_expression_chain
+    from flowfile_core.flowfile.flow_data_engine.formula_entries import entry_label
+
+    if not node.is_setup or not node.setting_input.entries:
+        return []
+    pl_schema = _main_input_polars_schema(node, allow_prediction)
+    if pl_schema is None:
+        return []
+    # An unresolvable ${param} leaves the entry blank: it contributes no column and raises no
+    # issue, the same silence the single-expression probe keeps.
+    chain = [
+        entry.model_copy(update={"function": _resolved_expression(node, entry.function or "") or ""})
+        for entry in node.setting_input.entries
+    ]
+    result = check_expression_chain(pl_schema, chain)
+    single = len(chain) == 1
+    out: list[tuple[ExpressionIssue, str | None]] = []
+    for position, (issue, entry) in enumerate(zip(result.issues, chain, strict=True), start=1):
+        if issue is None or issue.kind == "missing_column":
+            continue
+        out.append((issue, None if single else entry_label(position, entry.field.name)))
+    return out
+
+
+def node_formula_chain_issue(node: "FlowNode", *, allow_prediction: bool) -> str | None:
+    """The first formula entry that cannot run, as a ready-to-show message, or None.
+
+    The chain counterpart of ``node_expression_issue``: same ``type``/``parse`` gate, so a
+    formula node's save is refused on exactly what the editor flags.
+    """
+    for issue, prefix in _formula_chain_entry_issues(node, allow_prediction):
+        if issue.kind in ("type", "parse"):
+            return issue.message if prefix is None else f"{prefix}: {issue.message}"
+    return None
+
+
+def _formula_chain_issues(node: "FlowNode", allow_prediction: bool) -> list[SettingsValidationIssue]:
+    """Per-entry validation issues for a formula node (see ``_formula_chain_entry_issues``)."""
+    return [
+        SettingsValidationIssue(
+            kind="duplicate_output" if issue.kind == "duplicate" else "invalid_expression",
+            input_handle="main",
+            message=f"{prefix or 'Invalid formula'}: {issue.message}",
+        )
+        for issue, prefix in _formula_chain_entry_issues(node, allow_prediction)
+    ]
+
+
+_CLOUD_PATH_ROLES: dict[str, Literal["reader", "writer"]] = {
+    "cloud_storage_reader": "reader",
+    "cloud_storage_writer": "writer",
+}
+
+
+def _cloud_path_issues(node: "FlowNode") -> list[SettingsValidationIssue]:
+    """The run-time path guard's verdict on a cloud node's target; a ``${param}`` path is left to run time."""
+    role = _CLOUD_PATH_ROLES.get(node.node_type)
+    if role is None or not node.is_setup:
+        return []
+    path = node.setting_input.cloud_storage_settings.resource_path
+    if path and "${" in path:
+        return []
+    try:
+        validate_cloud_resource_path(path, role=role, allow_local_paths=sharing.ambient_credentials_allowed())
+    except ValueError as e:
+        return [SettingsValidationIssue(kind="invalid_path", input_handle="main", message=str(e))]
+    return []
+
+
+def _validate_node(node: "FlowNode", allow_prediction: bool) -> list[SettingsValidationIssue]:
+    issues = _column_issues(node, allow_prediction)
+    if node.node_type == "formula":
+        # Per-entry checks run alongside the column phase: suppressing them wholesale would
+        # hide entry 3's type error behind entry 1's missing column. Overlap is avoided by
+        # dropping missing_column issues instead.
+        issues.extend(_formula_chain_issues(node, allow_prediction))
+        return issues
+    if not any(issue.input_handle == "main" for issue in issues):
+        issues.extend(_expression_issues(node, allow_prediction))
+    return issues
+
+
+def _column_issues(node: "FlowNode", allow_prediction: bool) -> list[SettingsValidationIssue]:
+    extractor = _EXTRACTORS.get(node.node_type)
+    if extractor is None or not node.is_setup:
+        return []
+    refs = extractor(node.setting_input)
+    if refs is None:
+        return []
+    issues: list[SettingsValidationIssue] = []
+    for handle in ("main", "left", "right"):
+        handle_refs = _clean_refs(getattr(refs, handle))
+        if not handle_refs:
+            continue
+        input_node = _input_node(node, handle)
+        if input_node is None:
+            continue
+        schema = _resolved_schema(input_node, allow_prediction)
+        if schema is None:
+            continue
+        available = {c.name for c in schema}
+        missing = [ref for ref in handle_refs if ref not in available]
+        if missing:
+            issues.append(
+                SettingsValidationIssue(
+                    input_handle=handle,
+                    missing_columns=missing,
+                    message=f"Column(s) not available from the {handle} input: {', '.join(missing)}",
+                )
+            )
+    return issues
+
+
+def validate_flow_settings(flow: "FlowGraph") -> FlowSettingsValidation:
+    """Run the conservative settings check for every node in the flow."""
+    if not flow.flow_settings.validate_settings:
+        return FlowSettingsValidation(enabled=False, nodes=[])
+    allow_prediction = not flow.flow_settings.is_running
+    results: list[NodeSettingsValidation] = []
+    for node in flow.nodes:
+        try:
+            issues = _cloud_path_issues(node) + _validate_node(node, allow_prediction)
+            if issues:
+                results.append(NodeSettingsValidation(node_id=int(node.node_id), issues=issues))
+        except Exception:
+            main_logger.debug("Settings validation skipped node %s", node.node_id, exc_info=True)
+    return FlowSettingsValidation(enabled=True, nodes=results)

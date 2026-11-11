@@ -1,0 +1,178 @@
+# flowframe/__init__.py
+"""A Polars-like API for building ETL graphs."""
+
+from pl_fuzzy_frame_match.models import FuzzyMapping  # noqa: F401
+from polars.datatypes import (  # noqa: F401
+    Array,
+    Binary,
+    # Other primitive types
+    Boolean,
+    # Special types
+    Categorical,
+    # Type classes
+    DataType,
+    DataTypeClass,
+    # Date/time types
+    Date,
+    Datetime,
+    Decimal,
+    Duration,
+    Enum,
+    Field,
+    # Float types
+    Float32,
+    Float64,
+    # Integer types
+    Int8,
+    Int16,
+    Int32,
+    Int64,
+    Int128,
+    IntegerType,
+    # Complex types
+    List,
+    Null,
+    Object,
+    String,
+    Struct,
+    TemporalType,
+    Time,
+    UInt8,
+    UInt16,
+    UInt32,
+    UInt64,
+    Unknown,
+    Utf8,
+)
+
+from flowfile_core.flowfile.flow_graph import FlowGraph  # noqa: F401
+from flowfile_core.schemas.input_schema import OutputFieldConfig, OutputFieldInfo  # noqa: F401
+from flowfile_frame import _console_source  # noqa: F401 (installs the console-source hook only in a console)
+from flowfile_frame.catalog import (  # noqa: F401
+    read_catalog_sql,
+    read_catalog_table,
+    register_flow_with_catalog,
+    write_catalog_table,
+)
+from flowfile_frame.catalog_reference import (  # noqa: F401
+    CatalogReference,
+    SchemaReference,
+    default_schema,
+    get_catalog,
+    list_catalogs,
+)
+from flowfile_frame.cloud_storage.frame_helpers import (  # noqa: F401
+    read_from_cloud_storage,
+    write_to_cloud_storage,
+)
+from flowfile_frame.cloud_storage.secret_manager import (  # noqa: F401
+    create_cloud_storage_connection,
+    create_cloud_storage_connection_if_not_exists,
+    del_cloud_storage_connection,
+    get_all_available_cloud_storage_connections,
+)
+from flowfile_frame.custom_node import CustomNode, custom_node  # noqa: F401
+from flowfile_frame.custom_nodes import custom_nodes  # noqa: F401
+
+# Database I/O
+from flowfile_frame.database import (  # noqa: F401
+    create_database_connection,
+    create_database_connection_if_not_exists,
+    del_database_connection,
+    get_all_available_database_connections,
+    get_database_connection_by_name,
+    read_database,
+    write_database,
+)
+from flowfile_frame.enums import GateOperator, NodeType, ParamType  # noqa: F401
+
+# Commonly used functions
+from flowfile_frame.expr import (  # noqa: F401
+    col,
+    column,
+    corr,
+    count,
+    cov,
+    cum_count,
+    first,
+    implode,
+    last,
+    len,
+    lit,
+    max,
+    mean,
+    min,
+    sum,
+    when,
+)
+
+# Core classes
+from flowfile_frame.flow_frame import FlowFrame  # noqa: F401
+from flowfile_frame.flow_frame_methods import (  # noqa: F401
+    concat,
+    from_dict,
+    from_raw_data,
+    list_files,
+    read_avro,
+    read_csv,
+    read_excel,
+    read_ipc,
+    read_ipc_stream,
+    read_ndjson,
+    read_parquet,
+    scan_csv,
+    scan_csv_from_cloud_storage,
+    scan_delta,
+    scan_ipc,
+    scan_json_from_cloud_storage,
+    scan_ndjson,
+    scan_parquet,
+    scan_parquet_from_cloud_storage,
+)
+from flowfile_frame.flow_group import FlowGroup  # noqa: F401
+from flowfile_frame.gate import Gate  # noqa: F401
+
+# File I/O
+from flowfile_frame.kafka import read_kafka  # noqa: F401
+from flowfile_frame.kernels import kernels  # noqa: F401
+from flowfile_frame.lazy import fold  # noqa: F401
+from flowfile_frame.native import NativeNodeError, Node, explore  # noqa: F401
+from flowfile_frame.parameters import Parameter, add_flow_parameter, set_flow_parameter  # noqa: F401
+from flowfile_frame.polars_code_node import polars_code  # noqa: F401
+from flowfile_frame.python_script import PythonScript, python_script  # noqa: F401
+from flowfile_frame.rest_api import read_api  # noqa: F401
+from flowfile_frame.run_flow import FlowInput, FlowOutput, FlowRef, RunFlow, flow_ref, register_flow  # noqa: F401
+
+# Selector utilities
+from flowfile_frame.selectors import (  # noqa: F401
+    all_,
+    boolean,
+    by_dtype,
+    categorical,
+    contains,
+    date,
+    datetime,
+    duration,
+    ends_with,
+    float_,
+    integer,
+    list_,
+    matches,
+    numeric,
+    object_,
+    starts_with,
+    string,
+    struct,
+    temporal,
+    time,
+)
+from flowfile_frame.series import Series  # noqa: F401 E402
+from flowfile_frame.sql_query import sql  # noqa: F401 E402
+from flowfile_frame.utils import create_flow_graph  # noqa: F401 E402
+
+LazyFrame = FlowFrame  # Alias for compatibility with generated code
+DataFrame = FlowFrame  # Alias for compatibility with generated code
+
+from shared._version import get_version  # noqa: E402
+
+__version__ = get_version()

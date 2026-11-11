@@ -1,0 +1,249 @@
+# mkdocs.yml
+
+site_name: Flowfile
+site_description: A visual ETL tool combining drag-and-drop workflow building with Polars dataframes
+site_url: https://edwardvaneechoud.github.io/Flowfile/
+repo_url: https://github.com/edwardvaneechoud/Flowfile
+copyright: Flowfile is MIT-licensed. Alteryx is a trademark of Alteryx, Inc.; KNIME is a trademark of KNIME AG. Flowfile is not affiliated with or endorsed by either.
+
+
+# Explicitly set the URL style for consistency and planning
+use_directory_urls: false
+
+theme:
+  name: material
+  logo: assets/images/logo.png
+  favicon: assets/images/logo.png
+  font:
+    text: Roboto
+    code: Source Code Pro
+  features:
+    - navigation.tabs
+    - navigation.indexes
+    - navigation.prune
+    - navigation.tracking
+    - navigation.top
+    - navigation.footer
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - search.share
+    - content.code.copy
+    - content.tabs.link
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: orange
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: orange
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+extra_css:
+  - stylesheets/extra.css
+  - stylesheets/formula-reference.css
+
+extra_javascript:
+  - javascripts/formula-reference.js
+
+
+hooks:
+  - docs/hooks/roadmap.py
+
+plugins:
+  - search
+  - redirects:
+      redirect_maps:
+        for-developers/docker-deployment.md: users/deployment/docker.md
+        for-developers/creating-custom-nodes.md: users/visual-editor/creating-custom-nodes.md
+        for-developers/custom-node-tutorial.md: users/visual-editor/custom-node-tutorial.md
+        for-developers/kmeans-kernel-node.md: users/visual-editor/kmeans-kernel-node.md
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            # Global options for all Python objects
+            show_root_heading: true
+            inherited_members: true
+            show_bases: true
+            # Options specific to the griffe-pydantic extension
+            extensions:
+              - griffe_pydantic:
+                  # Render the "Fields" and "Validators" sections
+                  schema: true
+
+markdown_extensions:
+  - attr_list
+  - tables
+  - toc:
+      toc_depth: 3
+  - md_in_html
+  - admonition
+  - pymdownx.details
+  - pymdownx.snippets:
+      base_path: ["."]
+      check_paths: true
+      dedent_subsections: true
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - footnotes
+
+# MkDocs Navigation Structure
+
+
+nav:
+  - Home: index.html
+
+  - Get Started:
+    - What is Flowfile:
+      - Overview: what-is-flowfile.md
+      - For Non-Technical Readers: what-is-flowfile-plain.md
+      - For Technical Readers: what-is-flowfile-technical.md
+    - Installation: installation.md
+    - Quickstart: quickstart.md
+    - Flowfile Lite (Browser): users/deployment/lite.md
+    - By Audience:
+      - users/index.md
+      - Coming from Excel: users/coming-from-excel.md
+      - Build Flows Visually: users/build-flows-visually.md
+      - Analyze Your Data: users/analyze-your-data.md
+      - Your Data Lives Elsewhere: users/data-elsewhere.md
+      - Coming from Alteryx: users/coming-from-alteryx.md
+      - Write Python: users/write-python.md
+      - Run Flowfile for a Team: users/deploy-for-a-team.md
+
+  - Visual Editor:
+    - users/visual-editor/index.md
+    - Building Flows: users/visual-editor/building-flows.md
+    - Canvas Notebook: users/visual-editor/notebook.md
+    - Data Actions:
+      - users/visual-editor/nodes/index.md
+      - Input Sources: users/visual-editor/nodes/input.md
+      - Transformations: users/visual-editor/nodes/transform.md
+      - Combine Operations: users/visual-editor/nodes/combine.md
+      - Aggregations: users/visual-editor/nodes/aggregate.md
+      - Machine Learning: users/visual-editor/nodes/ml.md
+      - Output Operations: users/visual-editor/nodes/output.md
+    - Formula Language:
+      - users/formulas/index.md
+      - Function Reference: users/formulas/functions.md
+    - Sandboxed Python (Kernels): users/visual-editor/kernels.md
+    - The flowfile_ctx API: users/visual-editor/kernel-api.md
+    - Node Designer:
+      - Overview: users/visual-editor/node-designer.md
+      - 'Tutorial: Your First Custom Node': users/visual-editor/custom-node-tutorial.md
+      - 'Tutorial: K-Means on a Kernel': users/visual-editor/kmeans-kernel-node.md
+      - Community Nodes: users/visual-editor/community-nodes.md
+    - Worked Examples:
+      - users/visual-editor/tutorials/index.md
+      - Sales Pipeline: users/visual-editor/tutorials/sales-pipeline.md
+      - Sales Dashboard: users/visual-editor/tutorials/sales-dashboard.md
+      - Export to Python: users/visual-editor/tutorials/code-generator.md
+    - Settings: users/visual-editor/settings.md
+
+  - Connect Your Data:
+    - users/connect/index.md
+    - Connections: users/visual-editor/connections.md
+    - Secrets & Encryption: users/visual-editor/catalog/secrets.md
+    - Databases: users/visual-editor/tutorials/database-connectivity.md
+    - Cloud Storage: users/visual-editor/tutorials/cloud-connections.md
+    - Kafka: users/connect/kafka.md
+    - REST APIs & Google Analytics: users/connect/apis.md
+
+  - Catalog & Automation:
+    - users/visual-editor/catalog/index.md
+    - Virtual Tables: users/visual-editor/catalog/virtual-tables.md
+    - Slowly Changing Dimensions: users/visual-editor/catalog/slowly-changing-dimensions.md
+    - Change Tracking: users/visual-editor/catalog/change-tracking.md
+    - SQL Editor: users/visual-editor/catalog/sql-editor.md
+    - Notebooks: users/visual-editor/catalog/notebooks.md
+    - Visualizations: users/visual-editor/catalog/visualizations.md
+    - Schedules: users/visual-editor/catalog/schedules.md
+    - Alerts & Notifications: users/visual-editor/catalog/alerts.md
+    - Flows as APIs: users/visual-editor/catalog/flow-api.md
+    - Subflows: users/visual-editor/subflows.md
+    - Projects & Git: users/projects.md
+
+  - Python API:
+    - users/python-api/index.md
+    - Quick Start: users/python-api/quickstart.md
+    - Core Concepts:
+      - users/python-api/concepts/index.md
+      - FlowFrame & FlowGraph: users/python-api/concepts/design-concepts.md
+      - Expressions: users/python-api/concepts/expressions.md
+      - Formulas in Python: users/python-api/concepts/formulas.md
+    - API Reference:
+      - users/python-api/reference/index.md
+      - Reading Data: users/python-api/reference/reading-data.md
+      - Writing Data: users/python-api/reference/writing-data.md
+      - Catalog References: users/python-api/reference/catalog-references.md
+      - Data Types: users/python-api/reference/data-types.md
+      - DataFrame Operations: users/python-api/reference/flowframe-operations.md
+      - Aggregations: users/python-api/reference/aggregations.md
+      - Joins: users/python-api/reference/joins.md
+      - Cloud Storage: users/python-api/reference/cloud-connections.md
+      - Visual UI Integration: users/python-api/reference/visual-ui.md
+      - Native Node Classes: users/python-api/reference/native-nodes.md
+    - Tutorials:
+      - users/python-api/tutorials/index.md
+      - First steps: users/python-api/tutorials/first-steps.md
+      - Clean and shape: users/python-api/tutorials/clean-and-shape.md
+      - Combine: users/python-api/tutorials/combine.md
+      - Aggregate: users/python-api/tutorials/aggregate.md
+      - Flow parameters: users/python-api/tutorials/flow-parameters.md
+      - Branching with Gate: users/python-api/tutorials/branching.md
+      - Write results: users/python-api/tutorials/write-results.md
+      - Reusable flows: users/python-api/tutorials/reusable-flows.md
+      - Custom logic: users/python-api/tutorials/custom-logic.md
+      - Ship it: users/python-api/tutorials/ship-it.md
+      - Building Flows with Code: users/python-api/tutorials/flowfile_frame_api.md
+
+  - AI Assistant:
+    - ai/index.md
+    - Provider Setup: ai/providers.md
+
+  - Deploy & Operate:
+    - users/deployment/index.md
+    - Desktop App: users/deployment/desktop.md
+    - Python Package: users/deployment/python.md
+    - Docker: users/deployment/docker.md
+    - Where Flows Run: users/deployment/where-flows-run.md
+    - Remote Workers: users/deployment/remote-worker.md
+    - Users, Groups & Sharing: users/deployment/sharing.md
+    - Headless Runs & CLI: users/deployment/cli.md
+    - Privacy & Telemetry: users/telemetry.md
+    - Database Backups: users/deployment/backups.md
+
+  - For Developers:
+    - Introduction: for-developers/index.md
+    - Design Philosophy: for-developers/design-philosophy.md
+    - Architecture: for-developers/architecture.md
+    - Core Internals: for-developers/flowfile-core.md
+    - How Compute Works: for-developers/compute-walkthrough.md
+    - Compute Protocol: for-developers/compute-protocol.md
+    - Internal API Reference: for-developers/python-api-reference.md
+    - Catalog Architecture: for-developers/catalog-architecture.md
+    - Kernel Architecture: for-developers/kernel-architecture.md
+    - AI Integration Architecture: for-developers/ai-architecture.md
+    - Visualizations & Graphic Walker: for-developers/visualizations.md
+    - Custom Nodes in Code: users/visual-editor/creating-custom-nodes.md
+
+  - Roadmap:
+    - Priorities: roadmap.md
+    - Architecture & Technology: roadmap-details.md
+  - Community: community.md

@@ -1,0 +1,782 @@
+/* main.css - Main stylesheet entry point */
+
+/* ========== All Imports Must Come First ========== */
+@import './base/_variables.css';
+@import './components/_listbox.css';
+@import './components/_buttons.css';
+@import './components/_column-options.css';
+@import './components/_styled-table.css';
+@import './components/_column-list.css';
+@import './components/_cards.css';
+@import './components/_forms.css';
+@import './components/_modals.css';
+@import './components/_context-menu.css';
+@import './components/_status-badges.css';
+@import './components/_node-rows.css';
+@import './components/_detail-panels.css';
+@import './components/_popovers.css';
+@import './utils/_spacing.css';
+@import './utils/_layout.css';
+
+/* ========== Base Styles ========== */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  font-size: var(--font-size-base);
+  line-height: var(--line-height-normal);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  font-family: var(--font-family-base);
+  font-size: var(--font-size-base);
+  font-weight: var(--font-weight-normal);
+  color: var(--color-text-primary);
+  background-color: var(--color-background-primary);
+}
+
+/* ========== Typography Base ========== */
+h1, h2, h3, h4, h5, h6 {
+  margin: 0;
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--line-height-tight);
+  color: var(--color-text-primary);
+}
+
+h1 { font-size: var(--font-size-4xl); }
+h2 { font-size: var(--font-size-3xl); }
+h3 { font-size: var(--font-size-2xl); }
+h4 { font-size: var(--font-size-xl); }
+h5 { font-size: var(--font-size-lg); }
+h6 { font-size: var(--font-size-base); }
+
+p {
+  margin: 0 0 var(--spacing-3);
+}
+
+a {
+  color: var(--color-primary);
+  text-decoration: none;
+  transition: color var(--transition-fast) var(--transition-timing);
+}
+
+a:hover {
+  color: var(--color-primary-dark);
+}
+
+/* ========== Form Elements Base ========== */
+input,
+textarea,
+select,
+button {
+  font-family: inherit;
+  font-size: inherit;
+}
+
+/* Listed by type, not :not(), to stay a low-specificity base components can override. */
+input:not([type]),
+input[type="text"],
+input[type="number"],
+input[type="search"],
+input[type="email"],
+input[type="url"],
+input[type="password"],
+input[type="tel"],
+textarea,
+select {
+  background-color: var(--color-background-primary);
+  color: var(--color-text-primary);
+  border: 1px solid var(--color-border-primary);
+  border-radius: 4px;
+}
+
+/* Element Plus draws its chrome on the wrapper; styling the inner field doubles the border. */
+input.el-input__inner,
+input.el-select__input,
+input.el-range-input,
+textarea.el-textarea__inner {
+  background-color: transparent;
+  border: none;
+  border-radius: 0;
+}
+
+button {
+  cursor: pointer;
+}
+
+/* ========== Scrollbar Styling ========== */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background-color: var(--color-gray-300);
+  border-radius: var(--border-radius-full);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: var(--color-gray-400);
+}
+
+/* ========== Material Icons ========== */
+.material-icons {
+  font-family: 'Material Icons';
+  font-weight: normal;
+  font-style: normal;
+  font-size: 24px;
+  line-height: 1;
+  letter-spacing: normal;
+  text-transform: none;
+  display: inline-block;
+  white-space: nowrap;
+  word-wrap: normal;
+  direction: ltr;
+  -webkit-font-feature-settings: 'liga';
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+/* ========== Element Plus Theme Overrides ========== */
+/* Set Element Plus CSS variables at root level */
+:root {
+  --el-color-primary: var(--color-accent);
+  --el-color-primary-light-3: var(--color-accent-light);
+  --el-color-primary-light-5: var(--color-accent-subtle);
+  --el-color-primary-light-7: var(--color-accent-subtle);
+  --el-color-primary-light-8: var(--color-accent-subtle);
+  --el-color-primary-light-9: var(--color-accent-subtle);
+  --el-color-primary-dark-2: var(--color-accent-hover);
+  --el-border-radius-base: var(--border-radius-md);
+  --el-border-radius-small: var(--border-radius-sm);
+  --el-font-size-base: var(--font-size-base);
+  --el-font-size-small: var(--font-size-sm);
+}
+
+/* General font family */
+[class^="el-"],
+[class*=" el-"] {
+  font-family: var(--font-family-base);
+}
+
+/* Exception for icons */
+.el-icon,
+.el-select__caret,
+.el-input__icon,
+[class*="el-icon-"],
+[class*="el-select__caret"],
+[class*="el-input__icon"] {
+  font-family: element-icons !important;
+}
+
+/* ========== Element Plus Button Styling ========== */
+/* Base button styling - friendlier appearance */
+.el-button {
+  --el-button-font-weight: var(--font-weight-medium);
+  border-radius: var(--border-radius-lg) !important;
+  font-weight: var(--font-weight-medium);
+  transition: all var(--transition-fast) var(--transition-timing);
+}
+
+/* Primary button - friendly teal/cyan color.
+   Exclude text/link variants: those are meant to be colored text on a
+   transparent background, so forcing a solid accent fill made their
+   (also-accent) label unreadable. */
+.el-button--primary:not(.is-text):not(.is-link) {
+  --el-button-bg-color: var(--color-accent) !important;
+  --el-button-border-color: var(--color-accent) !important;
+  --el-button-hover-bg-color: var(--color-accent-hover) !important;
+  --el-button-hover-border-color: var(--color-accent-hover) !important;
+  --el-button-active-bg-color: var(--color-accent-hover) !important;
+  --el-button-active-border-color: var(--color-accent-hover) !important;
+  background-color: var(--color-accent) !important;
+  border-color: var(--color-accent) !important;
+}
+
+.el-button--primary:not(.is-text):not(.is-link):hover,
+.el-button--primary:not(.is-text):not(.is-link):focus {
+  background-color: var(--color-accent-hover) !important;
+  border-color: var(--color-accent-hover) !important;
+}
+
+/* Default button - subtle styling */
+.el-button--default {
+  --el-button-bg-color: var(--color-background-primary);
+  --el-button-border-color: var(--color-border-secondary);
+  --el-button-text-color: var(--color-text-primary);
+  --el-button-hover-bg-color: var(--color-background-tertiary);
+  --el-button-hover-border-color: var(--color-border-secondary);
+}
+
+/* Small button refinement */
+.el-button--small {
+  font-size: var(--font-size-sm);
+  padding: 6px 12px;
+}
+
+/* ========== Element Plus Input Styling ========== */
+.el-input__wrapper {
+  font-size: var(--font-size-sm);
+  border-radius: var(--border-radius-md);
+  transition: box-shadow var(--transition-fast);
+}
+
+.el-input.is-focus .el-input__wrapper {
+  box-shadow: 0 0 0 1px var(--color-accent) inset !important;
+}
+
+.el-select {
+  --el-select-input-font-size: var(--font-size-sm);
+}
+
+/* Select dropdown styling */
+.el-select-dropdown__item:hover {
+  background-color: var(--color-background-hover);
+}
+
+.el-select-dropdown__item.is-selected {
+  background-color: var(--color-accent-subtle);
+  color: var(--color-accent);
+}
+
+.el-select-dropdown__item:hover,
+.el-select-dropdown__item.hover {
+  background-color: var(--color-background-hover) !important;
+}
+
+.el-select-dropdown__item.is-selected:hover,
+.el-select-dropdown__item.is-selected.hover {
+  background-color: var(--color-accent-subtle) !important;
+}
+
+/* Element Plus dark theme isn't imported — theme multiselect tags explicitly.
+   Scoped to .el-select so standalone status tags (success/danger/info) stay colored. */
+[data-theme="dark"] .el-select .el-tag {
+  background-color: var(--color-background-secondary);
+  border-color: var(--color-border-primary);
+  color: var(--color-text-primary);
+}
+
+[data-theme="dark"] .el-select .el-tag .el-tag__close {
+  color: var(--color-text-secondary);
+}
+
+[data-theme="dark"] .el-select .el-tag .el-tag__close:hover {
+  background-color: var(--color-text-secondary);
+  color: var(--color-background-primary);
+}
+
+/* ========== Element Plus Message ========== */
+.el-message {
+  font-family: var(--font-family-base);
+  border-radius: var(--border-radius-lg);
+  box-shadow: var(--shadow-lg);
+  max-width: min(360px, calc(100vw - 32px));
+  pointer-events: none;
+}
+
+.el-message__content {
+  font-size: var(--font-size-sm);
+}
+
+/* Noise is click-through; things you need to read stay hoverable (pauses the timer). */
+.el-message .el-message__closeBtn,
+.el-message--warning,
+.el-message--error {
+  pointer-events: auto;
+}
+
+[data-theme="dark"] .el-message {
+  background-color: var(--color-background-secondary);
+  border-color: var(--color-border-primary);
+}
+
+/* ========== Element Plus Notification ========== */
+.el-notification {
+  font-family: var(--font-family-base);
+  border-radius: var(--border-radius-lg);
+  box-shadow: var(--shadow-lg);
+}
+
+.el-notification__title {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-primary);
+  font-weight: var(--font-weight-semibold);
+}
+
+.el-notification__content {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+}
+
+/* ========== Element Plus Drawer ========== */
+.el-drawer__body {
+  color: var(--color-text-primary);
+  padding: var(--spacing-5);
+  overflow-y: auto;
+}
+
+/* ========== Element Plus Dialog ========== */
+.el-dialog {
+  --el-dialog-border-radius: var(--border-radius-xl);
+  border-radius: var(--border-radius-xl);
+}
+
+.el-dialog__header {
+  padding: var(--spacing-4) var(--spacing-5);
+  border-bottom: 1px solid var(--color-border-light);
+}
+
+.el-dialog__title {
+  font-size: var(--font-size-lg);
+  font-weight: var(--font-weight-semibold);
+}
+
+.el-dialog__body {
+  font-size: var(--font-size-sm);
+  padding: var(--spacing-5);
+}
+
+.el-dialog__footer {
+  padding: var(--spacing-4) var(--spacing-5);
+  border-top: 1px solid var(--color-border-light);
+}
+
+/* Visualization (graphic-walker) dialog — identified by the presence of
+   .viz-scroll-area inside. Element Plus's `custom-class` / `modal-class`
+   props don't propagate to .el-dialog / .el-overlay reliably in this version,
+   so we target the right elements by structure (:has) instead of by class.
+   Locks dialog to 92vh, suppresses the .el-overlay-dialog wrapper scroll
+   (EP default `overflow: auto`), and sets up a flex column inside the body
+   so the inner .viz-scroll-area is the only scroll surface. */
+.el-overlay:has(.viz-scroll-area) .el-overlay-dialog {
+  overflow: hidden;
+}
+.el-dialog:has(.viz-scroll-area) {
+  --el-dialog-margin-top: 4vh;
+  /* EP applies the dialog's `top` prop as inline `margin-top` (default 15vh).
+     Inline styles win over CSS, so the var above is a no-op without this
+     override. Without it: 15vh + 92vh = 107vh, and .el-overlay-dialog
+     (overflow: hidden) silently clips the bottom 7vh. */
+  margin-top: 4vh !important;
+  height: 92vh !important;
+  max-height: 92vh !important;
+  display: flex;
+  flex-direction: column;
+}
+.el-dialog:has(.viz-scroll-area) .el-dialog__header {
+  flex: 0 0 auto;
+}
+.el-dialog:has(.viz-scroll-area) .el-dialog__body {
+  flex: 1 1 auto;
+  /* min-height: 0 is required for `overflow: hidden` to actually clip a
+     flex child — without it, flex items refuse to shrink below content. */
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  padding: var(--spacing-3) var(--spacing-4);
+}
+
+/* ========== Element Plus Table ========== */
+.el-table {
+  --el-table-border-color: var(--color-border-light);
+  --el-table-header-bg-color: var(--color-background-muted);
+  font-size: var(--font-size-sm);
+}
+
+.el-table th.el-table__cell {
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-primary);
+}
+
+/* ========== Element Plus Form ========== */
+.el-form-item__label {
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-secondary);
+}
+
+/* ========== Element Plus Misc ========== */
+.el-popover,
+.el-tooltip__content {
+  font-size: var(--font-size-sm);
+  border-radius: var(--border-radius-md);
+}
+
+.el-tabs__item {
+  font-size: var(--font-size-sm);
+}
+
+.el-message-box {
+  border-radius: var(--border-radius-xl);
+}
+
+.el-message-box__title {
+  font-size: var(--font-size-lg);
+}
+
+.el-message-box__message {
+  font-size: var(--font-size-sm);
+}
+
+/* ========== Element Plus Collapse ========== */
+.el-collapse {
+  --el-collapse-border-color: var(--color-border-primary);
+  --el-collapse-header-background-color: var(--color-background-primary);
+  --el-collapse-header-font-color: var(--color-text-primary);
+  --el-collapse-content-background-color: var(--color-background-primary);
+  --el-collapse-content-font-color: var(--color-text-primary);
+  border-color: var(--color-border-primary);
+}
+
+.el-collapse-item__header {
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+  background-color: var(--color-background-primary);
+  color: var(--color-text-primary);
+}
+
+.el-collapse-item__content {
+  font-size: var(--font-size-sm);
+  background-color: var(--color-background-primary);
+  color: var(--color-text-primary);
+}
+
+.el-collapse-item__wrap {
+  background-color: var(--color-background-primary);
+}
+
+/* ========== Element Plus Menu Styling ========== */
+.el-menu {
+  background-color: var(--color-background-primary);
+  border-right: none;
+}
+
+.el-menu-item,
+.el-sub-menu__title {
+  color: var(--color-text-secondary);
+}
+
+.el-menu-item:hover,
+.el-sub-menu__title:hover {
+  background-color: var(--color-background-hover);
+  color: var(--color-text-primary);
+}
+
+.el-menu-item.is-active {
+  color: var(--color-accent);
+  background-color: var(--color-background-selected);
+}
+
+.el-menu-item i,
+.el-sub-menu__title i {
+  color: var(--color-text-secondary);
+}
+
+.el-menu-item.is-active i {
+  color: var(--color-accent);
+}
+
+/* Sub-menu parents (Catalog, Connections) carry is-active on the root .el-sub-menu, not the item — mirror the plain active highlight so their rail icon turns accent too. */
+.el-sub-menu.is-active > .el-sub-menu__title {
+  color: var(--color-accent);
+  background-color: var(--color-background-selected);
+}
+
+.el-sub-menu.is-active > .el-sub-menu__title i {
+  color: var(--color-accent);
+}
+
+/* ========== Element Plus Tabs Styling ========== */
+.el-tabs__header {
+  background-color: var(--color-background-primary);
+}
+
+.el-tabs__nav-wrap::after {
+  background-color: var(--color-border-primary);
+}
+
+.el-tabs__item {
+  color: var(--color-text-secondary);
+}
+
+.el-tabs__item:hover {
+  color: var(--color-text-primary);
+}
+
+.el-tabs__item.is-active {
+  color: var(--color-accent);
+}
+
+.el-tabs__content {
+  background-color: var(--color-background-primary);
+}
+
+.el-tab-pane {
+  background-color: var(--color-background-primary);
+}
+
+/* ========== Element Plus Drawer Styling ========== */
+.el-drawer {
+  background-color: var(--color-background-primary);
+}
+
+.el-drawer__header {
+  background-color: var(--color-background-secondary);
+  color: var(--color-text-primary);
+  border-bottom: 1px solid var(--color-border-primary);
+}
+
+.el-drawer__body {
+  background-color: var(--color-background-primary);
+  color: var(--color-text-primary);
+}
+
+/* ========== Element Plus Switch Styling ========== */
+.el-switch__label {
+  color: var(--color-text-secondary);
+}
+
+.el-switch__label.is-active {
+  color: var(--color-text-primary);
+}
+
+/* ========== Element Plus Textarea/Input Styling ========== */
+.el-textarea__inner {
+  background-color: var(--color-background-primary);
+  color: var(--color-text-primary);
+  border-color: var(--color-border-primary);
+}
+
+.el-textarea__inner:focus {
+  border-color: var(--color-accent);
+}
+
+.el-input__inner {
+  background-color: var(--color-background-primary);
+  color: var(--color-text-primary);
+}
+
+/* ========== Element Plus Card Styling ========== */
+.el-card {
+  background-color: var(--color-background-primary);
+  border-color: var(--color-border-primary);
+}
+
+.el-card__header {
+  background-color: var(--color-background-secondary);
+  border-bottom-color: var(--color-border-primary);
+  color: var(--color-text-primary);
+}
+
+.el-card__body {
+  color: var(--color-text-primary);
+}
+
+/* ========== Element Plus Dropdown Styling ========== */
+.el-dropdown-menu {
+  background-color: var(--color-background-primary);
+  border-color: var(--color-border-primary);
+}
+
+.el-dropdown-menu__item {
+  color: var(--color-text-primary);
+}
+
+.el-dropdown-menu__item:hover {
+  background-color: var(--color-background-hover);
+  color: var(--color-text-primary);
+}
+
+/* ========== Element Plus Popover Styling ========== */
+.el-popover {
+  background-color: var(--color-background-primary);
+  border-color: var(--color-border-primary);
+}
+
+.el-popover__title {
+  color: var(--color-text-primary);
+}
+
+/* ========== Element Plus Popper Z-Index Fix ========== */
+/* Fix for el-select dropdowns appearing behind dialogs and canvas elements.
+   Element Plus poppers are teleported to body and need high z-index to appear above:
+   - Canvas panels (DraggableItem panels at z-index 100000)
+   - High z-index dialogs (at z-index 200001)
+   Set to 200010 to ensure dropdowns always appear above modal dialogs */
+.el-popper,
+.el-select-dropdown,
+.el-select__popper,
+.el-autocomplete-suggestion,
+.el-cascader__dropdown,
+.el-color-dropdown,
+.el-date-editor .el-picker-panel,
+.el-picker__popper,
+.el-tooltip__popper,
+.el-popover.el-popper {
+  z-index: 200010 !important;
+}
+
+/* ========== CodeMirror Dark Mode Styling ========== */
+/* These styles must be global because CodeMirror tooltips are rendered as portals */
+
+/* Editor background and text */
+.cm-editor {
+  background-color: var(--color-background-secondary) !important;
+  color: var(--color-text-primary) !important;
+  cursor: default !important;
+}
+
+.cm-editor .cm-content {
+  caret-color: var(--color-text-primary) !important;
+  cursor: text !important;
+}
+
+.cm-editor .cm-cursor,
+.cm-editor .cm-cursor-primary {
+  border-left-color: var(--color-text-primary) !important;
+}
+
+.cm-editor .cm-gutters {
+  background-color: var(--color-background-primary) !important;
+  color: var(--color-text-muted) !important;
+  border-right: 1px solid var(--color-border-primary) !important;
+}
+
+.cm-editor .cm-activeLineGutter {
+  background-color: var(--color-background-hover) !important;
+}
+
+.cm-editor .cm-activeLine {
+  background-color: rgba(240, 247, 255, 0.5) !important;
+}
+
+[data-theme="dark"] .cm-editor .cm-activeLine {
+  background-color: rgba(30, 58, 95, 0.5) !important;
+}
+
+.cm-editor .cm-selectionBackground {
+  background-color: var(--color-focus-ring-accent) !important;
+}
+
+.cm-editor.cm-focused .cm-selectionBackground {
+  background-color: var(--color-focus-ring-accent-strong) !important;
+}
+
+/* Placeholder styling */
+.cm-placeholder {
+  color: var(--color-text-muted) !important;
+}
+
+/* CodeMirror Autocomplete Tooltip - rendered as portal to body */
+.cm-tooltip {
+  background-color: var(--color-background-primary) !important;
+  border: 1px solid var(--color-border-primary) !important;
+  color: var(--color-text-primary) !important;
+  box-shadow: var(--shadow-lg) !important;
+  /* Body-mounted via tooltips({parent}); must beat draggable panels (100000),
+     high-z-index dialogs (200001) and el-popper (200010) */
+  z-index: 200020 !important;
+}
+
+.cm-tooltip-autocomplete {
+  background-color: var(--color-background-primary) !important;
+}
+
+.cm-tooltip-autocomplete > ul {
+  background-color: var(--color-background-primary) !important;
+}
+
+.cm-tooltip-autocomplete > ul > li {
+  color: var(--color-text-primary) !important;
+  background-color: var(--color-background-primary) !important;
+}
+
+.cm-tooltip-autocomplete > ul > li:hover {
+  background-color: var(--color-background-hover) !important;
+}
+
+.cm-tooltip-autocomplete > ul > li[aria-selected],
+.cm-tooltip-autocomplete > ul > li[aria-selected="true"] {
+  background-color: var(--color-accent) !important;
+  color: var(--color-text-inverse) !important;
+}
+
+/* Completion label and detail */
+.cm-completionLabel {
+  color: var(--color-text-primary) !important;
+}
+
+.cm-completionDetail {
+  color: var(--color-text-secondary) !important;
+}
+
+/* Completion Info Panel (documentation popup) - critical for dark mode */
+.cm-completionInfo {
+  background-color: var(--color-background-secondary) !important;
+  border: 1px solid var(--color-border-primary) !important;
+  color: var(--color-text-primary) !important;
+  padding: 8px 12px !important;
+  max-width: 400px !important;
+  box-shadow: var(--shadow-lg) !important;
+}
+
+.cm-completionInfo * {
+  color: var(--color-text-primary) !important;
+}
+
+/* Ensure tooltip above other content */
+.cm-tooltip-above,
+.cm-tooltip-below {
+  background-color: var(--color-background-primary) !important;
+}
+
+/* Tooltip arrow styling */
+.cm-tooltip::before,
+.cm-tooltip::after {
+  border-color: var(--color-border-primary) transparent transparent transparent !important;
+}
+
+/* Matching bracket highlight */
+.cm-matchingBracket {
+  background-color: var(--color-background-selected) !important;
+  color: var(--color-accent) !important;
+}
+
+/* Panel styling */
+.cm-panels {
+  background-color: var(--color-background-secondary) !important;
+  color: var(--color-text-primary) !important;
+  border-color: var(--color-border-primary) !important;
+}
+
+.cm-panels-top {
+  border-bottom-color: var(--color-border-primary) !important;
+}
+
+.cm-panels-bottom {
+  border-top-color: var(--color-border-primary) !important;
+}
+
+/* vega-tooltip injects #vg-tooltip-element into <body> with z-index: 1000.
+   Element Plus dialogs sit at z-index ≈ 2001, so chart-mark tooltips inside
+   a dialog (catalog viewer/editor) render behind the modal. Lift the tooltip
+   above the modal layer so hover works inside dialogs. */
+#vg-tooltip-element {
+  z-index: 4000 !important;
+}
+

@@ -1,0 +1,224 @@
+"""Nodes that run user code: Polars code, SQL query and the kernel-backed Python script."""
+
+from dataclasses import replace
+
+import polars as pl
+
+from flowfile_core.configs.settings import FLOWFILE_COMPUTE_PROTOCOL
+from flowfile_core.flowfile.execution.context import current_context
+from flowfile_core.flowfile.execution.payloads import PolarsCodePayload, SqlQueryPayload, op_payload
+from flowfile_core.flowfile.execution.protocol import ComputeBackend, OperationKind
+from flowfile_core.flowfile.flow_data_engine.flow_data_engine import (
+    FlowDataEngine,
+    execute_polars_code,
+    execute_sql_query,
+)
+from flowfile_core.flowfile.flow_data_engine.flow_file_column.main import FlowfileColumn
+from flowfile_core.flowfile.flow_data_engine.polars_code_parser import polars_code_parser
+from flowfile_core.flowfile.flow_graph._base import GraphMixinBase
+from flowfile_core.flowfile.flow_graph.history import with_history_capture
+from flowfile_core.flowfile.flow_node.flow_node import FlowNode, run_operation
+from flowfile_core.flowfile.flow_node.multi_output import DEFAULT_OUTPUT_HANDLE, output_handle
+from flowfile_core.flowfile.sources.external_sources.sql_source.sql_source import (
+    validate_sql_query,
+)
+from flowfile_core.schemas import input_schema
+from flowfile_core.schemas.history_schema import (
+    HistoryActionType,
+)
+
+
+def _user_code_engine(
+    backend: ComputeBackend,
+    node: FlowNode,
+    op: OperationKind,
+    job: PolarsCodePayload | SqlQueryPayload,
+    predicting: bool,
+) -> FlowDataEngine:
+    """The engine over what a Polars Code or SQL Query job answers on ``backend``.
+
+    A run's result is the node's (``FlowNode.run_op``), released at once when deferred, since the engine holds its
+    plan. A schema prediction runs as ``<job_id>-schema`` so it never replaces the run's result, and is released once
+    its columns are read.
+    """
+    if predicting:
+        ref = run_operation(backend, op, op_payload(replace(job, job_id=f"{job.job_id}-schema"))).refs["result"]
+        backend.release(ref)
+        return FlowDataEngine.create_from_schema(list(ref.schema))
+    ref = node.run_op(backend, op, op_payload(job), job_id=job.job_id).refs["result"]
+    engine = FlowDataEngine(backend.plan_for(ref), schema=ref.schema, number_of_records=ref.row_count)
+    if ref.state == "deferred":
+        backend.release(ref)
+    return engine
+
+
+class CodeBuildersMixin(GraphMixinBase):
+    @with_history_capture(HistoryActionType.UPDATE_SETTINGS)
+    def add_polars_code(self, node_polars_code: input_schema.NodePolarsCode):
+        """Adds a node that executes custom Polars code.
+
+        With ``FLOWFILE_COMPUTE_PROTOCOL`` on, the code runs as the ``polars_code`` operation on the execution
+        context's backend, so core never executes it. A call while the node already holds a result is a schema
+        prediction (a run calls the function only while the node holds none), made over the predicted inputs' empty
+        frames under its own job id (``_user_code_engine``). With the flag off the code runs in core to build the plan.
+
+        Args:
+            node_polars_code: The settings for the Polars code node.
+        """
+
+        def _func(*flowfile_tables: FlowDataEngine) -> FlowDataEngine:
+            if not FLOWFILE_COMPUTE_PROTOCOL:
+                return execute_polars_code(*flowfile_tables, code=node_polars_code.polars_code_input.polars_code)
+            node = self.get_node(node_polars_code.node_id)
+            job = PolarsCodePayload(
+                code=node_polars_code.polars_code_input.polars_code,
+                inputs=tuple(table.data_frame.lazy() for table in flowfile_tables),
+                flow_id=self.flow_id,
+                node_id=node_polars_code.node_id,
+                job_id=f"{node.hash}-polars-code",
+            )
+            predicting = node.results.resulting_data is not None
+            return _user_code_engine(current_context(self).backend, node, OperationKind.polars_code, job, predicting)
+
+        self.add_node_step(
+            node_id=node_polars_code.node_id,
+            function=_func,
+            node_type="polars_code",
+            setting_input=node_polars_code,
+            input_node_ids=node_polars_code.depending_on_ids,
+        )
+
+        try:
+            polars_code_parser.validate_code(node_polars_code.polars_code_input.polars_code)
+        except Exception as e:
+            node = self.get_node(node_id=node_polars_code.node_id)
+            node.results.errors = str(e)
+
+    @with_history_capture(HistoryActionType.UPDATE_SETTINGS)
+    def add_sql_query(self, node_sql_query: input_schema.NodeSqlQuery):
+        """Adds a node that executes a SQL query against connected data sources.
+
+        With ``FLOWFILE_COMPUTE_PROTOCOL`` on, the query is translated as the ``sql_query`` operation on the
+        execution context's backend, so core translates no SQL. The schema callback, and a call while the node already
+        holds a result, are predictions over the predicted inputs' empty frames under their own job id
+        (``_user_code_engine``). With the flag off the query is translated in core to build the plan.
+
+        Args:
+            node_sql_query: The settings for the SQL query node.
+        """
+
+        def _query(*flowfile_tables: FlowDataEngine, predicting: bool) -> FlowDataEngine:
+            if not FLOWFILE_COMPUTE_PROTOCOL:
+                return execute_sql_query(*flowfile_tables, sql_code=node_sql_query.sql_query_input.sql_code)
+            node = self.get_node(node_sql_query.node_id)
+            job = SqlQueryPayload(
+                sql_code=node_sql_query.sql_query_input.sql_code,
+                inputs=tuple(table.data_frame.lazy() for table in flowfile_tables),
+                flow_id=self.flow_id,
+                node_id=node_sql_query.node_id,
+                job_id=f"{node.hash}-sql-query",
+            )
+            predicting = predicting or node.results.resulting_data is not None
+            return _user_code_engine(current_context(self).backend, node, OperationKind.sql_query, job, predicting)
+
+        def _func(*flowfile_tables: FlowDataEngine) -> FlowDataEngine:
+            return _query(*flowfile_tables, predicting=False)
+
+        self.add_node_step(
+            node_id=node_sql_query.node_id,
+            function=_func,
+            node_type="sql_query",
+            setting_input=node_sql_query,
+            input_node_ids=node_sql_query.depending_on_ids,
+        )
+
+        node = self.get_node(node_id=node_sql_query.node_id)
+
+        def schema_callback() -> list[FlowfileColumn]:
+            # Resolve the schema by planning over 0-row upstream frames; nothing is collected.
+            inputs = [
+                v.get_predicted_resulting_data(src_handle) if v is not None else FlowDataEngine()
+                for v, src_handle in node._slot_input_pairs()
+            ]
+            return _query(*inputs, predicting=True).schema
+
+        node.schema_callback = schema_callback
+
+        try:
+            validate_sql_query(node_sql_query.sql_query_input.sql_code)
+        except Exception as e:
+            node.results.errors = str(e)
+
+    @with_history_capture(HistoryActionType.UPDATE_SETTINGS)
+    def add_python_script(self, node_python_script: input_schema.NodePythonScript):
+        """Adds a node that executes Python code on a kernel container."""
+
+        def _func(*flowfile_tables: FlowDataEngine) -> FlowDataEngine:
+            kernel_id = node_python_script.python_script_input.kernel_id
+            if not kernel_id:
+                raise ValueError("No kernel selected for python_script node")
+            result = self._execute_on_kernel(
+                node_id=node_python_script.node_id,
+                kernel_id=kernel_id,
+                code=node_python_script.python_script_input.code,
+                output_names=node_python_script.output_names,
+                flow_data_engine=flowfile_tables,
+            )
+            return result or (flowfile_tables[0] if flowfile_tables else FlowDataEngine(pl.LazyFrame()))
+
+        def schema_callback():
+            """Best-effort schema prediction for python_script nodes.
+
+            Declared ``output_schemas`` win; an output without a declaration (or a node
+            without any) predicts the first input's schema, since most python_script
+            nodes transform and pass through. If nothing is available, returns [] —
+            never raises.
+            """
+            try:
+                node = self.get_node(node_python_script.node_id)
+                if node is None:
+                    return []
+
+                main_inputs = node.node_inputs.main_inputs
+                input_schema_: list[FlowfileColumn] = (main_inputs[0].schema or []) if main_inputs else []
+                declared = node_python_script.output_schemas
+                if not declared:
+                    return input_schema_
+                named = {
+                    output_handle(i): (
+                        [FlowfileColumn.from_input(f.name, f.data_type) for f in declared[name]]
+                        if name in declared
+                        else list(input_schema_)
+                    )
+                    for i, name in enumerate(node_python_script.output_names)
+                }
+                node._named_schemas = named
+                return named.get(DEFAULT_OUTPUT_HANDLE, [])
+            except Exception:
+                return []
+
+        previous = self.get_node(node_python_script.node_id)
+        previous_declared = (
+            previous.setting_input.output_schemas
+            if previous is not None and isinstance(previous.setting_input, input_schema.NodePythonScript)
+            else None
+        )
+
+        self.add_node_step(
+            node_id=node_python_script.node_id,
+            function=_func,
+            node_type="python_script",
+            setting_input=node_python_script,
+            input_node_ids=node_python_script.depending_on_ids,
+            schema_callback=schema_callback,
+        )
+
+        node = self.get_node(node_python_script.node_id)
+        if node is not None:
+            node._executes_on_kernel = bool(node_python_script.python_script_input.kernel_id)
+            if previous is not None and previous_declared != node_python_script.output_schemas:
+                node.refresh_predicted_schema()
+        output_names = node_python_script.output_names
+        if len(output_names) > 1:
+            if node is not None:
+                node.node_template = node.node_template.model_copy(update={"output": len(output_names)})

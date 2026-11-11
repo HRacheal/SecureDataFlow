@@ -1,0 +1,863 @@
+
+import polars as pl
+import pytest
+
+from fastapi import HTTPException
+
+from flowfile_core.flowfile.flow_graph import FlowGraph, add_connection, validate_connection
+from flowfile_core.flowfile.flow_graph_utils import (
+    _create_node_id_mapping,
+    _validate_input,
+    combine_flow_graphs,
+    combine_flow_graphs_with_mapping,
+)
+from flowfile_core.flowfile.node_designer import CustomNodeBase, NodeSettings, Section, TextInput
+from flowfile_core.flowfile.param_types import FlowParameter
+from flowfile_core.schemas import input_schema, schemas, transform_schema
+
+
+# Helper functions from your existing test suite
+def create_flowfile_handler():
+    from flowfile_core.flowfile.handler import FlowfileHandler
+    handler = FlowfileHandler()
+    assert handler._flows == {}, 'Flow should be empty'
+    return handler
+
+
+def create_graph(flow_id: int = 1, execution_mode: str = 'Development') -> FlowGraph:
+    handler = create_flowfile_handler()
+    handler.register_flow(schemas.FlowSettings(flow_id=flow_id, name=f'flow_{flow_id}', path='.', execution_mode=execution_mode))
+    graph = handler.get_flow(flow_id)
+    return graph
+
+
+def add_manual_input(graph: FlowGraph, data, node_id: int = 1):
+    node_promise = input_schema.NodePromise(flow_id=graph.flow_id, node_id=node_id, node_type='manual_input')
+    graph.add_node_promise(node_promise)
+    input_file = input_schema.NodeManualInput(flow_id=graph.flow_id, node_id=node_id,
+                                              raw_data_format=input_schema.RawData.from_pylist(data))
+    graph.add_manual_input(input_file)
+    return graph
+
+
+def add_node_promise_on_type(graph: FlowGraph, node_type: str, node_id: int, flow_id: int = None):
+    if flow_id is None:
+        flow_id = graph.flow_id
+    node_promise = input_schema.NodePromise(flow_id=flow_id, node_id=node_id, node_type=node_type)
+    graph.add_node_promise(node_promise)
+
+
+def handle_run_info(run_info):
+    if not run_info.success:
+        errors = 'errors:'
+        for node_step in run_info.node_step_result:
+            if not node_step.success:
+                errors += f'\n node_id:{node_step.node_id}, error: {node_step.error}'
+        raise ValueError(f'Graph should run successfully:\n{errors}')
+
+
+# Test functions for the combine_flow_graphs functionality
+def test_validate_unique_flow_ids():
+    """Test that _validate_unique_flow_ids works correctly."""
+    graphs = tuple(create_graph(flow_id=i) for i in range(3))
+
+    _validate_input(graphs)
+
+    graphs_with_duplicates = (create_graph(flow_id=1), create_graph(flow_id=1))
+    with pytest.raises(ValueError, match="Cannot combine"):
+        _validate_input(graphs_with_duplicates)
+
+
+def test_create_node_id_mapping():
+    """Test that _create_node_id_mapping generates correct mappings."""
+    graph1 = create_graph(flow_id=1)
+    add_manual_input(graph1, [{"name": "john"}], node_id=101)
+    add_node_promise_on_type(graph1, "filter", 102)
+
+    graph2 = create_graph(flow_id=2)
+    add_manual_input(graph2, [{"name": "jane"}], node_id=201)
+    add_node_promise_on_type(graph2, "record_id", 202)
+
+    mapping = _create_node_id_mapping((graph1, graph2))
+
+    assert (1, 101) in mapping
+    assert (1, 102) in mapping
+    assert (2, 201) in mapping
+    assert (2, 202) in mapping
+
+    new_ids = list(mapping.values())
+    assert len(new_ids) == len(set(new_ids)), "New IDs should be unique"
+    assert min(new_ids) > max(102, 202), "New IDs should be higher than original IDs"
+
+
+def test_combine_flow_graphs_basic():
+    """Test combining two simple flow graphs."""
+    graph1 = create_graph(flow_id=1)
+    add_manual_input(graph1, [{"name": "john"}], node_id=1)
+
+    graph2 = create_graph(flow_id=2)
+    add_manual_input(graph2, [{"name": "jane"}], node_id=1)
+    combined = combine_flow_graphs(graph1, graph2)
+
+    assert combined.flow_id != graph1.flow_id
+    assert combined.flow_id != graph2.flow_id
+    assert len(combined.nodes) == 2
+
+    run_info = combined.run_graph()
+    handle_run_info(run_info)
+
+    for node in combined.nodes:
+        data = node.get_resulting_data().collect().to_dicts()
+        assert len(data) == 1
+        assert "name" in data[0]
+        assert data[0]["name"] in ["john", "jane"]
+
+
+def test_combine_flow_graphs_with_filter():
+    """Test combining graphs with both manual input and filter nodes."""
+    graph1 = create_graph(flow_id=1)
+    add_manual_input(graph1, [{"name": "john", "age": 30}], node_id=1)
+
+    add_node_promise_on_type(graph1, "filter", 2)
+    filter_input = transform_schema.FilterInput(
+        advanced_filter="[age] > 25",
+        filter_type='advanced'
+    )
+    filter_settings = input_schema.NodeFilter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        filter_input=filter_input
+    )
+    graph1.add_filter(filter_settings)
+    connection = input_schema.NodeConnection.create_from_simple_input(1, 2)
+    add_connection(graph1, connection)
+
+    graph2 = create_graph(flow_id=2)
+    add_manual_input(graph2, [{"name": "jane", "age": 20}], node_id=1)
+
+    add_node_promise_on_type(graph2, "filter", 2)
+    filter_input2 = transform_schema.FilterInput(
+        advanced_filter="[age] < 25",
+        filter_type='advanced'
+    )
+    filter_settings2 = input_schema.NodeFilter(
+        flow_id=2,
+        node_id=2,
+        depending_on_id=1,
+        filter_input=filter_input2
+    )
+    graph2.add_filter(filter_settings2)
+    connection2 = input_schema.NodeConnection.create_from_simple_input(1, 2)
+    add_connection(graph2, connection2)
+    combined = combine_flow_graphs(graph1, graph2)
+
+    assert len(combined.nodes) == 4
+    assert len(combined.node_connections) == 2
+
+    run_info = combined.run_graph()
+    handle_run_info(run_info)
+
+    filter_nodes = [n for n in combined.nodes if n.node_type == "filter"]
+    assert len(filter_nodes) == 2
+
+    for filter_node in filter_nodes:
+        assert len(filter_node.node_inputs.main_inputs) == 1
+        input_node = filter_node.node_inputs.main_inputs[0]
+
+        assert input_node is not None
+        assert input_node.node_type == "manual_input"
+
+        filter_data = filter_node.get_resulting_data().collect().to_dicts()
+        if "[age] > 25" in filter_node.setting_input.filter_input.advanced_filter:
+            assert filter_data[0]["name"] == "john"
+            assert filter_data[0]["age"] == 30
+        else:
+            assert filter_data[0]["name"] == "jane"
+            assert filter_data[0]["age"] == 20
+
+
+def test_combine_flow_graphs_with_join():
+    """Test combining graphs with join operations."""
+    graph1 = create_graph(flow_id=1)
+    customers = [
+        {"customer_id": 1, "name": "John"},
+        {"customer_id": 2, "name": "Jane"}
+    ]
+    add_manual_input(graph1, customers, node_id=1)
+
+    graph2 = create_graph(flow_id=2)
+    orders = [
+        {"order_id": 101, "customer_id": 1, "amount": 100},
+        {"order_id": 102, "customer_id": 1, "amount": 200},
+        {"order_id": 103, "customer_id": 2, "amount": 300}
+    ]
+    add_manual_input(graph2, orders, node_id=1)
+
+    graph3 = create_graph(flow_id=3)
+    add_manual_input(graph3, customers, node_id=1)
+    add_manual_input(graph3, orders, node_id=2)
+
+    add_node_promise_on_type(graph3, "join", 3)
+
+    join_input = transform_schema.JoinInput(
+        join_mapping=[transform_schema.JoinMap(left_col='customer_id', right_col='customer_id')],
+        left_select=[
+            transform_schema.SelectInput(old_name='customer_id', new_name='customer_id', keep=True),
+            transform_schema.SelectInput(old_name='name', new_name='name', keep=True),
+
+        ],
+        right_select=[
+            transform_schema.SelectInput(old_name='customer_id', new_name='customer_id', keep=True),
+            transform_schema.SelectInput(old_name='order_id', new_name='order_id', keep=True),
+            transform_schema.SelectInput(old_name='amount', new_name='amount', keep=True)
+        ],
+        how='inner'
+    )
+
+    join_settings = input_schema.NodeJoin(
+        flow_id=3,
+        node_id=3,
+        depending_on_ids=[1, 2],
+        join_input=join_input,
+        auto_generate_selection=True,
+        verify_integrity=True,
+        auto_keep_all=True,
+        auto_keep_left=True,
+        auto_keep_right=True
+    )
+    graph3.add_join(join_settings)
+
+    left_connection = input_schema.NodeConnection.create_from_simple_input(1, 3, input_type="main")
+    right_connection = input_schema.NodeConnection.create_from_simple_input(2, 3, input_type="right")
+    add_connection(graph3, left_connection)
+    add_connection(graph3, right_connection)
+
+    combined = combine_flow_graphs(graph1, graph2, graph3)
+
+    assert len(combined.nodes) == 5  # 2 data inputs + 1 joined data input + 1 join node
+
+    run_info = combined.run_graph()
+    handle_run_info(run_info)
+
+    join_nodes = [n for n in combined.nodes if n.node_type == "join"]
+    assert len(join_nodes) == 1
+    join_node = join_nodes[0]
+
+    assert join_node.node_inputs.main_inputs is not None
+    assert join_node.node_inputs.right_input is not None
+
+    join_data = join_node.get_resulting_data().collect().to_dicts()
+    assert len(join_data) == 3
+    assert any(row["name"] == "John" and row["order_id"] == 101 and row["amount"] == 100 for row in join_data)
+    assert any(row["name"] == "John" and row["order_id"] == 102 and row["amount"] == 200 for row in join_data)
+    assert any(row["name"] == "Jane" and row["order_id"] == 103 and row["amount"] == 300 for row in join_data)
+
+
+def test_combine_flow_graphs_with_specific_target_id():
+    """Test combining graphs with a specific target flow ID."""
+    graph1 = create_graph(flow_id=1)
+    add_manual_input(graph1, [{"name": "john"}], node_id=1)
+
+    graph2 = create_graph(flow_id=2)
+    add_manual_input(graph2, [{"name": "jane"}], node_id=1)
+
+    target_id = 999
+    combined = combine_flow_graphs(graph1, graph2, target_flow_id=target_id)
+
+    assert combined.flow_id == target_id
+
+    for node in combined.nodes:
+        assert node.setting_input.flow_id == target_id
+
+    run_info = combined.run_graph()
+    handle_run_info(run_info)
+
+
+def test_combine_flow_graphs_preserves_node_properties():
+    """Test that combining graphs preserves node properties like positions."""
+    graph1 = create_graph(flow_id=1)
+    node_promise = input_schema.NodePromise(
+        flow_id=1,
+        node_id=1,
+        node_type='manual_input',
+        pos_x=100,
+        pos_y=200
+    )
+    graph1.add_node_promise(node_promise)
+    input_file = input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=1,
+        raw_data_format=input_schema.RawData.from_pylist([{"name": "john"}]),
+        pos_x=100,
+        pos_y=200
+    )
+    graph1.add_manual_input(input_file)
+
+    combined = combine_flow_graphs(graph1)
+
+    for node in combined.nodes:
+        # Position might be adjusted by layout algorithm, but should exist
+        assert hasattr(node.setting_input, 'pos_x')
+        assert hasattr(node.setting_input, 'pos_y')
+
+        data = node.get_resulting_data().collect().to_dicts()
+        assert len(data) == 1
+        assert data[0]["name"] == "john"
+
+
+def test_combine_complex_flow_graphs():
+    """Test combining complex graphs with multiple node types and connections."""
+    graph1 = create_graph(flow_id=1)
+
+    data = [
+        {"name": "John", "age": 30, "city": "New York"},
+        {"name": "Jane", "age": 25, "city": "Boston"},
+        {"name": "Mike", "age": 40, "city": "Chicago"},
+        {"name": "Sarah", "age": 35, "city": "New York"}
+    ]
+    add_manual_input(graph1, data, node_id=1)
+
+    add_node_promise_on_type(graph1, "filter", 2)
+    filter_input = transform_schema.FilterInput(
+        advanced_filter="[age] > 30",
+        filter_type='advanced'
+    )
+    filter_settings = input_schema.NodeFilter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        filter_input=filter_input
+    )
+    graph1.add_filter(filter_settings)
+    connection1 = input_schema.NodeConnection.create_from_simple_input(1, 2)
+    add_connection(graph1, connection1)
+
+    add_node_promise_on_type(graph1, "record_id", 3)
+    record_id_settings = input_schema.NodeRecordId(
+        flow_id=1,
+        node_id=3,
+        depending_on_id=2,
+        record_id_input=transform_schema.RecordIdInput()
+    )
+    graph1.add_record_id(record_id_settings)
+    connection2 = input_schema.NodeConnection.create_from_simple_input(2, 3)
+    add_connection(graph1, connection2)
+
+    graph2 = create_graph(flow_id=2)
+
+    data2 = [
+        {"name": "Alex", "age": 22, "city": "Seattle"},
+        {"name": "Lisa", "age": 45, "city": "Portland"},
+        {"name": "Dave", "age": 33, "city": "Denver"}
+    ]
+    add_manual_input(graph2, data2, node_id=1)
+
+    add_node_promise_on_type(graph2, "filter", 2)
+    filter_input2 = transform_schema.FilterInput(
+        advanced_filter="[city] = 'Portland'",
+        filter_type='advanced'
+    )
+    filter_settings2 = input_schema.NodeFilter(
+        flow_id=2,
+        node_id=2,
+        depending_on_id=1,
+        filter_input=filter_input2
+    )
+    graph2.add_filter(filter_settings2)
+    connection3 = input_schema.NodeConnection.create_from_simple_input(1, 2)
+    add_connection(graph2, connection3)
+
+    combined = combine_flow_graphs(graph1, graph2)
+
+    assert len(combined.nodes) == 5  # 2 inputs + 2 filters + 1 record_id
+
+    connections = combined.node_connections
+    assert len(connections) == 3  # input-filter, filter-record_id, input-filter
+
+    run_info = combined.run_graph()
+    handle_run_info(run_info)
+    combined.get_node_storage()
+
+    for node in combined.nodes:
+        if node.node_type == "filter":
+            data = node.get_resulting_data().collect().to_dicts()
+            if "[age] > 30" in node.setting_input.filter_input.advanced_filter:
+                # Filter from graph1 - should return 2 rows (Mike and Sarah)
+                assert len(data) == 2
+                assert all(row["age"] > 30 for row in data)
+            elif "[city] = 'Portland'" in node.setting_input.filter_input.advanced_filter:
+                # Filter from graph2 - should return 1 row (Lisa)
+                assert len(data) == 1
+                assert data[0]["city"] == "Portland"
+
+        elif node.node_type == "record_id":
+            # Should contain records from filter1 (Mike and Sarah) with record IDs
+            data = node.get_resulting_data().collect().to_dicts()
+            assert len(data) == 2
+            assert "record_id" in data[0]
+            assert all(row["age"] > 30 for row in data)
+            assert set([row["record_id"] for row in data]) == {1, 2}
+
+
+def test_non_working_filter_error():
+    """Test if filter that does not work raises error."""
+    graph1 = create_graph(flow_id=1, execution_mode="remote")
+
+    data = [
+        {"name": "John", "age": 30, "city": "New York"},
+        {"name": "Jane", "age": 25, "city": "Boston"},
+        {"name": "Mike", "age": 40, "city": "Chicago"},
+        {"name": "Sarah", "age": 35, "city": "New York"}
+    ]
+    add_manual_input(graph1, data, node_id=1)
+
+    add_node_promise_on_type(graph1, "filter", 2)
+    filter_input = transform_schema.FilterInput(
+        advanced_filter="[age2] > 30",  # age2 is not a column
+        filter_type='advanced'
+    )
+    filter_settings = input_schema.NodeFilter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        filter_input=filter_input
+    )
+    graph1.add_filter(filter_settings)
+    connection1 = input_schema.NodeConnection.create_from_simple_input(1, 2)
+    add_connection(graph1, connection1)
+
+    add_node_promise_on_type(graph1, "record_id", 3)
+    record_id_settings = input_schema.NodeRecordId(
+        flow_id=1,
+        node_id=3,
+        depending_on_id=2,
+        record_id_input=transform_schema.RecordIdInput()
+    )
+    graph1.add_record_id(record_id_settings)
+    connection2 = input_schema.NodeConnection.create_from_simple_input(2, 3)
+    add_connection(graph1, connection2)
+    run_info = graph1.run_graph()
+    result_filter_node = next(_node for _node in run_info.node_step_result if _node.node_id == 2)
+    assert not result_filter_node.success
+    assert 'unable to find column "age2"' in result_filter_node.error
+
+
+def _build_chain_for_cycle_tests() -> FlowGraph:
+    """Build a 1 -> 2 -> 3 chain of manual_input/record_id nodes for cycle tests."""
+    graph = create_graph(flow_id=99)
+    add_manual_input(graph, [{"name": "a"}], node_id=1)
+    add_node_promise_on_type(graph, "record_id", 2)
+    graph.add_record_id(input_schema.NodeRecordId(
+        flow_id=99, node_id=2, depending_on_id=1,
+        record_id_input=transform_schema.RecordIdInput(),
+    ))
+    add_connection(graph, input_schema.NodeConnection.create_from_simple_input(1, 2))
+    add_node_promise_on_type(graph, "record_id", 3)
+    graph.add_record_id(input_schema.NodeRecordId(
+        flow_id=99, node_id=3, depending_on_id=2,
+        record_id_input=transform_schema.RecordIdInput(),
+    ))
+    add_connection(graph, input_schema.NodeConnection.create_from_simple_input(2, 3))
+    return graph
+
+
+def test_add_connection_rejects_self_loop():
+    graph = _build_chain_for_cycle_tests()
+    with pytest.raises(HTTPException) as exc:
+        add_connection(graph, input_schema.NodeConnection.create_from_simple_input(2, 2))
+    assert exc.value.status_code == 422
+    assert "cycle" in exc.value.detail.lower()
+
+
+def test_add_connection_rejects_direct_back_edge():
+    graph = _build_chain_for_cycle_tests()
+    # 1 -> 2 exists; adding 2 -> 1 closes a 2-cycle.
+    with pytest.raises(HTTPException) as exc:
+        add_connection(graph, input_schema.NodeConnection.create_from_simple_input(2, 1))
+    assert exc.value.status_code == 422
+
+
+def test_add_connection_rejects_transitive_back_edge():
+    graph = _build_chain_for_cycle_tests()
+    # Chain is 1 -> 2 -> 3; closing 3 -> 1 would form a 3-cycle.
+    with pytest.raises(HTTPException) as exc:
+        add_connection(graph, input_schema.NodeConnection.create_from_simple_input(3, 1))
+    assert exc.value.status_code == 422
+
+
+def test_add_connection_allows_valid_downstream_edge():
+    """Adding a parallel feed-forward edge (skip-connection) must still be permitted."""
+    graph = _build_chain_for_cycle_tests()
+    # 1 -> 3 adds a skip connection, no cycle.
+    add_connection(graph, input_schema.NodeConnection.create_from_simple_input(1, 3))
+    # Sanity: the topological ordering still works.
+    graph.run_graph()
+
+
+def test_add_connection_rejects_wiring_into_source_node():
+    """A source node (manual_input, node_template.input == 0) has no input port,
+    so wiring INTO it must be refused with a 422 — not silently accepted."""
+    graph = create_graph(flow_id=1)
+    add_manual_input(graph, [{"name": "john"}], node_id=1)
+    add_manual_input(graph, [{"name": "jane"}], node_id=2)  # second source
+    with pytest.raises(HTTPException) as exc:
+        add_connection(graph, input_schema.NodeConnection.create_from_simple_input(1, 2))
+    assert exc.value.status_code == 422
+    assert "source node" in exc.value.detail
+    # The refused edge must not have been wired onto the source node.
+    assert graph.get_node(2).node_inputs.main_inputs in (None, [])
+
+
+def test_validate_connection_source_target_without_template():
+    """The source-target guard falls back to the registry when node_template is
+    None (an unresolved/unconfigured node), so it can't be bypassed."""
+    graph = create_graph(flow_id=1)
+    add_manual_input(graph, [{"name": "john"}], node_id=1)
+    add_manual_input(graph, [{"name": "jane"}], node_id=2)
+    to_node = graph.get_node(2)
+    to_node.node_template = None  # simulate an unresolved promise node
+    error = validate_connection(graph.get_node(1), to_node)
+    assert error is not None
+    assert error.reason == "target_is_source"
+
+
+def test_add_connection_into_transform_succeeds():
+    """Wiring a source into a real transform still works (regression guard)."""
+    graph = create_graph(flow_id=1)
+    add_manual_input(graph, [{"name": "john", "age": 30}], node_id=1)
+    add_node_promise_on_type(graph, "filter", 2)
+    add_connection(graph, input_schema.NodeConnection.create_from_simple_input(1, 2))
+    assert [n.node_id for n in graph.get_node(2).node_inputs.main_inputs] == [1]
+
+
+def test_add_connection_cycle_into_transform_keeps_message():
+    """Cycle detection still fires (with its verbatim message) when the target is a
+    non-source node — guards the validate_connection refactor."""
+    graph = _build_chain_for_cycle_tests()  # 1(source) -> 2 -> 3
+    # 3 -> 2 closes a cycle; node 2 is a record_id transform, not a source, so the
+    # source-target check passes and the cycle check is what rejects it.
+    with pytest.raises(HTTPException) as exc:
+        add_connection(graph, input_schema.NodeConnection.create_from_simple_input(3, 2))
+    assert exc.value.status_code == 422
+    assert "would create a cycle" in exc.value.detail
+
+
+# Merge fidelity: output handles, keyed edges, custom nodes, parameters, groups, deferred seeds
+
+SPLIT_ROWS = [{"a": 1}, {"a": 2}, {"a": 3}]
+
+
+def _add_split_filter(graph: FlowGraph, node_id: int, depending_on_id: int, value: str = "1") -> None:
+    """A pass/fail split filter on a == value: output-0 keeps the match, output-1 the rest."""
+    add_node_promise_on_type(graph, "filter", node_id)
+    add_connection(graph, input_schema.NodeConnection.create_from_simple_input(depending_on_id, node_id))
+    graph.add_filter(
+        input_schema.NodeFilter(
+            flow_id=graph.flow_id,
+            node_id=node_id,
+            depending_on_id=depending_on_id,
+            split_mode=True,
+            filter_input=transform_schema.FilterInput(
+                mode="basic",
+                basic_filter=transform_schema.BasicFilter(
+                    field="a", operator=transform_schema.FilterOperator.EQUALS, value=value
+                ),
+            ),
+        )
+    )
+
+
+def _add_select_on(graph: FlowGraph, node_id: int, depending_on_id: int, output_handle: str = "output-0") -> None:
+    add_node_promise_on_type(graph, "select", node_id)
+    add_connection(
+        graph,
+        input_schema.NodeConnection.create_from_simple_input(depending_on_id, node_id, output_handle=output_handle),
+    )
+    graph.add_select(
+        input_schema.NodeSelect(
+            flow_id=graph.flow_id, node_id=node_id, depending_on_id=depending_on_id, select_input=[], keep_missing=True
+        )
+    )
+
+
+def test_combine_keeps_second_output_handle():
+    graph1 = create_graph(flow_id=1)
+    add_manual_input(graph1, SPLIT_ROWS, node_id=1)
+    _add_split_filter(graph1, node_id=2, depending_on_id=1)
+    _add_select_on(graph1, node_id=3, depending_on_id=2, output_handle="output-1")
+    graph2 = create_graph(flow_id=2)
+    add_manual_input(graph2, [{"a": 9}], node_id=1)
+
+    combined, mapping = combine_flow_graphs_with_mapping(graph1, graph2)
+
+    select_node = combined.get_node(mapping[(1, 3)])
+    assert select_node._input_output_handles[mapping[(1, 2)]] == "output-1"
+    handle_run_info(combined.run_graph())
+    assert sorted(select_node.get_resulting_data().collect()["a"].to_list()) == [2, 3]
+
+
+def test_combine_keeps_keyed_run_flow_edges(tmp_path):
+    import uuid
+
+    from flowfile_core.database import models as db_models
+    from flowfile_core.database.connection import get_db_context
+
+    subflow = create_graph(flow_id=302)
+    for node_id, name in ((1, "a"), (2, "b")):
+        add_node_promise_on_type(subflow, "flow_input", node_id)
+        subflow.add_flow_input(input_schema.NodeFlowInput(flow_id=302, node_id=node_id, input_name=name))
+    for node_id, source_id, name in ((3, 1, "out_a"), (4, 2, "out_b")):
+        add_node_promise_on_type(subflow, "flow_output", node_id)
+        subflow.add_flow_output(
+            input_schema.NodeFlowOutput(flow_id=302, node_id=node_id, output_name=name, depending_on_id=source_id)
+        )
+        add_connection(subflow, input_schema.NodeConnection.create_from_simple_input(source_id, node_id))
+    path = tmp_path / "two_port_subflow.yaml"
+    subflow.save_flow(str(path))
+    with get_db_context() as db:
+        registration = db_models.FlowRegistration(
+            flow_uuid=str(uuid.uuid4()), name="merge_two_port", flow_path=str(path), owner_id=1
+        )
+        db.add(registration)
+        db.commit()
+        db.refresh(registration)
+        registration_id = registration.id
+
+    parent = create_graph(flow_id=1)
+    add_manual_input(parent, SPLIT_ROWS, node_id=1)
+    _add_split_filter(parent, node_id=2, depending_on_id=1)
+    add_node_promise_on_type(parent, "run_flow", 9)
+    parent.add_run_flow(
+        input_schema.NodeRunFlow(
+            flow_id=1,
+            node_id=9,
+            user_id=1,
+            flow_reference=input_schema.SubflowReference(registration_id=registration_id),
+            input_slots=["a", "b"],
+            output_slots=["out_a", "out_b"],
+        )
+    )
+    add_connection(parent, input_schema.NodeConnection.create_from_simple_input(1, 9, input_type="input-1"))
+    add_connection(
+        parent,
+        input_schema.NodeConnection.create_from_simple_input(2, 9, input_type="input-2", output_handle="output-1"),
+    )
+    other = create_graph(flow_id=2)
+    add_manual_input(other, [{"a": 9}], node_id=1)
+
+    combined, mapping = combine_flow_graphs_with_mapping(parent, other)
+
+    run_flow_node = combined.get_node(mapping[(1, 9)])
+    inputs = run_flow_node.node_inputs
+    assert {h: n.node_id for h, n in inputs.keyed_inputs.items()} == {
+        "input-1": mapping[(1, 1)],
+        "input-2": mapping[(1, 2)],
+    }
+    assert inputs.keyed_source_handles == {"input-1": "output-0", "input-2": "output-1"}
+    handle_run_info(combined.run_graph())
+    assert run_flow_node.get_output("output-0").collect().height == 3
+    assert sorted(run_flow_node.get_output("output-1").collect()["a"].to_list()) == [2, 3]
+
+
+class MergeFixedColumn(CustomNodeBase):
+    node_name: str = "Merge Fixed Column"
+    node_category: str = "Testing"
+    title: str = "Merge Fixed Column"
+    intro: str = "Adds a column with a fixed value."
+
+    settings_schema: NodeSettings = NodeSettings(
+        main_section=Section(title="Configuration", value=TextInput(label="Value")),
+    )
+
+    def process(self, *inputs):
+        return inputs[0].with_columns(pl.lit(self.settings_schema.main_section.value.value).alias("fixed"))
+
+
+ZERO_INPUT_PROCESS_CALLS: list[str] = []
+
+
+class MergeZeroInputCounter(CustomNodeBase):
+    """A hookless 0-input source: without a deferred flag its placement prefetch runs ``process()``."""
+
+    node_name: str = "Merge Zero Input Counter"
+    node_category: str = "Testing"
+    number_of_inputs: int = 0
+
+    settings_schema: NodeSettings = NodeSettings(
+        main_section=Section(title="Configuration", value=TextInput(label="Value")),
+    )
+
+    def process(self, *inputs):
+        ZERO_INPUT_PROCESS_CALLS.append("process")
+        return pl.LazyFrame({"generated": [1]})
+
+
+@pytest.fixture
+def custom_node_store():
+    from flowfile_core.configs import node_store
+
+    saved_store = dict(node_store.CUSTOM_NODE_STORE)
+    saved_dict = dict(node_store.node_dict)
+    saved_list = list(node_store.nodes_list)
+    node_store.add_to_custom_node_store(MergeFixedColumn)
+    node_store.add_to_custom_node_store(MergeZeroInputCounter)
+    yield
+    node_store.CUSTOM_NODE_STORE.clear()
+    node_store.CUSTOM_NODE_STORE.update(saved_store)
+    node_store.node_dict.clear()
+    node_store.node_dict.update(saved_dict)
+    node_store.nodes_list[:] = saved_list
+
+
+def test_combine_places_custom_node_as_user_defined(custom_node_store):
+    node_type = MergeFixedColumn().item
+    settings = {"main_section": {"value": "hello"}}
+    graph1 = create_graph(flow_id=1)
+    add_manual_input(graph1, [{"a": 1}], node_id=1)
+    add_node_promise_on_type(graph1, node_type, 2)
+    add_connection(graph1, input_schema.NodeConnection.create_from_simple_input(1, 2))
+    graph1.add_user_defined_node(
+        custom_node=MergeFixedColumn.from_settings(settings),
+        user_defined_node_settings=input_schema.UserDefinedNode(
+            flow_id=1, node_id=2, settings=settings, is_user_defined=True
+        ),
+    )
+    graph2 = create_graph(flow_id=2)
+    add_manual_input(graph2, [{"a": 9}], node_id=1)
+
+    combined, mapping = combine_flow_graphs_with_mapping(graph1, graph2)
+
+    custom = combined.get_node(mapping[(1, 2)])
+    assert custom.node_type == node_type
+    assert isinstance(custom.setting_input, input_schema.UserDefinedNode)
+    assert custom.setting_input.settings == settings
+    handle_run_info(combined.run_graph())
+    assert custom.get_resulting_data().collect().to_dicts() == [{"a": 1, "fixed": "hello"}]
+
+
+def test_combine_unions_flow_parameters_first_wins():
+    graph1 = create_graph(flow_id=1)
+    graph1.flow_settings.parameters.append(FlowParameter(name="env", default_value="prod"))
+    add_manual_input(graph1, [{"a": 1}], node_id=1)
+    graph2 = create_graph(flow_id=2)
+    graph2.flow_settings.parameters.extend(
+        [FlowParameter(name="env", default_value="dev"), FlowParameter(name="limit", default_value="5")]
+    )
+    add_manual_input(graph2, [{"a": 2}], node_id=1)
+
+    combined = combine_flow_graphs(graph1, graph2)
+
+    assert {p.name: p.default_value for p in combined.flow_settings.parameters} == {"env": "prod", "limit": "5"}
+    assert [p.name for p in graph1.flow_settings.parameters] == ["env"]
+
+
+def test_combine_carries_groups_with_remapped_members():
+    graph1 = create_graph(flow_id=1)
+    add_manual_input(graph1, [{"a": 1}], node_id=1)
+    graph1.create_group("Sources one", [1])
+    graph2 = create_graph(flow_id=2)
+    add_manual_input(graph2, [{"a": 2}], node_id=1)
+    _add_select_on(graph2, node_id=2, depending_on_id=1)
+    graph2.create_group("Sources two", [1, 2])
+
+    combined, mapping = combine_flow_graphs_with_mapping(graph1, graph2)
+
+    groups_by_name = {g.name: g for g in combined._groups.values()}
+    assert set(groups_by_name) == {"Sources one", "Sources two"}
+    assert len({g.id for g in combined._groups.values()}) == 2
+    assert combined._member_node_ids(groups_by_name["Sources one"].id) == [mapping[(1, 1)]]
+    assert sorted(combined._member_node_ids(groups_by_name["Sources two"].id)) == sorted(
+        [mapping[(2, 1)], mapping[(2, 2)]]
+    )
+
+
+def test_combine_carries_deferred_seed_without_executing():
+    from flowfile_core.flowfile.flow_data_engine.flow_data_engine import FlowDataEngine
+    from flowfile_core.flowfile.flow_data_engine.flow_file_column.main import FlowfileColumn
+
+    graph1 = create_graph(flow_id=1)
+    add_manual_input(graph1, [{"a": 1}, {"a": 2}], node_id=1)
+    _add_select_on(graph1, node_id=2, depending_on_id=1)
+    _add_select_on(graph1, node_id=3, depending_on_id=2)
+    seed_schema = [FlowfileColumn.from_input("a", "Int64"), FlowfileColumn.from_input("seed_only", "String")]
+    seeded = graph1.get_node(2)
+    with seeded._execution_lock_held():
+        seeded.results.resulting_data = FlowDataEngine.create_from_schema(list(seed_schema))
+        seeded._named_schemas = {"output-0": seed_schema}
+        seeded.node_schema.result_schema = seed_schema
+        seeded.node_schema.predicted_schema = seed_schema
+        seeded.deferred_until_run = True
+    graph2 = create_graph(flow_id=2)
+    add_manual_input(graph2, [{"a": 9}], node_id=1)
+
+    combined, mapping = combine_flow_graphs_with_mapping(graph1, graph2)
+
+    node = combined.get_node(mapping[(1, 2)])
+    assert node.deferred_until_run is True
+    assert node.results.resulting_data is seeded.results.resulting_data
+    assert node.get_resulting_data() is seeded.results.resulting_data
+    downstream = combined.get_node(mapping[(1, 3)]).get_resulting_data().collect()
+    assert downstream.columns == ["a", "seed_only"] and downstream.height == 0
+    assert node.deferred_until_run is True
+
+    handle_run_info(combined.run_graph())
+    assert node.deferred_until_run is False
+    assert node.get_resulting_data().collect().to_dicts() == [{"a": 1}, {"a": 2}]
+
+
+def test_combine_carries_a_built_result_without_the_deferred_flag():
+    graph1 = create_graph(flow_id=1)
+    add_manual_input(graph1, [{"a": 1}, {"a": 2}], node_id=1)
+    _add_select_on(graph1, node_id=2, depending_on_id=1)
+    built = graph1.get_node(2).get_resulting_data()
+    graph2 = create_graph(flow_id=2)
+    add_manual_input(graph2, [{"a": 9}], node_id=1)
+
+    combined, mapping = combine_flow_graphs_with_mapping(graph1, graph2)
+
+    node = combined.get_node(mapping[(1, 2)])
+    assert node.results.resulting_data is built
+    assert node.deferred_until_run is False
+    assert combined.get_node(mapping[(2, 1)]).results.resulting_data is None
+    handle_run_info(combined.run_graph())
+    assert node.get_resulting_data().collect().to_dicts() == [{"a": 1}, {"a": 2}]
+
+
+def test_combine_never_runs_a_deferred_zero_input_node(custom_node_store):
+    import time
+
+    from flowfile_core.flowfile.flow_data_engine.flow_data_engine import FlowDataEngine
+    from flowfile_core.flowfile.flow_data_engine.flow_file_column.main import FlowfileColumn
+
+    ZERO_INPUT_PROCESS_CALLS.clear()
+    node_type = MergeZeroInputCounter().item
+    graph1 = create_graph(flow_id=1)
+    add_node_promise_on_type(graph1, node_type, 1)
+    graph1.get_node(1).deferred_until_run = True  # before placement, as the native node base does
+    graph1.add_user_defined_node(
+        custom_node=MergeZeroInputCounter.from_settings({}),
+        user_defined_node_settings=input_schema.UserDefinedNode(
+            flow_id=1, node_id=1, settings={}, is_user_defined=True
+        ),
+    )
+    seed_schema = [FlowfileColumn.from_input("generated", "Int64")]
+    seeded = graph1.get_node(1)
+    with seeded._execution_lock_held():
+        seeded.results.resulting_data = FlowDataEngine.create_from_schema(list(seed_schema))
+        seeded._named_schemas = {"output-0": seed_schema}
+        seeded.node_schema.result_schema = seed_schema
+        seeded.node_schema.predicted_schema = seed_schema
+    graph2 = create_graph(flow_id=2)
+    add_manual_input(graph2, [{"a": 9}], node_id=1)
+
+    combined, mapping = combine_flow_graphs_with_mapping(graph1, graph2)
+    time.sleep(0.3)  # let any orphaned background prefetch surface
+
+    node = combined.get_node(mapping[(1, 1)])
+    assert ZERO_INPUT_PROCESS_CALLS == []
+    assert node.deferred_until_run is True
+    assert node.results.resulting_data is seeded.results.resulting_data
+    assert node.node_schema.result_schema == seed_schema
+    assert node.get_resulting_data().collect().height == 0
+    assert ZERO_INPUT_PROCESS_CALLS == []

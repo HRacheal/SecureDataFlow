@@ -1,0 +1,509 @@
+from base64 import b64decode, b64encode
+from typing import Annotated, Any, Literal
+
+from pl_fuzzy_frame_match import FuzzyMapping
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, PlainSerializer, PrivateAttr
+
+from flowfile_worker.external_sources.s3_source.models import CloudStorageWriteSettings, FullCloudStorageConnection
+from flowfile_worker.external_sources.sql_source.models import DatabaseWriteSettings
+from flowfile_worker.log_models import RawLogInput as RawLogInput  # noqa: F401
+from shared.delta_models import DeltaVersionCommit as DeltaVersionCommit  # noqa: F401
+from shared.wire_model import WireModel
+
+
+# Custom type for bytes that serializes to/from base64 string in JSON
+def _decode_bytes(v: Any) -> bytes:
+    if isinstance(v, bytes):
+        return v
+    if isinstance(v, str):
+        return b64decode(v)
+    raise ValueError(f"Expected bytes or base64 string, got {type(v)}")
+
+
+Base64Bytes = Annotated[
+    bytes,
+    BeforeValidator(_decode_bytes),
+    PlainSerializer(lambda x: b64encode(x).decode("ascii"), return_type=str),
+]
+
+OperationType = Literal[
+    "store",
+    "calculate_schema",
+    "calculate_number_of_records",
+    "write_output",
+    "fuzzy",
+    "store_sample",
+    "write_to_database",
+    "write_to_cloud_storage",
+    "write_parquet",
+    "write_delta",
+    "merge_delta",
+    "scd2_delta",
+    "polars_code",
+    "sql_query",
+]
+ResultType = Literal["polars", "other"]
+
+
+class PoolConfigInput(WireModel):
+    """Request body for POST /pool (warm worker pool resize)."""
+
+    size: int = Field(..., ge=0, le=32, description="Target member capacity; 0 disables the pool.")
+
+
+class PolarsOperation(WireModel):
+    operation: Base64Bytes  # Automatically encodes/decodes base64 for JSON
+    flowfile_flow_id: int | None = 1
+    flowfile_node_id: int | str | None = -1
+
+    def polars_serializable_object(self):
+        # Operation is raw bytes (auto-decoded from base64 if received as JSON)
+        return self.operation
+
+
+class PolarsScript(PolarsOperation):
+    task_id: str | None = None
+    cache_dir: str | None = None
+    operation_type: OperationType
+
+
+class PolarsScriptSample(PolarsScript):
+    sample_size: int | None = 100
+
+
+class PolarsScriptWrite(WireModel):
+    operation: Base64Bytes  # Automatically encodes/decodes base64 for JSON
+    data_type: str
+    path: str
+    write_mode: str
+    sheet_name: str | None = None
+    delimiter: str | None = None
+    compression: str | None = None
+    flowfile_flow_id: int | None = -1
+    flowfile_node_id: int | str | None = -1
+
+    def polars_serializable_object(self):
+        # Operation is raw bytes (auto-decoded from base64 if received as JSON)
+        return self.operation
+
+
+class DatabaseScriptWrite(DatabaseWriteSettings):
+    operation: Base64Bytes  # Automatically encodes/decodes base64 for JSON
+
+    def polars_serializable_object(self):
+        # Operation is raw bytes (auto-decoded from base64 if received as JSON)
+        return self.operation
+
+    def get_database_write_settings(self) -> DatabaseWriteSettings:
+        """
+        Converts the current instance to a DatabaseWriteSettings object.
+        Returns:
+            DatabaseWriteSettings: The corresponding DatabaseWriteSettings object.
+        """
+        return DatabaseWriteSettings(
+            connection=self.connection,
+            table_name=self.table_name,
+            if_exists=self.if_exists,
+            flowfile_flow_id=self.flowfile_flow_id,
+            flowfile_node_id=self.flowfile_node_id,
+        )
+
+
+class CloudStorageScriptWrite(CloudStorageWriteSettings):
+    operation: Base64Bytes  # Automatically encodes/decodes base64 for JSON
+
+    def polars_serializable_object(self):
+        # Operation is raw bytes (auto-decoded from base64 if received as JSON)
+        return self.operation
+
+    def get_cloud_storage_write_settings(self) -> CloudStorageWriteSettings:
+        """
+        Converts the current instance to a DatabaseWriteSettings object.
+        Returns:
+            DatabaseWriteSettings: The corresponding DatabaseWriteSettings object.
+        """
+        return CloudStorageWriteSettings(
+            write_settings=self.write_settings,
+            connection=self.connection,
+            flowfile_flow_id=self.flowfile_flow_id,
+            flowfile_node_id=self.flowfile_node_id,
+        )
+
+
+class FuzzyJoinInput(WireModel):
+    task_id: str | None = None
+    cache_dir: str | None = None
+    left_df_operation: PolarsOperation
+    right_df_operation: PolarsOperation
+    fuzzy_maps: list[FuzzyMapping]
+    flowfile_flow_id: int | None = 1
+    flowfile_node_id: int | str | None = -1
+
+
+class CustomNodeExecuteInput(WireModel):
+    """Input for the /execute_custom_node endpoint.
+
+    Ships the node's source text (not a path — jobs stay immune to concurrent
+    save/delete) plus ``$ffsec$`` ciphertext secrets the child decrypts locally.
+    """
+
+    task_id: str | None = None
+    cache_dir: str | None = None
+    node_source: str
+    class_name: str | None = None
+    settings_values: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    secrets: dict[str, str] = Field(default_factory=dict)
+    inputs: list[Base64Bytes] = Field(default_factory=list)
+    output_names: list[str] = Field(default_factory=lambda: ["main"])
+    dry_run: bool = False
+    row_limit: int | None = None
+    user_id: int | None = None
+    flowfile_flow_id: int | None = 1
+    flowfile_node_id: int | str | None = -1
+
+
+class TrainModelInput(WireModel):
+    """Input for the /train_ml_model endpoint.
+
+    Core sends a serialised LazyFrame plus the training spec. The worker writes
+    the resulting model JSON to *staging_path* and reports back ``{sha256, size_bytes}``
+    via the ``Status.results`` field. Core then calls ``ArtifactService.finalize_upload``.
+    """
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    task_id: str | None = None
+    cache_dir: str | None = None
+    df_operation: PolarsOperation
+    model_type: str
+    target_column: str
+    feature_columns: list[str]
+    params: dict[str, Any] = Field(default_factory=dict)
+    staging_path: str  # absolute path under <staging_root> where the worker writes the model bytes
+    flowfile_flow_id: int | None = 1
+    flowfile_node_id: int | str | None = -1
+
+
+class ApplyModelInput(WireModel):
+    """Input for the /apply_ml_model endpoint."""
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    task_id: str | None = None
+    cache_dir: str | None = None
+    df_operation: PolarsOperation
+    model_path: str  # absolute path of the trained-model artifact on the shared volume
+    output_column: str = "prediction"
+    flowfile_flow_id: int | None = 1
+    flowfile_node_id: int | str | None = -1
+
+
+class Status(BaseModel):
+    background_task_id: str
+    status: Literal["Processing", "Completed", "Error", "Unknown Error", "Starting", "Cancelled"]
+    file_ref: str
+    progress: int | None = 0
+    error_message: str | None = None
+    error_kind: Literal["task", "environment"] | None = None
+    results: Any | None = None
+    result_type: ResultType | None = "polars"
+    number_of_records: int | None = None
+    # The exception a job run in process failed with; never serialised, and None for a child's job.
+    _raised: BaseException | None = PrivateAttr(default=None)
+
+    def __hash__(self):
+        return hash(self.file_ref)
+
+
+class ColumnSchema(BaseModel):
+    name: str
+    dtype: str
+
+
+class CatalogStorageInterface(WireModel):
+    """Object-storage backend for a catalog operation.
+
+    ``base_uri`` is the catalog root (e.g. ``s3://bucket/catalog``); ``connection`` carries
+    owner-encrypted secrets the worker decrypts itself. Absent on a request ⇒ local filesystem.
+    """
+
+    base_uri: str
+    connection: FullCloudStorageConnection
+
+
+class DeltaStoragePayload(WireModel):
+    """The ``storage_payload`` of the Delta task operations (``write_delta``, ``merge_delta``, ``scd2_delta``).
+
+    ``connection`` carries owner-encrypted secrets the worker decrypts itself; ``base_uri`` is the catalog root a table
+    named by identity is resolved under. Absent on a request ⇒ a table on this worker's disk.
+    """
+
+    base_uri: str | None = None
+    connection: FullCloudStorageConnection
+
+
+class DeltaSkipReport(WireModel):
+    """What a Delta task operation answers when it wrote nothing; an SCD2 write adds the table's unchanged version."""
+
+    skipped: Literal[True]
+    version: int | None = None
+
+
+class DeltaWriteReport(WireModel):
+    """What ``write_delta`` and ``merge_delta`` answer: the table written and what core records of it."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    table_path: str
+    column_schema: list[ColumnSchema] = Field(alias="schema")
+    row_count: int
+    column_count: int
+    size_bytes: int
+
+
+class Scd2Metrics(WireModel):
+    rows_inserted: int
+    rows_closed: int
+    rows_total: int
+    rows_current: int
+    created: bool
+
+
+class Scd2WriteReport(DeltaWriteReport):
+    """What ``scd2_delta`` answers: the write's report, the version it committed and its row counts."""
+
+    version: int | None
+    scd2_metrics: Scd2Metrics
+
+
+class CatalogMaterializeRequest(WireModel):
+    source_file_path: str
+    table_name: str | None = None
+    storage: CatalogStorageInterface | None = None
+
+
+class CatalogMaterializeResponse(BaseModel):
+    table_path: str
+    column_schema: list[ColumnSchema]
+    row_count: int
+    column_count: int
+    size_bytes: int
+
+
+class CatalogOptimizeRequest(WireModel):
+    table_path: str  # Bare table directory name (no path separators)
+    z_order_columns: list[str] | None = None
+    storage: CatalogStorageInterface | None = None
+
+
+class CatalogOptimizeResponse(BaseModel):
+    metrics: dict = {}
+    size_bytes: int | None = None
+
+
+class CatalogVacuumRequest(WireModel):
+    table_path: str  # Bare table directory name (no path separators)
+    retention_hours: int = 168
+    dry_run: bool = True
+    storage: CatalogStorageInterface | None = None
+
+
+class CatalogVacuumResponse(BaseModel):
+    files_removed: list[str] = []
+    file_count: int = 0
+    size_bytes: int | None = None
+
+
+class CatalogNewColumn(WireModel):
+    name: str
+    dtype: str  # One of shared.delta_utils.EDIT_COLUMN_DTYPES
+
+
+class CatalogApplyEditsRequest(WireModel):
+    """Row-level edits from the catalog edit surface, applied as keyed Delta merges."""
+
+    table_path: str  # Bare table directory name (no path separators)
+    key_columns: list[str]
+    expected_version: int | None = None
+    upsert_columns: list[str] | None = None
+    upsert_rows: list[list] | None = None
+    new_columns: list[CatalogNewColumn] = []
+    delete_keys: list[list] | None = None
+    commit_metadata: dict[str, str] | None = None
+    storage: CatalogStorageInterface | None = None
+
+
+class CatalogApplyEditsResponse(BaseModel):
+    rows_upserted: int = 0
+    rows_deleted: int = 0
+    new_version: int | None = None
+    column_schema: list[ColumnSchema] = []
+    row_count: int = 0
+    column_count: int = 0
+    size_bytes: int | None = None
+
+
+class CatalogAddKeyColumnRequest(WireModel):
+    """Rewrite a Delta catalog table with a sequential row-id column appended."""
+
+    table_path: str  # Bare table directory name (no path separators)
+    column_name: str = "record_id"
+    expected_version: int | None = None
+    storage: CatalogStorageInterface | None = None
+
+
+class CatalogAddKeyColumnResponse(BaseModel):
+    new_version: int | None = None
+    column_schema: list[ColumnSchema] = []
+    row_count: int = 0
+    column_count: int = 0
+    size_bytes: int | None = None
+
+
+class TableMetadataRequest(WireModel):
+    table_path: str  # Bare table directory name (no path separators)
+    storage: CatalogStorageInterface | None = None
+
+
+class TableMetadataResponse(BaseModel):
+    column_schema: list[ColumnSchema]
+    row_count: int
+    column_count: int
+    size_bytes: int
+
+
+class DeltaHistoryRequest(WireModel):
+    table_path: str  # Bare table directory name (no path separators)
+    limit: int | None = None
+    storage: CatalogStorageInterface | None = None
+
+
+class DeltaHistoryResponse(BaseModel):
+    current_version: int
+    history: list[DeltaVersionCommit]
+
+
+class DeltaVersionPreviewRequest(WireModel):
+    table_path: str  # Bare table directory name (no path separators)
+    version: int
+    n_rows: int = 100
+    storage: CatalogStorageInterface | None = None
+
+
+class DeltaVersionPreviewResponse(BaseModel):
+    version: int
+    columns: list[str]
+    dtypes: list[str]
+    rows: list[list]
+    total_rows: int
+
+
+class DeltaPreviewRequest(WireModel):
+    table_path: str  # Bare table directory name (no path separators)
+    n_rows: int = 100
+    storage: CatalogStorageInterface | None = None
+
+
+class DeltaPreviewResponse(BaseModel):
+    columns: list[str]
+    dtypes: list[str]
+    rows: list[list]
+    total_rows: int
+
+
+class SqlQueryRequest(WireModel):
+    query: str
+    tables: dict[str, str]  # mapping of logical table name -> directory name
+    max_rows: int = 10_000
+    virtual_refs: dict[str, str] | None = None  # name -> bare ipc filename under catalog_virtual_results
+    storage: CatalogStorageInterface | None = None
+
+
+class SqlQueryResponse(BaseModel):
+    columns: list[str] = Field(default_factory=list)
+    dtypes: list[str] = Field(default_factory=list)
+    rows: list[list] = Field(default_factory=list)
+    total_rows: int = 0
+    truncated: bool = False
+    execution_time_ms: float = 0.0
+    used_tables: list[str] = Field(default_factory=list)
+    error: str | None = None
+
+
+class ResolveVirtualTableRequest(WireModel):
+    """Ask the worker to materialise a flow-virtual table from a serialised plan."""
+
+    table_id: int
+    plan_bytes: Base64Bytes
+    source_versions_hash: str
+    # "kernel_shared" writes into the kernel-mounted shared volume so Docker kernels can scan the result.
+    target: Literal["virtual_results", "kernel_shared"] = "virtual_results"
+
+
+class ResolveVirtualTableResponse(BaseModel):
+    ipc_path: str
+    mtime: float
+    row_count: int
+
+
+class VizWorkerSource(WireModel):
+    """Source descriptor for a viz session.
+
+    The ``session_key`` is the cache key in ``VizSessionRegistry``; core builds
+    it deterministically and version-addressed (``tbl:{id}:v{delta_version}``,
+    a sql digest over query + referenced-table versions, fvt ipc path+mtime) so
+    successive requests against the same source data skip the load step while
+    any Delta write rotates the key and spawns a fresh child.
+    """
+
+    kind: Literal["physical", "sql", "ipc_path", "plan"]
+    session_key: str
+    table_path: str | None = None  # bare directory name for kind="physical"
+    sql_query: str | None = None
+    tables: dict[str, str] | None = None  # logical name -> directory name (kind="sql")
+    virtual_refs: dict[str, str] | None = None  # name -> bare ipc filename (kind="sql")
+    ipc_path: str | None = None  # bare filename under catalog_virtual_results_directory
+    mtime: float | None = None  # cache file mtime; used in session-key contract
+    plan_bytes: Base64Bytes | None = None  # serialized pl.LazyFrame for kind="plan"
+
+
+class VisualizeQueryRequest(WireModel):
+    source: VizWorkerSource
+    payload: dict
+    max_rows: int = 100_000
+
+
+class VisualizeQueryResponse(BaseModel):
+    rows: list[dict] = Field(default_factory=list)
+    total_rows: int = 0
+    truncated: bool = False
+    elapsed_ms: float = 0.0
+    cache_hit: bool = False
+    error: str | None = None
+
+
+class VisualizeFieldsRequest(WireModel):
+    source: VizWorkerSource
+
+
+class VisualizeFieldsResponse(BaseModel):
+    fields: list[dict] = Field(default_factory=list)
+    cache_hit: bool = False
+    error: str | None = None
+
+
+class VisualizeColumnStatsRequest(WireModel):
+    source: VizWorkerSource
+    column: str
+    limit: int = 100
+
+
+class VisualizeColumnStatsResponse(BaseModel):
+    dtype: str = ""
+    values: list = Field(default_factory=list)
+    truncated: bool = False
+    distinct_count: int | None = None
+    min: object | None = None
+    max: object | None = None
+    cache_hit: bool = False
+    error: str | None = None

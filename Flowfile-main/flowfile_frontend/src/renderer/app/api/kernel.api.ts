@@ -1,0 +1,239 @@
+import axios from "../services/axios.config";
+import type {
+  DisplayOutput,
+  DockerStatus,
+  ExecuteCellRequest,
+  ExecuteResult,
+  FlavourInfo,
+  ImageFlavour,
+  KernelConfig,
+  KernelInfo,
+  KernelMatchBatchResponse,
+  KernelMatchResponse,
+  KernelMemoryInfo,
+} from "../types";
+
+const API_BASE_URL = "/kernels";
+
+export class KernelApi {
+  static async getAll(): Promise<KernelInfo[]> {
+    try {
+      const response = await axios.get<KernelInfo[]>(`${API_BASE_URL}/`);
+      return response.data;
+    } catch (error) {
+      console.error("API Error: Failed to load kernels:", error);
+      const errorMsg = (error as any).response?.data?.detail || "Failed to load kernels";
+      throw new Error(errorMsg);
+    }
+  }
+
+  static async get(kernelId: string): Promise<KernelInfo> {
+    try {
+      const response = await axios.get<KernelInfo>(
+        `${API_BASE_URL}/${encodeURIComponent(kernelId)}`,
+      );
+      return response.data;
+    } catch (error) {
+      console.error("API Error: Failed to get kernel:", error);
+      throw error;
+    }
+  }
+
+  static async create(config: KernelConfig): Promise<KernelInfo> {
+    try {
+      const response = await axios.post<KernelInfo>(`${API_BASE_URL}/`, config);
+      return response.data;
+    } catch (error) {
+      console.error("API Error: Failed to create kernel:", error);
+      const errorMsg = (error as any).response?.data?.detail || "Failed to create kernel";
+      throw new Error(errorMsg);
+    }
+  }
+
+  static async update(kernelId: string, update: { packages: string[] }): Promise<KernelInfo> {
+    try {
+      const response = await axios.patch<KernelInfo>(
+        `${API_BASE_URL}/${encodeURIComponent(kernelId)}`,
+        update,
+      );
+      return response.data;
+    } catch (error) {
+      console.error("API Error: Failed to update kernel:", error);
+      const errorMsg = (error as any).response?.data?.detail || "Failed to update kernel";
+      throw new Error(errorMsg);
+    }
+  }
+
+  static async delete(kernelId: string): Promise<void> {
+    try {
+      await axios.delete(`${API_BASE_URL}/${encodeURIComponent(kernelId)}`);
+    } catch (error) {
+      console.error("API Error: Failed to delete kernel:", error);
+      throw error;
+    }
+  }
+
+  static async start(kernelId: string): Promise<KernelInfo> {
+    try {
+      const response = await axios.post<KernelInfo>(
+        `${API_BASE_URL}/${encodeURIComponent(kernelId)}/start`,
+      );
+      return response.data;
+    } catch (error) {
+      console.error("API Error: Failed to start kernel:", error);
+      const errorMsg = (error as any).response?.data?.detail || "Failed to start kernel";
+      throw new Error(errorMsg);
+    }
+  }
+
+  static async stop(kernelId: string): Promise<void> {
+    try {
+      await axios.post(`${API_BASE_URL}/${encodeURIComponent(kernelId)}/stop`);
+    } catch (error) {
+      console.error("API Error: Failed to stop kernel:", error);
+      throw error;
+    }
+  }
+
+  static async getArtifacts(kernelId: string): Promise<Record<string, any>> {
+    try {
+      const response = await axios.get<Record<string, any>>(
+        `${API_BASE_URL}/${encodeURIComponent(kernelId)}/artifacts`,
+      );
+      return response.data;
+    } catch (error) {
+      console.error("API Error: Failed to get artifacts:", error);
+      return {};
+    }
+  }
+
+  // Errors deliberately throw raw: callers fall back to the plain kernel list
+  // when matching is unavailable.
+  static async matchKernels(
+    dependencies: string[],
+    nodeName?: string,
+  ): Promise<KernelMatchResponse> {
+    const response = await axios.post<KernelMatchResponse>(`${API_BASE_URL}/match`, {
+      dependencies,
+      node_name: nodeName ?? null,
+    });
+    return response.data;
+  }
+
+  // Errors throw raw — readiness badges simply don't render when unavailable.
+  static async matchKernelsBatch(
+    items: Record<string, string[]>,
+  ): Promise<KernelMatchBatchResponse> {
+    const response = await axios.post<KernelMatchBatchResponse>(`${API_BASE_URL}/match/batch`, {
+      items,
+    });
+    return response.data;
+  }
+
+  static async listFlavours(): Promise<FlavourInfo[]> {
+    try {
+      const response = await axios.get<FlavourInfo[]>(`${API_BASE_URL}/flavours`);
+      return response.data;
+    } catch (error) {
+      console.error("API Error: Failed to load kernel flavours:", error);
+      return [];
+    }
+  }
+
+  static async pullImage(flavour: ImageFlavour): Promise<{ pull_state: string }> {
+    try {
+      const response = await axios.post<{ pull_state: string }>(
+        `${API_BASE_URL}/images/${encodeURIComponent(flavour)}/pull`,
+      );
+      return response.data;
+    } catch (error) {
+      console.error("API Error: Failed to start image pull:", error);
+      const errorMsg = (error as any).response?.data?.detail || "Failed to start image pull";
+      throw new Error(errorMsg);
+    }
+  }
+
+  static async getDockerStatus(): Promise<DockerStatus> {
+    try {
+      const response = await axios.get<DockerStatus>(`${API_BASE_URL}/docker-status`);
+      // Tolerate older backends that don't yet return `images`.
+      return { ...response.data, images: response.data.images ?? [] };
+    } catch (error) {
+      console.error("API Error: Failed to check Docker status:", error);
+      return {
+        available: false,
+        image_available: false,
+        images: [],
+        error: "Failed to reach server",
+      };
+    }
+  }
+
+  static async executeCell(kernelId: string, request: ExecuteCellRequest): Promise<ExecuteResult> {
+    try {
+      const response = await axios.post<ExecuteResult>(
+        `${API_BASE_URL}/${encodeURIComponent(kernelId)}/execute_cell`,
+        request,
+      );
+      return response.data;
+    } catch (error) {
+      console.error("API Error: Failed to execute cell:", error);
+      const errorMsg = (error as any).response?.data?.detail || "Failed to execute cell";
+      throw new Error(errorMsg);
+    }
+  }
+
+  static async clearNamespace(kernelId: string, flowId: number): Promise<void> {
+    const url = `${API_BASE_URL}/${encodeURIComponent(kernelId)}/clear_namespace`;
+    try {
+      await axios.post(url, null, { params: { flow_id: flowId } });
+    } catch (error) {
+      console.error("API Error: Failed to clear namespace:", error);
+      const errorMsg = (error as any).response?.data?.detail || "Failed to clear namespace";
+      throw new Error(errorMsg);
+    }
+  }
+
+  static async getDisplayOutputs(
+    kernelId: string,
+    flowId: number,
+    nodeId: number,
+  ): Promise<DisplayOutput[]> {
+    try {
+      const response = await axios.get<DisplayOutput[]>(
+        `${API_BASE_URL}/${encodeURIComponent(kernelId)}/display_outputs`,
+        { params: { flow_id: flowId, node_id: nodeId } },
+      );
+      return response.data;
+    } catch {
+      return [];
+    }
+  }
+
+  static async getArtifactPreview(
+    kernelId: string,
+    flowId: number,
+    name: string,
+  ): Promise<DisplayOutput | null> {
+    try {
+      const response = await axios.get<DisplayOutput | null>(
+        `${API_BASE_URL}/${encodeURIComponent(kernelId)}/artifact_preview`,
+        { params: { flow_id: flowId, name } },
+      );
+      return response.data ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  static async getMemoryStats(kernelId: string): Promise<KernelMemoryInfo | null> {
+    try {
+      const response = await axios.get<KernelMemoryInfo>(
+        `${API_BASE_URL}/${encodeURIComponent(kernelId)}/memory`,
+      );
+      return response.data;
+    } catch {
+      return null;
+    }
+  }
+}

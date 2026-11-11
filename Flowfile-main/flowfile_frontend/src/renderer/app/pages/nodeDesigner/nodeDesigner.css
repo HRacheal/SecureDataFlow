@@ -1,0 +1,61 @@
+/**
+ * Node Designer specific styles
+ * Uses design tokens from the main styling system
+ */
+
+/* Panel styles - specific to Node Designer */
+.panel {
+  background: var(--card-bg);
+  border: 1px solid var(--color-border-primary);
+  border-radius: var(--border-radius-lg);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.panel-header {
+  display: flex;
+  align-items: center;
+  min-height: 40px;
+  padding: 0 var(--spacing-4);
+  border-bottom: 1px solid var(--color-border-primary);
+  flex-shrink: 0;
+  background-color: var(--color-background-secondary);
+}
+
+.panel-header h3 {
+  margin: 0;
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-primary);
+}
+
+.panel-content {
+  padding: var(--spacing-4);
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+  height: 0;
+}
+
+/* Component row inside the WYSIWYG form canvas / drawer */
+.component-item {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-2);
+  padding: var(--spacing-2) var(--spacing-3);
+  cursor: pointer;
+  border-bottom: 1px solid var(--color-border-light);
+  font-size: var(--font-size-sm);
+  color: var(--color-text-primary);
+  transition: background-color var(--transition-fast);
+}
+
+.component-item:hover {
+  background-color: var(--color-background-hover);
+}
+
+.component-item:last-child {
+  border-bottom: none;
+}

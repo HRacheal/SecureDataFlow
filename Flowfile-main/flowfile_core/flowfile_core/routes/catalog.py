@@ -1,0 +1,1729 @@
+"""API routes for the Catalog system.
+
+Provides endpoints for:
+- Namespace management (Unity Catalog-style catalog / schema hierarchy)
+- Flow registration (persistent flow metadata)
+- Run history with versioned snapshots
+- Favorites and follows
+
+This module is a thin HTTP adapter: it delegates all business logic to
+``CatalogService`` and translates domain exceptions into HTTP responses.
+"""
+
+import json
+from datetime import datetime, timezone
+from functools import wraps
+from pathlib import Path
+
+import yaml
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from sqlalchemy.orm import Session
+
+from flowfile_core import flow_file_handler
+from flowfile_core.auth.jwt import get_current_active_user, get_user_or_internal_service
+from flowfile_core.catalog import (
+    KEEP_PREDICTION,
+    AmbiguousTableError,
+    CatalogService,
+    CdcCursorNotFoundError,
+    CdcCursorsAtRiskError,
+    CdcNotSupportedError,
+    DashboardNotFoundError,
+    FavoriteNotFoundError,
+    FlowAlreadyRunningError,
+    FlowExistsError,
+    FlowHasArtifactsError,
+    FlowNotFoundError,
+    FollowNotFoundError,
+    InvalidNamespaceStorageError,
+    NamespaceExistsError,
+    NamespaceNotEmptyError,
+    NamespaceNotFoundError,
+    NamespaceStorageLockedError,
+    NestingLimitError,
+    NoSnapshotError,
+    NotAuthorizedError,
+    NotAVirtualTableError,
+    NotebookExistsError,
+    NotebookNotFoundError,
+    RunNotFoundError,
+    ScheduleNotFoundError,
+    SeededNamespaceError,
+    SQLAlchemyCatalogRepository,
+    StaleWriteError,
+    TableExistsError,
+    TableFavoriteNotFoundError,
+    TableNotFoundError,
+    TableVersionUnavailableError,
+    VisualizationComputeError,
+    VisualizationExistsError,
+    VisualizationNotFoundError,
+    WorkerUnavailableError,
+)
+from flowfile_core.catalog.access import AccessResolver
+from flowfile_core.catalog.services.tables import catalog_table_location
+from flowfile_core.catalog.validators import validate_cron_expression, validate_cron_timezone
+from flowfile_core.configs import logger
+from flowfile_core.database.connection import get_db
+from flowfile_core.database.models import RunType, SchedulerLock
+from flowfile_core.fileExplorer import validate_path_under_cwd
+from flowfile_core.flowfile.execution.errors import ComputeUnavailable
+from flowfile_core.flowfile.utils import create_unique_id
+from flowfile_core.scheduler import FlowScheduler, get_scheduler, set_scheduler
+from flowfile_core.schemas.catalog_schema import (
+    ActiveFlowRun,
+    CatalogOverview,
+    CatalogStats,
+    CatalogTableCreate,
+    CatalogTableEditsRequest,
+    CatalogTableEditsResponse,
+    CatalogTableFromDataCreate,
+    CatalogTableKeyColumnRequest,
+    CatalogTableKeyColumnResponse,
+    CatalogTableMaterializeResult,
+    CatalogTableOut,
+    CatalogTablePreview,
+    CatalogTableRefreshRequest,
+    CatalogTableUpdate,
+    CdcCursorOut,
+    CdcCursorResetRequest,
+    CdcStatusOut,
+    ColumnStatsResponse,
+    CronValidationRequest,
+    CronValidationResult,
+    DashboardCreate,
+    DashboardOut,
+    DashboardUpdate,
+    DeltaTableHistory,
+    FavoriteOut,
+    FlowCodeFormat,
+    FlowCodeOut,
+    FlowInterfaceOut,
+    FlowInterfacePort,
+    FlowRegistrationCreate,
+    FlowRegistrationOut,
+    FlowRegistrationUpdate,
+    FlowRunDetail,
+    FlowRunOut,
+    FlowScheduleCreate,
+    FlowScheduleOut,
+    FlowScheduleUpdate,
+    FollowOut,
+    GlobalArtifactOut,
+    NamespaceCreate,
+    NamespaceOut,
+    NamespaceTree,
+    NamespaceUpdate,
+    NotebookCreate,
+    NotebookOut,
+    NotebookSummaryOut,
+    NotebookUpdate,
+    OptimizeTableRequest,
+    OptimizeTableResponse,
+    PaginatedFlowRuns,
+    QueryVirtualTableCreate,
+    QueryVirtualTableUpdate,
+    ResolveTableResult,
+    SaveQueryAsFlowRequest,
+    SchedulerStatusOut,
+    ScratchCleanupOut,
+    SqlQueryRequest,
+    SqlQueryResult,
+    TableFavoriteOut,
+    VacuumTableRequest,
+    VacuumTableResponse,
+    VirtualFlowTableCreate,
+    VirtualFlowTableUpdate,
+    VisualizationAdHocComputeRequest,
+    VisualizationComputeResponse,
+    VisualizationCreate,
+    VisualizationFieldsRequest,
+    VisualizationFieldsResponse,
+    VisualizationOut,
+    VisualizationSavedComputeRequest,
+    VisualizationUpdate,
+)
+from flowfile_scheduler.engine import STALE_THRESHOLD
+from shared.storage_config import storage
+
+router = APIRouter(
+    prefix="/catalog",
+    tags=["catalog"],
+    # JWT or the kernel's X-Internal-Token; a JWT-only endpoint re-checks with get_current_active_user.
+    dependencies=[Depends(get_user_or_internal_service)],
+)
+
+
+def get_catalog_service(
+    db: Session = Depends(get_db),
+    current_user=Depends(get_user_or_internal_service),
+) -> CatalogService:
+    """FastAPI dependency that provides a configured ``CatalogService``.
+
+    The ``AccessResolver`` makes the catalog private-by-default in multi-user
+    mode (no-op for admins, the kernel internal-service principal, and electron).
+    """
+    repo = SQLAlchemyCatalogRepository(db)
+    return CatalogService(repo, access=AccessResolver(db, current_user))
+
+
+# Exception → HTTP mapping
+
+COMPUTE_UNAVAILABLE_DETAIL = "Compute unavailable"
+"""The detail of a catalog 503: the typed message names the worker's address, so it goes to the log only."""
+
+_CATALOG_EXCEPTION_MAP: dict[type[Exception], tuple[int, str | None]] = {
+    NamespaceNotFoundError: (404, "Namespace not found"),
+    NamespaceExistsError: (409, "Namespace with this name already exists at this level"),
+    NestingLimitError: (422, "Cannot nest deeper than catalog -> schema"),
+    NamespaceNotEmptyError: (422, "Cannot delete namespace with children or flows"),
+    SeededNamespaceError: (422, None),
+    NamespaceStorageLockedError: (409, None),
+    InvalidNamespaceStorageError: (422, None),
+    NotAuthorizedError: (403, None),
+    FlowNotFoundError: (404, "Flow not found"),
+    FlowExistsError: (409, "A flow with this name already exists in this namespace"),
+    FlowHasArtifactsError: (409, None),
+    FlowAlreadyRunningError: (409, "Flow already has an active run"),
+    TableNotFoundError: (404, "Catalog table not found"),
+    TableVersionUnavailableError: (410, None),
+    NotAVirtualTableError: (400, None),
+    WorkerUnavailableError: (503, COMPUTE_UNAVAILABLE_DETAIL),
+    ComputeUnavailable: (503, COMPUTE_UNAVAILABLE_DETAIL),
+    TableExistsError: (409, "A table with this name already exists in this namespace"),
+    AmbiguousTableError: (409, None),
+    RunNotFoundError: (404, "Run not found"),
+    ScheduleNotFoundError: (404, "Schedule not found"),
+    FavoriteNotFoundError: (404, "Favorite not found"),
+    FollowNotFoundError: (404, "Follow not found"),
+    TableFavoriteNotFoundError: (404, "Table favorite not found"),
+    NoSnapshotError: (422, "No flow snapshot available for this run"),
+    VisualizationNotFoundError: (404, None),
+    VisualizationExistsError: (409, None),
+    StaleWriteError: (409, None),
+    VisualizationComputeError: (502, None),
+    DashboardNotFoundError: (404, None),
+    NotebookNotFoundError: (404, None),
+    NotebookExistsError: (409, None),
+    CdcNotSupportedError: (409, None),
+    CdcCursorNotFoundError: (404, None),
+    CdcCursorsAtRiskError: (409, None),
+    ValueError: (422, None),
+}
+
+_HANDLED_EXCEPTIONS = tuple(_CATALOG_EXCEPTION_MAP.keys())
+
+
+def _kernel_table_path(table_path: str, namespace_id: int | None = None) -> str:
+    """A table directory in the catalog's storage (``catalog_table_location``); 403 for any other path.
+
+    Without *namespace_id* only a directory under the catalog tables directory is one.
+    """
+    resolved = catalog_table_location(table_path, namespace_id)
+    if resolved is None:
+        raise HTTPException(403, "Access denied: table_path must be a table directory in the catalog's storage")
+    return resolved
+
+
+def _stale_token(value):
+    """Render a StaleWriteError token JSON-safe (datetime → isoformat, ints pass through)."""
+    return value.isoformat() if isinstance(value, datetime) else value
+
+
+def handle_catalog_exceptions(**overrides: str):
+    """Decorator that maps domain exceptions to ``HTTPException`` responses.
+
+    Default messages come from ``_CATALOG_EXCEPTION_MAP``.  Pass keyword
+    arguments of the form ``ExceptionClassName="custom message"`` to
+    override the default for a specific exception within one endpoint.
+    """
+
+    override_map: dict[type[Exception], str] = {}
+    if overrides:
+        name_to_type = {cls.__name__: cls for cls in _CATALOG_EXCEPTION_MAP}
+        for name, msg in overrides.items():
+            if name in name_to_type:
+                override_map[name_to_type[name]] = msg
+
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            try:
+                return func(*args, **kwargs)
+            except _HANDLED_EXCEPTIONS as exc:
+                for exc_type in type(exc).__mro__:
+                    if exc_type in _CATALOG_EXCEPTION_MAP:
+                        status_code, default_msg = _CATALOG_EXCEPTION_MAP[exc_type]
+                        if status_code == 503:
+                            logger.error("Catalog request %s could not reach compute: %s", func.__name__, exc)
+                        msg = override_map.get(exc_type, default_msg)
+                        if msg is None:
+                            msg = str(exc)
+                        if isinstance(exc, AmbiguousTableError):
+                            raise HTTPException(
+                                status_code,
+                                detail={"message": msg, "name": exc.name, "candidates": exc.candidates},
+                            ) from None
+                        if isinstance(exc, CdcCursorsAtRiskError):
+                            raise HTTPException(
+                                status_code,
+                                detail={
+                                    "error_code": "CDC_CURSORS_AT_RISK",
+                                    "message": msg,
+                                    "cursors": exc.cursors,
+                                },
+                            ) from None
+                        if isinstance(exc, StaleWriteError):
+                            raise HTTPException(
+                                status_code,
+                                detail={
+                                    "error": "stale_write",
+                                    "resource_type": exc.resource_type,
+                                    "resource_id": exc.resource_id,
+                                    "expected": _stale_token(exc.expected),
+                                    "current": _stale_token(exc.current),
+                                    "message": msg,
+                                },
+                            ) from None
+                        raise HTTPException(status_code, msg) from None
+                raise  # unreachable but keeps linters happy
+
+        return wrapper
+
+    return decorator
+
+
+# Demo catalog (optional, one-click seed/teardown)
+
+
+@router.post("/seed-demo", tags=["demo"])
+@handle_catalog_exceptions()
+def seed_demo(current_user=Depends(get_current_active_user)):
+    """Populate the optional ``Demo`` catalog (sample tables + daily FX-sync flow)."""
+    from flowfile_core.catalog.demo_seed import seed_demo_catalog
+
+    return seed_demo_catalog(user_id=current_user.id)
+
+
+@router.post("/remove-demo", tags=["demo"])
+@handle_catalog_exceptions()
+def remove_demo(current_user=Depends(get_current_active_user)):
+    """Remove the ``Demo`` catalog and everything under it."""
+    from flowfile_core.catalog.demo_seed import remove_demo_catalog
+
+    return remove_demo_catalog(user_id=current_user.id)
+
+
+@router.get("/namespaces", response_model=list[NamespaceOut])
+def list_namespaces(
+    parent_id: int | None = None,
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """List namespaces, optionally filtered by parent."""
+    return service.list_namespaces(parent_id)
+
+
+@router.post("/namespaces", response_model=NamespaceOut, status_code=201)
+@handle_catalog_exceptions(NamespaceNotFoundError="Parent namespace not found")
+def create_namespace(
+    body: NamespaceCreate,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Create a catalog (level 0) or schema (level 1) namespace."""
+    return service.create_namespace(
+        name=body.name,
+        owner_id=current_user.id,
+        parent_id=body.parent_id,
+        description=body.description,
+        storage_uri=body.storage_uri,
+        storage_connection_name=body.storage_connection_name,
+    )
+
+
+@router.put("/namespaces/{namespace_id}", response_model=NamespaceOut)
+@handle_catalog_exceptions()
+def update_namespace(
+    namespace_id: int,
+    body: NamespaceUpdate,
+    service: CatalogService = Depends(get_catalog_service),
+):
+    # Only forward storage fields the client actually sent (omitted ⇒ no change).
+    storage_kwargs = {}
+    if "storage_uri" in body.model_fields_set:
+        storage_kwargs["storage_uri"] = body.storage_uri
+    if "storage_connection_name" in body.model_fields_set:
+        storage_kwargs["storage_connection_name"] = body.storage_connection_name
+    return service.update_namespace(
+        namespace_id=namespace_id,
+        name=body.name,
+        description=body.description,
+        **storage_kwargs,
+    )
+
+
+@router.delete("/namespaces/{namespace_id}", status_code=204)
+@handle_catalog_exceptions()
+def delete_namespace(
+    namespace_id: int,
+    service: CatalogService = Depends(get_catalog_service),
+):
+    service.delete_namespace(namespace_id)
+
+
+@router.post("/namespaces/{namespace_id}/cleanup_flows", response_model=ScratchCleanupOut)
+@handle_catalog_exceptions()
+def cleanup_namespace_flows(
+    namespace_id: int,
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Bulk-delete the auto-accreted flow registrations in a scratch schema.
+
+    Restricted server-side to ``General > Unnamed Flows`` and ``General > Python
+    Editor``. Flows with live artifacts, and rows the caller may not manage, are
+    kept; scratch files on disk are removed with their rows.
+    """
+    deleted, kept = service.cleanup_scratch_namespace(namespace_id)
+    return ScratchCleanupOut(deleted=deleted, kept=kept)
+
+
+@router.get("/namespaces/tree", response_model=list[NamespaceTree])
+def get_namespace_tree(
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Return the full catalog tree with flows nested under schemas."""
+    return service.get_namespace_tree(user_id=current_user.id)
+
+
+# Default namespace helper
+
+
+@router.get("/default-namespace-id")
+def get_default_namespace_id(
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Return the ID of the default 'default' schema under 'General'."""
+    return service.get_default_namespace_id()
+
+
+@router.get("/flows", response_model=list[FlowRegistrationOut])
+def list_flows(
+    namespace_id: int | None = None,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    return service.list_flows(user_id=current_user.id, namespace_id=namespace_id)
+
+
+@router.post("/flows", response_model=FlowRegistrationOut, status_code=201)
+@handle_catalog_exceptions()
+def register_flow(
+    body: FlowRegistrationCreate,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    return service.register_flow(
+        name=body.name,
+        flow_path=body.flow_path,
+        owner_id=current_user.id,
+        namespace_id=body.namespace_id,
+        description=body.description,
+    )
+
+
+@router.get("/flows/{flow_id}", response_model=FlowRegistrationOut)
+@handle_catalog_exceptions()
+def get_flow(
+    flow_id: int,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    return service.get_flow(registration_id=flow_id, user_id=current_user.id)
+
+
+@router.get("/flows/{flow_id}/interface", response_model=FlowInterfaceOut)
+@handle_catalog_exceptions()
+def get_flow_interface(
+    flow_id: int,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """The flow's callable surface (flow_input/flow_output ports + typed parameters).
+
+    Degrades to empty lists with ``file_exists=False`` when the flow file is
+    missing or unparseable, so the run_flow picker can still render.
+    """
+    from flowfile_core.flowfile import subflow
+
+    registration = service.get_flow(registration_id=flow_id, user_id=current_user.id)
+    try:
+        interface = subflow.get_subflow_interface(Path(registration.flow_path))
+    except Exception:  # noqa: BLE001 - degrade like the flow-API parameter lookup
+        return FlowInterfaceOut(registration_id=flow_id, file_exists=False)
+    return FlowInterfaceOut(
+        registration_id=flow_id,
+        inputs=[FlowInterfacePort(name=p.name, node_id=p.node_id) for p in interface.inputs],
+        outputs=[FlowInterfacePort(name=p.name, node_id=p.node_id) for p in interface.outputs],
+        parameters=interface.parameters,
+        file_exists=registration.file_exists,
+    )
+
+
+@router.get("/flows/{flow_id}/code", response_model=FlowCodeOut)
+@handle_catalog_exceptions()
+def get_flow_code(
+    flow_id: int,
+    format: FlowCodeFormat = Query("flowframe"),
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """The registered flow as text to copy: its file, its notebook cells as a script, or a code export.
+
+    Everything but ``yaml`` builds the graph for this call only (``ephemeral_flow_graph``: a fresh id,
+    released afterwards) and never enters the editor sessions. A missing file or a flow the exporter
+    cannot express is a soft result, like ``/interface``, so the catalog page can say why.
+    """
+    from flowfile_core.flowfile.code_generator import export_flow_to_flowframe, export_flow_to_polars
+    from flowfile_core.flowfile.manage.ephemeral_graph import ephemeral_flow_graph
+    from flowfile_core.flowfile.manage.io_flowfile import require_flow_in_storage
+    from flowfile_core.notebook.render import render
+
+    registration = service.get_flow(registration_id=flow_id, user_id=current_user.id)
+    if not registration.file_exists:
+        return FlowCodeOut(registration_id=flow_id, format=format, file_exists=False)
+    try:
+        path = require_flow_in_storage(Path(registration.flow_path))
+        if format == "yaml":
+            if path.suffix.lower() not in (".yaml", ".yml", ".json"):
+                raise ValueError("the flow is stored in the legacy binary format; save it from the designer first")
+            content = path.read_text(encoding="utf-8")
+        else:
+            with ephemeral_flow_graph(path, current_user.id) as graph:
+                if format == "notebook":
+                    content = notebook_script(render(graph).cells)
+                elif format == "polars":
+                    content = export_flow_to_polars(graph)
+                else:
+                    content = export_flow_to_flowframe(graph)
+    except Exception as exc:  # noqa: BLE001 - the page reports the reason, whatever it is
+        logger.warning("Code of registered flow %s could not be produced as %s: %s", flow_id, format, exc)
+        return FlowCodeOut(registration_id=flow_id, format=format, error=str(exc))
+    return FlowCodeOut(registration_id=flow_id, format=format, content=content)
+
+
+def notebook_script(cells) -> str:
+    """The notebook's cells as one script with a ``# %%`` marker per cell (the panel's "Export as Python
+    script" shape; the frontend's ``notebookExport.ts`` writes the same for python cells)."""
+    blocks = [f"# %%\n{cell.code.rstrip()}" for cell in cells if cell.code.strip()]
+    return "\n\n".join(blocks) + "\n" if blocks else ""
+
+
+@router.put("/flows/{flow_id}", response_model=FlowRegistrationOut)
+@handle_catalog_exceptions()
+def update_flow(
+    flow_id: int,
+    body: FlowRegistrationUpdate,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    return service.update_flow(
+        registration_id=flow_id,
+        requesting_user_id=current_user.id,
+        name=body.name,
+        description=body.description,
+        namespace_id=body.namespace_id,
+    )
+
+
+@router.delete("/flows/{flow_id}", status_code=204)
+@handle_catalog_exceptions()
+def delete_flow(
+    flow_id: int,
+    delete_file: bool = False,
+    service: CatalogService = Depends(get_catalog_service),
+):
+    service.delete_flow(registration_id=flow_id, delete_file=delete_file)
+
+
+@router.get(
+    "/flows/{flow_id}/artifacts",
+    response_model=list[GlobalArtifactOut],
+)
+@handle_catalog_exceptions()
+def list_flow_artifacts(
+    flow_id: int,
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """List all active artifacts produced by a registered flow."""
+    return service.list_artifacts_for_flow(flow_id)
+
+
+@router.get("/runs", response_model=PaginatedFlowRuns)
+def list_runs(
+    registration_id: int | None = None,
+    schedule_id: int | None = None,
+    run_type: RunType | None = None,
+    search: str | None = None,
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    return service.list_runs(
+        registration_id=registration_id,
+        schedule_id=schedule_id,
+        run_type=run_type,
+        limit=limit,
+        offset=offset,
+        search=search,
+    )
+
+
+@router.get("/runs/{run_id}", response_model=FlowRunDetail)
+@handle_catalog_exceptions()
+def get_run_detail(
+    run_id: int,
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Get a single run including the YAML snapshot of the flow version that ran."""
+    return service.get_run_detail(run_id)
+
+
+# Run Logs
+
+
+@router.get("/runs/{run_id}/log")
+@handle_catalog_exceptions()
+def get_run_log(
+    run_id: int,
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Return the log content for a subprocess-spawned run."""
+    run = service.get_run_detail(run_id)
+
+    log_path = service.resolve_run_log_path(run.id, run.run_type)
+    if log_path is None:
+        raise HTTPException(404, "Log file not found")
+
+    return {"log": Path(log_path).read_text(encoding="utf-8", errors="replace")}
+
+
+# Open Run Snapshot in Designer
+
+
+@router.post("/runs/{run_id}/open")
+@handle_catalog_exceptions()
+def open_run_snapshot(
+    run_id: int,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Write the run's flow snapshot to a temp file and import it into the designer."""
+    snapshot_data = service.get_run_snapshot(run_id)
+
+    # A new flow_id, so the snapshot opens in its own tab instead of over the open flow with its id.
+    try:
+        parsed = json.loads(snapshot_data)
+        suffix = ".json"
+    except (json.JSONDecodeError, TypeError):
+        parsed = yaml.safe_load(snapshot_data)
+        suffix = ".yaml"
+
+    parsed["flowfile_id"] = create_unique_id()
+    if isinstance(parsed.get("flowfile_settings"), dict):
+        parsed["flowfile_settings"]["source_registration_id"] = None
+
+    if suffix == ".json":
+        snapshot_data = json.dumps(parsed)
+    else:
+        snapshot_data = yaml.dump(parsed)
+
+    # Write to the flows temp directory (safe location for import)
+    temp_dir = storage.temp_directory_for_flows
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_filename = f"run_{run_id}_snapshot{suffix}"
+    snapshot_path = temp_dir / snapshot_filename
+
+    snapshot_path.write_text(snapshot_data, encoding="utf-8")
+
+    user_id = current_user.id if current_user else None
+    flow_id = flow_file_handler.import_flow(Path(snapshot_path), user_id=user_id)
+    return {"flow_id": flow_id}
+
+
+# Favorites
+
+
+@router.get("/favorites", response_model=list[FlowRegistrationOut])
+def list_favorites(
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    return service.list_favorites(user_id=current_user.id)
+
+
+@router.post("/flows/{flow_id}/favorite", response_model=FavoriteOut, status_code=201)
+@handle_catalog_exceptions()
+def add_favorite(
+    flow_id: int,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    return service.add_favorite(user_id=current_user.id, registration_id=flow_id)
+
+
+@router.delete("/flows/{flow_id}/favorite", status_code=204)
+@handle_catalog_exceptions()
+def remove_favorite(
+    flow_id: int,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    service.remove_favorite(user_id=current_user.id, registration_id=flow_id)
+
+
+# Follows
+
+
+@router.get("/following", response_model=list[FlowRegistrationOut])
+def list_following(
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    return service.list_following(user_id=current_user.id)
+
+
+@router.post("/flows/{flow_id}/follow", response_model=FollowOut, status_code=201)
+@handle_catalog_exceptions()
+def add_follow(
+    flow_id: int,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    return service.add_follow(user_id=current_user.id, registration_id=flow_id)
+
+
+@router.delete("/flows/{flow_id}/follow", status_code=204)
+@handle_catalog_exceptions()
+def remove_follow(
+    flow_id: int,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    service.remove_follow(user_id=current_user.id, registration_id=flow_id)
+
+
+# Catalog Tables
+
+
+@router.get("/tables", response_model=list[CatalogTableOut])
+def list_tables(
+    namespace_id: int | None = None,
+    current_user=Depends(get_user_or_internal_service),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """List catalog tables, optionally filtered by namespace.
+
+    Accepts the kernel's internal token so ``flowfile_ctx.list_catalog_tables``
+    can enumerate available tables.
+    """
+    return service.list_tables(namespace_id=namespace_id, user_id=current_user.id)
+
+
+@router.post("/tables", response_model=CatalogTableOut, status_code=201)
+@handle_catalog_exceptions()
+def register_table(
+    body: CatalogTableCreate,
+    current_user=Depends(get_user_or_internal_service),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Register a new table by materializing a source file as Parquet.
+
+    Accepts the kernel's internal token so ``flowfile_ctx.write_catalog_table``
+    can register tables it produced.
+    """
+    validated_path = validate_path_under_cwd(body.file_path)
+    return service.register_table(
+        name=body.name,
+        file_path=validated_path,
+        owner_id=current_user.id,
+        namespace_id=body.namespace_id,
+        description=body.description,
+    )
+
+
+@router.post("/tables/from-data", response_model=CatalogTableOut, status_code=201)
+@handle_catalog_exceptions()
+def register_table_from_data(
+    body: CatalogTableFromDataCreate,
+    current_user=Depends(get_user_or_internal_service),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Register a new catalog table from already-materialized data.
+
+    Used by ``flowfile_ctx.write_catalog_table`` once the kernel has written
+    the Delta directory locally — Core only persists the metadata record (no
+    worker-side materialization). The directory must be under the catalog's
+    tables directory, where the kernel writes it, or a table directory under
+    the namespace's object-storage root (403 otherwise).
+    """
+    return service.register_table_from_data(
+        name=body.name,
+        table_path=_kernel_table_path(body.table_path, body.namespace_id),
+        owner_id=current_user.id,
+        namespace_id=body.namespace_id,
+        description=body.description,
+        storage_format=body.storage_format,
+        schema=body.schema_columns,
+        row_count=body.row_count,
+        column_count=body.column_count,
+        size_bytes=body.size_bytes,
+    )
+
+
+@router.post("/tables/{table_id}/refresh", response_model=CatalogTableOut)
+@handle_catalog_exceptions()
+def refresh_table_metadata(
+    table_id: int,
+    body: CatalogTableRefreshRequest,
+    current_user=Depends(get_user_or_internal_service),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Refresh an existing catalog table's metadata after an in-place data write.
+
+    Used by ``flowfile_ctx.write_catalog_table`` for append / upsert / update /
+    delete modes — the kernel writes new data to the existing Delta directory
+    and then reports back the new row_count / size_bytes / schema so Core's
+    record stays consistent. A ``table_path`` must be under the catalog's
+    tables directory (403 otherwise).
+    """
+    return service.overwrite_table_data(
+        table_id=table_id,
+        table_path=_kernel_table_path(body.table_path) if body.table_path is not None else None,
+        description=body.description,
+        storage_format=body.storage_format,
+        schema=body.schema_columns,
+        row_count=body.row_count,
+        column_count=body.column_count,
+        size_bytes=body.size_bytes,
+    )
+
+
+@router.get("/tables/resolve", response_model=ResolveTableResult)
+@handle_catalog_exceptions()
+def resolve_table(
+    q: str,
+    namespace_id: int | None = None,
+    strict: bool = False,
+    current_user=Depends(get_user_or_internal_service),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Resolve a catalog table by ``"namespace.table"`` or bare ``"table"`` reference.
+
+    Strict mode raises ``AmbiguousTableError`` (→ 409) when a bare name matches >1 row.
+    Default mode soft-picks deterministically and reports alternatives in ``warnings``.
+    """
+    table_out, warnings = service.resolve_table_out(
+        q,
+        default_namespace_id=namespace_id,
+        strict=strict,
+        user_id=current_user.id,
+    )
+    return ResolveTableResult(table=table_out, warnings=warnings)
+
+
+@router.get("/tables/{table_id}", response_model=CatalogTableOut)
+@handle_catalog_exceptions()
+def get_table(
+    table_id: int,
+    current_user=Depends(get_user_or_internal_service),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    return service.get_table(table_id, user_id=current_user.id)
+
+
+@router.put("/tables/{table_id}", response_model=CatalogTableOut)
+@handle_catalog_exceptions()
+def update_table(
+    table_id: int,
+    body: CatalogTableUpdate,
+    current_user=Depends(get_user_or_internal_service),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    prediction_table_id = (
+        body.prediction_table_id if "prediction_table_id" in body.model_fields_set else KEEP_PREDICTION
+    )
+    return service.update_table(
+        table_id=table_id,
+        name=body.name,
+        description=body.description,
+        namespace_id=body.namespace_id,
+        prediction_table_id=prediction_table_id,
+    )
+
+
+@router.delete("/tables/{table_id}", status_code=204)
+@handle_catalog_exceptions()
+def delete_table(
+    table_id: int,
+    delete_file: bool = False,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    service.delete_table(table_id, delete_file=delete_file)
+
+
+@router.get("/tables/{table_id}/preview", response_model=CatalogTablePreview)
+@handle_catalog_exceptions()
+def get_table_preview(
+    table_id: int,
+    limit: int = Query(100, ge=1, le=10000),
+    version: int | None = Query(None),
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Preview the first N rows of a catalog table.
+
+    When ``version`` is provided and the table is a Delta table, returns
+    data from that specific historical version.
+    """
+    return service.get_table_preview(table_id, limit=limit, version=version, user_id=current_user.id)
+
+
+@router.post("/tables/{table_id}/materialize", response_model=CatalogTableMaterializeResult)
+@handle_catalog_exceptions()
+def materialize_table(
+    table_id: int,
+    current_user=Depends(get_user_or_internal_service),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Materialise a virtual table to a kernel-readable IPC snapshot.
+
+    Resolves the view (SQL, optimized plan, or producer re-run), has the
+    worker collect it to an Arrow IPC file under the kernel-shared volume,
+    and returns the host path. Used by ``flowfile_ctx.read_catalog_table``
+    for views; physical tables are rejected with 400.
+    """
+    return service.materialize_table(table_id, user_id=current_user.id)
+
+
+@router.get(
+    "/tables/{table_id}/columns/{column_name}/stats",
+    response_model=ColumnStatsResponse,
+)
+@handle_catalog_exceptions()
+def get_table_column_stats(
+    table_id: int,
+    column_name: str,
+    limit: int = Query(100, ge=1, le=1000),
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Distinct values + min/max for a column on a catalog table.
+
+    Used by the dashboard filter UI to pre-populate categorical option
+    lists and pre-fill numeric / date range inputs.
+    """
+    return service.get_table_column_stats(table_id, column_name, limit=limit, user_id=current_user.id)
+
+
+@router.get("/tables/{table_id}/history", response_model=DeltaTableHistory)
+@handle_catalog_exceptions()
+def get_table_history(
+    table_id: int,
+    limit: int | None = Query(None),
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Return version history for a Delta catalog table."""
+    return service.get_table_history(table_id, limit=limit)
+
+
+@router.post("/tables/{table_id}/optimize", response_model=OptimizeTableResponse)
+@handle_catalog_exceptions()
+def optimize_table(
+    table_id: int,
+    body: OptimizeTableRequest,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Compact (and optionally Z-order) a Delta catalog table."""
+    return service.optimize_table(table_id, z_order_columns=body.z_order_columns)
+
+
+@router.post("/tables/{table_id}/vacuum", response_model=VacuumTableResponse)
+@handle_catalog_exceptions()
+def vacuum_table(
+    table_id: int,
+    body: VacuumTableRequest,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Vacuum tombstoned files from a Delta catalog table (dry-run by default).
+
+    Refused with 409 ``CDC_CURSORS_AT_RISK`` when change-feed cursors still point into the
+    history this retention window would drop, unless ``force`` is set.
+    """
+    return service.vacuum_table(table_id, retention_hours=body.retention_hours, dry_run=body.dry_run, force=body.force)
+
+
+@router.get("/tables/{table_id}/cdc", response_model=CdcStatusOut)
+@handle_catalog_exceptions()
+def get_table_cdc(
+    table_id: int,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Change-tracking state for a catalog table, with every consumer's cursor position."""
+    return service.get_table_cdc_status(table_id)
+
+
+@router.post("/tables/{table_id}/cdc/enable", response_model=CdcStatusOut)
+@handle_catalog_exceptions()
+def enable_table_cdc(
+    table_id: int,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Turn change tracking on for a Delta catalog table (idempotent). Requires manage."""
+    return service.enable_table_cdc(table_id)
+
+
+@router.post("/tables/{table_id}/cdc/cursors/reset", response_model=CdcCursorOut)
+@handle_catalog_exceptions()
+def reset_table_cdc_cursor(
+    table_id: int,
+    body: CdcCursorResetRequest,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Move one consumer's cursor. Requires cursor ownership or manage on the table."""
+    return service.reset_table_cdc_cursor(table_id, body.consumer_key, body.to)
+
+
+@router.delete("/tables/{table_id}/cdc/cursors/{consumer_key}", status_code=204)
+@handle_catalog_exceptions()
+def delete_table_cdc_cursor(
+    table_id: int,
+    consumer_key: str,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Forget one consumer's cursor. Requires cursor ownership or manage on the table."""
+    service.delete_table_cdc_cursor(table_id, consumer_key)
+
+
+@router.post("/tables/{table_id}/edits", response_model=CatalogTableEditsResponse)
+@handle_catalog_exceptions()
+def apply_table_edits(
+    table_id: int,
+    body: CatalogTableEditsRequest,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Apply row-level edits from the catalog edit surface to a Delta catalog table.
+
+    Edits attach to rows via ``key_columns`` (validated as unique server-side) and
+    land as keyed Delta merges — every save is a new Delta version, visible in the
+    table's history and revertible via time travel. ``expected_version`` guards
+    against concurrent writers (409 stale-write on mismatch). Requires manage on
+    the table, like every other data-mutating table operation.
+    """
+    return service.apply_table_edits(
+        table_id,
+        body,
+        edited_by=getattr(current_user, "username", None),
+        user_id=current_user.id,
+    )
+
+
+@router.post("/tables/{table_id}/key-column", response_model=CatalogTableKeyColumnResponse)
+@handle_catalog_exceptions()
+def add_table_key_column(
+    table_id: int,
+    body: CatalogTableKeyColumnRequest,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Rewrite a catalog table with a sequential row-id column appended.
+
+    The escape hatch for the edit surface on tables with no natural unique key:
+    edits need key columns, so this mints one. A full-table rewrite (new Delta
+    version). Requires manage on the table.
+    """
+    return service.add_table_key_column(
+        table_id,
+        column_name=body.column_name,
+        expected_version=body.expected_version,
+        user_id=current_user.id,
+    )
+
+
+# Table Favorites
+
+
+@router.get("/table-favorites", response_model=list[CatalogTableOut])
+def list_table_favorites(
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    return service.list_table_favorites(user_id=current_user.id)
+
+
+@router.post("/tables/{table_id}/favorite", response_model=TableFavoriteOut, status_code=201)
+@handle_catalog_exceptions()
+def add_table_favorite(
+    table_id: int,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    return service.add_table_favorite(user_id=current_user.id, table_id=table_id)
+
+
+@router.delete("/tables/{table_id}/favorite", status_code=204)
+@handle_catalog_exceptions()
+def remove_table_favorite(
+    table_id: int,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    service.remove_table_favorite(user_id=current_user.id, table_id=table_id)
+
+
+# Catalog Visualizations
+
+
+@router.get("/visualizations", response_model=list[VisualizationOut])
+@handle_catalog_exceptions()
+def list_visualization_library(
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Return every saved visualization across the catalog."""
+    return service.list_visualization_library(user_id=current_user.id)
+
+
+@router.post("/visualizations", response_model=VisualizationOut, status_code=201)
+@handle_catalog_exceptions()
+def create_visualization(
+    body: VisualizationCreate,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Create a saved viz. Source is either a catalog table or an inline SQL query."""
+    return service.create_visualization(body, user_id=current_user.id)
+
+
+@router.get("/visualizations/{viz_id}", response_model=VisualizationOut)
+@handle_catalog_exceptions()
+def get_visualization(
+    viz_id: int,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    return service.get_visualization(viz_id, user_id=current_user.id)
+
+
+@router.put("/visualizations/{viz_id}", response_model=VisualizationOut)
+@handle_catalog_exceptions()
+def update_visualization(
+    viz_id: int,
+    body: VisualizationUpdate,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    return service.update_visualization(viz_id, body, user_id=current_user.id)
+
+
+@router.delete("/visualizations/{viz_id}", status_code=204)
+@handle_catalog_exceptions()
+def delete_visualization(
+    viz_id: int,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    service.delete_visualization(viz_id, user_id=current_user.id)
+
+
+@router.post(
+    "/visualizations/{viz_id}/compute",
+    response_model=VisualizationComputeResponse,
+)
+@handle_catalog_exceptions()
+def compute_saved_visualization(
+    viz_id: int,
+    body: VisualizationSavedComputeRequest = Body(default_factory=VisualizationSavedComputeRequest),
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Compute chart rows for a saved viz.
+
+    GraphicWalker's ``computation`` callback POSTs the IDataQueryPayload
+    here on every aggregation; the worker session cache keeps the source
+    LazyFrame warm so successive calls skip the load.
+    """
+    return service.compute_saved_visualization_rows(
+        viz_id,
+        body.max_rows,
+        user_id=current_user.id,
+        payload=body.payload,
+    )
+
+
+@router.post("/visualizations/{viz_id}/fields", response_model=VisualizationFieldsResponse)
+@handle_catalog_exceptions()
+def get_saved_visualization_fields(
+    viz_id: int,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Return the GW field schema for a saved viz's source."""
+    return service.get_visualization_fields_for_viz(viz_id, user_id=current_user.id)
+
+
+@router.post("/visualizations/compute", response_model=VisualizationComputeResponse)
+@handle_catalog_exceptions()
+def compute_ad_hoc_visualization(
+    body: VisualizationAdHocComputeRequest,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Compute a chart from a transient source (ad-hoc SQL or a catalog table)."""
+    return service.compute_ad_hoc_visualization(
+        source=body.source,
+        payload=body.payload,
+        max_rows=body.max_rows,
+        user_id=current_user.id,
+    )
+
+
+@router.post("/visualizations/fields", response_model=VisualizationFieldsResponse)
+@handle_catalog_exceptions()
+def get_visualization_fields(
+    body: VisualizationFieldsRequest,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Return the Graphic Walker field schema for a viz source descriptor."""
+    return service.get_visualization_fields(body.source, user_id=current_user.id)
+
+
+@router.get("/tables/{table_id}/visualizations", response_model=list[VisualizationOut])
+@handle_catalog_exceptions()
+def list_visualizations_for_table(
+    table_id: int,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Filtered listing — viz that reference this table."""
+    return service.list_visualizations_for_table(table_id, user_id=current_user.id)
+
+
+# Catalog Notebooks
+
+
+@router.get("/notebooks", response_model=list[NotebookSummaryOut])
+@handle_catalog_exceptions()
+def list_notebooks(
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """List saved notebooks (lightweight — cells omitted)."""
+    return service.list_notebooks(user_id=current_user.id)
+
+
+@router.post("/notebooks", response_model=NotebookOut, status_code=201)
+@handle_catalog_exceptions()
+def create_notebook(
+    body: NotebookCreate,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Create a saved notebook with an ordered list of mixed cells."""
+    return service.create_notebook(body, user_id=current_user.id)
+
+
+@router.get("/notebooks/{notebook_id}", response_model=NotebookOut)
+@handle_catalog_exceptions()
+def get_notebook(
+    notebook_id: int,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    return service.get_notebook(notebook_id, user_id=current_user.id)
+
+
+@router.put("/notebooks/{notebook_id}", response_model=NotebookOut)
+@handle_catalog_exceptions()
+def update_notebook(
+    notebook_id: int,
+    body: NotebookUpdate,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Full-document save of a notebook's cells / metadata."""
+    return service.update_notebook(notebook_id, body, user_id=current_user.id)
+
+
+@router.delete("/notebooks/{notebook_id}", status_code=204)
+@handle_catalog_exceptions()
+def delete_notebook(
+    notebook_id: int,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    service.delete_notebook(notebook_id, user_id=current_user.id)
+
+
+# Catalog Dashboards
+
+
+@router.get("/dashboards", response_model=list[DashboardOut])
+@handle_catalog_exceptions()
+def list_dashboards(
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Return every saved dashboard."""
+    return service.list_dashboards(user_id=current_user.id)
+
+
+@router.post("/dashboards", response_model=DashboardOut, status_code=201)
+@handle_catalog_exceptions()
+def create_dashboard(
+    body: DashboardCreate,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Create a new dashboard. The layout may be empty; tiles can be added later."""
+    return service.create_dashboard(body, user_id=current_user.id)
+
+
+@router.get("/dashboards/{dashboard_id}", response_model=DashboardOut)
+@handle_catalog_exceptions()
+def get_dashboard(
+    dashboard_id: int,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    return service.get_dashboard(dashboard_id, user_id=current_user.id)
+
+
+@router.put("/dashboards/{dashboard_id}", response_model=DashboardOut)
+@handle_catalog_exceptions()
+def update_dashboard(
+    dashboard_id: int,
+    body: DashboardUpdate,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    return service.update_dashboard(dashboard_id, body, user_id=current_user.id)
+
+
+@router.delete("/dashboards/{dashboard_id}", status_code=204)
+@handle_catalog_exceptions()
+def delete_dashboard(
+    dashboard_id: int,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    service.delete_dashboard(dashboard_id, user_id=current_user.id)
+
+
+# Virtual Flow Tables
+
+
+@router.post("/virtual-tables", response_model=CatalogTableOut, status_code=201)
+@handle_catalog_exceptions(FlowNotFoundError="Producer flow not found")
+def create_virtual_flow_table(
+    body: VirtualFlowTableCreate,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Create a virtual flow table (non-materialized catalog entry)."""
+    table_out = service.create_virtual_flow_table(
+        name=body.name,
+        owner_id=current_user.id,
+        producer_registration_id=body.producer_registration_id,
+        namespace_id=body.namespace_id,
+        description=body.description,
+    )
+
+    flow_reg = service.repo.get_flow(body.producer_registration_id)
+    blockers = CatalogService._compute_laziness_blockers(flow_reg.flow_path if flow_reg else None)
+    if blockers:
+        table_out.laziness_blockers = blockers
+
+    return table_out
+
+
+@router.put("/virtual-tables/{table_id}", response_model=CatalogTableOut)
+@handle_catalog_exceptions(TableNotFoundError="Virtual table not found", FlowNotFoundError="Producer flow not found")
+def update_virtual_flow_table(
+    table_id: int,
+    body: VirtualFlowTableUpdate,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Update a virtual flow table's metadata or producer."""
+    return service.update_virtual_flow_table(
+        table_id=table_id,
+        name=body.name,
+        description=body.description,
+        namespace_id=body.namespace_id,
+        producer_registration_id=body.producer_registration_id,
+    )
+
+
+@router.post("/virtual-tables/{table_id}/resolve", response_model=CatalogTablePreview)
+@handle_catalog_exceptions(TableNotFoundError="Virtual table not found", FlowNotFoundError="Producer flow not found")
+def resolve_virtual_flow_table(
+    table_id: int,
+    limit: int = Query(100, ge=1, le=10000),
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+) -> CatalogTablePreview:
+    """Resolve a virtual flow table and return a preview of the result."""
+    return service.resolve_virtual_flow_table_preview(table_id, limit, user_id=current_user.id)
+
+
+# Query-based Virtual Tables
+
+
+@router.post("/query-virtual-tables", response_model=CatalogTableOut, status_code=201)
+@handle_catalog_exceptions()
+def create_query_virtual_table(
+    body: QueryVirtualTableCreate,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Create a query-based virtual table from a SQL expression."""
+    return service.create_query_virtual_table(
+        name=body.name,
+        owner_id=current_user.id,
+        sql_query=body.sql_query,
+        namespace_id=body.namespace_id,
+        description=body.description,
+    )
+
+
+@router.put("/query-virtual-tables/{table_id}", response_model=CatalogTableOut)
+@handle_catalog_exceptions(TableNotFoundError="Query virtual table not found")
+def update_query_virtual_table(
+    table_id: int,
+    body: QueryVirtualTableUpdate,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Update a query-based virtual table."""
+    return service.update_query_virtual_table(
+        table_id=table_id,
+        name=body.name,
+        description=body.description,
+        namespace_id=body.namespace_id,
+        sql_query=body.sql_query,
+    )
+
+
+# SQL Query
+
+
+@router.post("/sql/execute", response_model=SqlQueryResult)
+def execute_sql_query(
+    body: SqlQueryRequest,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Execute a SQL query against Delta catalog tables."""
+    return service.execute_sql_query(query=body.query, max_rows=body.max_rows, user_id=current_user.id)
+
+
+@router.post("/sql/save-as-flow")
+def save_query_as_flow(
+    body: SaveQueryAsFlowRequest,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Save a SQL query as a registered flow with catalog_reader + sql_query nodes."""
+    try:
+        flow_id = service.save_sql_query_as_flow(
+            query=body.query,
+            name=body.name,
+            owner_id=current_user.id,
+            namespace_id=body.namespace_id,
+            description=body.description,
+            used_tables=body.used_tables,
+        )
+        return {"flow_id": flow_id}
+    except NotAuthorizedError as e:
+        raise HTTPException(403, str(e)) from None
+    except Exception as e:
+        raise HTTPException(500, str(e)) from e
+
+
+# Dashboard / Stats
+
+
+@router.get("/stats", response_model=CatalogStats)
+def get_catalog_stats(
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    return service.get_catalog_stats(user_id=current_user.id)
+
+
+# Schedules
+
+
+@router.get("/schedules", response_model=list[FlowScheduleOut])
+def list_schedules(
+    registration_id: int | None = None,
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """List schedules, optionally filtered by flow registration."""
+    return service.list_schedules(registration_id=registration_id)
+
+
+@router.post("/schedules", response_model=FlowScheduleOut, status_code=201)
+@handle_catalog_exceptions(TableNotFoundError="Trigger table not found")
+def create_schedule(
+    body: FlowScheduleCreate,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    return service.create_schedule(
+        registration_id=body.registration_id,
+        owner_id=current_user.id,
+        schedule_type=body.schedule_type,
+        interval_seconds=body.interval_seconds,
+        cron_expression=body.cron_expression,
+        cron_timezone=body.cron_timezone,
+        trigger_table_id=body.trigger_table_id,
+        trigger_table_ids=body.trigger_table_ids,
+        enabled=body.enabled,
+        name=body.name,
+        description=body.description,
+    )
+
+
+@router.post("/schedules/validate-cron", response_model=CronValidationResult)
+def validate_cron_schedule(
+    body: CronValidationRequest,
+    current_user=Depends(get_current_active_user),
+):
+    """Validate a cron expression (+ optional timezone) against the same croniter
+    rules ``create_schedule`` enforces, returning a flag instead of raising so the
+    schedule builder can gate its submit button on the backend's verdict — keeping
+    croniter the single source of truth for cron validity (the UI preview uses a
+    different parser, cronstrue, which accepts a slightly different grammar)."""
+    try:
+        validate_cron_expression(body.cron_expression)
+        validate_cron_timezone(body.cron_timezone)
+    except ValueError as exc:
+        return CronValidationResult(valid=False, error=str(exc))
+    return CronValidationResult(valid=True, error=None)
+
+
+@router.get("/schedules/{schedule_id}", response_model=FlowScheduleOut)
+@handle_catalog_exceptions()
+def get_schedule(
+    schedule_id: int,
+    service: CatalogService = Depends(get_catalog_service),
+):
+    return service.get_schedule(schedule_id)
+
+
+@router.put("/schedules/{schedule_id}", response_model=FlowScheduleOut)
+@handle_catalog_exceptions()
+def update_schedule(
+    schedule_id: int,
+    body: FlowScheduleUpdate,
+    service: CatalogService = Depends(get_catalog_service),
+):
+    return service.update_schedule(
+        schedule_id=schedule_id,
+        enabled=body.enabled,
+        interval_seconds=body.interval_seconds,
+        cron_expression=body.cron_expression,
+        cron_timezone=body.cron_timezone,
+        name=body.name,
+        description=body.description,
+    )
+
+
+@router.delete("/schedules/{schedule_id}", status_code=204)
+@handle_catalog_exceptions()
+def delete_schedule(
+    schedule_id: int,
+    service: CatalogService = Depends(get_catalog_service),
+):
+    service.delete_schedule(schedule_id)
+
+
+@router.post("/flows/{flow_id}/run", response_model=FlowRunOut)
+@handle_catalog_exceptions()
+def run_flow_now(
+    flow_id: int,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Trigger a registered flow immediately without needing a schedule."""
+    return service.run_flow_now(registration_id=flow_id, user_id=current_user.id)
+
+
+@router.post("/schedules/{schedule_id}/run-now", response_model=FlowRunOut)
+@handle_catalog_exceptions()
+def trigger_schedule_now(
+    schedule_id: int,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Manually trigger a scheduled flow immediately."""
+    return service.trigger_schedule_now(schedule_id=schedule_id, user_id=current_user.id)
+
+
+# Active Runs
+
+
+@router.get("/active-runs", response_model=list[ActiveFlowRun])
+def list_active_runs(
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """List all currently running flows."""
+    return service.list_active_runs()
+
+
+@router.post("/runs/{run_id}/cancel", status_code=204)
+@handle_catalog_exceptions()
+def cancel_run(
+    run_id: int,
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Cancel a running flow by marking it as failed."""
+    service.cancel_run(run_id)
+
+
+# Scheduler management
+
+
+def _scheduler_status(db: Session) -> SchedulerStatusOut:
+    """Resolve the scheduler lock row into a status, flagging a stale heartbeat as inactive."""
+    import logging
+
+    logger = logging.getLogger("flowfile.scheduler.status")
+
+    lock = db.get(SchedulerLock, 1)
+    if lock is None:
+        logger.debug("No scheduler lock row found — reporting inactive")
+        return SchedulerStatusOut(active=False)
+
+    embedded = get_scheduler()
+    is_embedded = embedded is not None and getattr(embedded, "_holder_id", None) == lock.holder_id
+
+    # Detect stale heartbeat — scheduler may have died without releasing the lock
+    active = True
+    if lock.heartbeat_at is not None:
+        heartbeat = lock.heartbeat_at
+        if heartbeat.tzinfo is None:
+            heartbeat = heartbeat.replace(tzinfo=timezone.utc)
+        elapsed = (datetime.now(timezone.utc) - heartbeat).total_seconds()
+        if elapsed > STALE_THRESHOLD:
+            active = False
+            logger.warning(
+                "Scheduler heartbeat is STALE: last heartbeat %.1fs ago (threshold=%ds), "
+                "holder_id=%s, heartbeat_at=%s — marking inactive",
+                elapsed,
+                STALE_THRESHOLD,
+                lock.holder_id,
+                lock.heartbeat_at,
+            )
+        else:
+            logger.debug(
+                "Scheduler heartbeat OK: %.1fs ago (threshold=%ds), holder_id=%s",
+                elapsed,
+                STALE_THRESHOLD,
+                lock.holder_id,
+            )
+    else:
+        logger.warning("Scheduler lock exists but heartbeat_at is None — holder_id=%s", lock.holder_id)
+
+    logger.debug(
+        "Scheduler status response: active=%s, holder_id=%s, is_embedded=%s, started_at=%s, heartbeat_at=%s",
+        active,
+        lock.holder_id,
+        is_embedded,
+        lock.started_at,
+        lock.heartbeat_at,
+    )
+
+    return SchedulerStatusOut(
+        active=active,
+        holder_id=lock.holder_id,
+        started_at=lock.started_at,
+        heartbeat_at=lock.heartbeat_at,
+        is_embedded=is_embedded,
+    )
+
+
+@router.get("/scheduler/status", response_model=SchedulerStatusOut)
+def scheduler_status(
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_active_user),
+):
+    """Return the current scheduler lock status."""
+    return _scheduler_status(db)
+
+
+@router.get("/overview", response_model=CatalogOverview)
+def get_catalog_overview(
+    runs_limit: int = Query(25, ge=1, le=500),
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_active_user),
+    service: CatalogService = Depends(get_catalog_service),
+):
+    """Everything the catalog screen loads on mount, in one round-trip.
+
+    FastAPI caches ``get_db`` per request, so ``db`` is the session the service was
+    built on: the whole screen costs one pooled connection instead of one per call.
+    The individual endpoints stay for detail views, mutations and the poll loop.
+    """
+    user_id = current_user.id
+    return CatalogOverview(
+        stats=service.get_catalog_stats(user_id=user_id),
+        tree=service.get_namespace_tree(user_id=user_id),
+        flows=service.list_flows(user_id=user_id),
+        tables=service.list_tables(user_id=user_id),
+        favorites=service.list_favorites(user_id=user_id),
+        schedules=service.list_schedules(),
+        active_runs=service.list_active_runs(),
+        runs=service.list_runs(limit=runs_limit, offset=0),
+        scheduler=_scheduler_status(db),
+        default_namespace_id=service.get_default_namespace_id(),
+    )
+
+
+@router.post("/scheduler/start", status_code=200)
+async def scheduler_start(current_user=Depends(get_current_active_user)):
+    """Start the embedded scheduler. No-op if already running."""
+    scheduler = get_scheduler()
+    if scheduler is not None:
+        return {"message": "Scheduler already running"}
+
+    scheduler = FlowScheduler()
+    await scheduler.start()
+    set_scheduler(scheduler)
+    return {"message": "Scheduler started"}
+
+
+@router.post("/scheduler/stop", status_code=200)
+async def scheduler_stop(current_user=Depends(get_current_active_user)):
+    """Stop the embedded scheduler. No-op if not running."""
+    scheduler = get_scheduler()
+    if scheduler is None:
+        return {"message": "Scheduler not running"}
+
+    await scheduler.stop()
+    set_scheduler(None)
+    return {"message": "Scheduler stopped"}

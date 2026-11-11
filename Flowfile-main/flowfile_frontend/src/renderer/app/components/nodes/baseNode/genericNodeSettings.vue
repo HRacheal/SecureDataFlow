@@ -1,0 +1,858 @@
+<template>
+  <div class="settings-wrapper">
+    <!-- — Inline ✨ menu. Always visible (across all three tabs) for
+         discoverability. Popover content is the AiInlineActions component;
+         the trigger sits in the top-right of the wrapper so it doesn't
+         displace the el-tabs nav bar. -->
+    <div class="ai-inline-actions-trigger">
+      <el-popover
+        v-model:visible="aiPopoverVisible"
+        placement="bottom-end"
+        :width="320"
+        trigger="click"
+        :show-arrow="true"
+        popper-class="ai-inline-actions-popper"
+      >
+        <template #reference>
+          <button
+            type="button"
+            class="ai-inline-actions-trigger__button"
+            title="AI actions for this node"
+            aria-label="AI actions for this node"
+          >
+            <span class="material-icons ai-inline-actions-trigger__icon" aria-hidden="true"
+              >auto_awesome</span
+            >
+          </button>
+        </template>
+        <AiInlineActions
+          :flow-id="aiFlowIdNumber"
+          :node-id="props.modelValue.node_id"
+          :node-name="aiNodeName"
+          @picked="aiPopoverVisible = false"
+        />
+      </el-popover>
+    </div>
+
+    <div v-if="predictionWarning" class="prediction-warning-banner">
+      <span class="material-icons prediction-warning-banner__icon" aria-hidden="true">warning</span>
+      <span class="prediction-warning-banner__text">
+        {{ predictionWarning }}
+        <el-button link type="primary" size="small" @click="activeTab = 'output-schema'">
+          Or declare the expected columns in the Schema Validator
+        </el-button>
+      </span>
+    </div>
+
+    <el-tabs v-model="activeTab">
+      <el-tab-pane label="Main Settings" name="main">
+        <slot></slot>
+      </el-tab-pane>
+
+      <el-tab-pane label="General Settings" name="general">
+        <div class="settings-section">
+          <div class="setting-group">
+            <div class="setting-header">
+              <span class="setting-title">Cache Results</span>
+              <div class="setting-description-wrapper">
+                <span class="setting-description">
+                  Store results on disk to speed up subsequent executions and verify results.
+                  <el-tooltip
+                    effect="dark"
+                    content="Caching is only active when the flow is executed in performance mode"
+                    placement="top"
+                  >
+                    <el-icon class="info-icon">
+                      <InfoFilled />
+                    </el-icon>
+                  </el-tooltip>
+                </span>
+              </div>
+            </div>
+            <el-switch
+              v-model="localSettings.cache_results"
+              size="small"
+              @change="handleSettingChange"
+            />
+          </div>
+
+          <div class="setting-group">
+            <div class="setting-header">
+              <span class="setting-title">Compute backend</span>
+              <span class="setting-description">
+                Where this node runs. Auto runs it on the flow's backend; another backend is used
+                when an exchange store is configured, its data crossing through the store. When the
+                backend it is set to cannot run it, it runs on the default backend instead.
+              </span>
+            </div>
+            <div class="execution-location-row">
+              <el-select
+                v-model="localSettings.execution_location"
+                fit-input-width
+                aria-label="Compute backend"
+                data-testid="node-execution-location"
+                class="execution-location-select"
+                size="small"
+                @change="handleSettingChange"
+              >
+                <el-option
+                  v-for="option in locationOptions"
+                  :key="option.key"
+                  :value="option.key"
+                  :label="option.label"
+                />
+              </el-select>
+              <router-link
+                :to="{ name: 'compute', query: { tab: 'backends' } }"
+                class="manage-backends-link"
+              >
+                Manage backends
+              </router-link>
+            </div>
+            <p
+              v-if="placementNote"
+              :class="['placement-note', `placement-note--${placementNote.kind}`]"
+              data-testid="node-placement-note"
+            >
+              {{ placementNote.detail }}
+            </p>
+            <BackendHandshakeStatus
+              v-if="selectedBackend?.verdict"
+              :key="selectedBackend.id"
+              :verdict="selectedBackend.verdict"
+              compact
+            />
+          </div>
+
+          <div class="setting-group">
+            <div class="setting-header">
+              <span class="setting-title">Node Reference</span>
+              <div class="setting-description-wrapper">
+                <span class="setting-description">
+                  A unique identifier used as the variable name in code generation.
+                  <el-tooltip
+                    effect="dark"
+                    content="Must be lowercase with no spaces. Leave empty to use the default (df_node_id)"
+                    placement="top"
+                  >
+                    <el-icon class="info-icon">
+                      <InfoFilled />
+                    </el-icon>
+                  </el-tooltip>
+                </span>
+              </div>
+            </div>
+            <el-input
+              v-model="localSettings.node_reference"
+              :placeholder="defaultReference"
+              :class="{ 'is-error': referenceError }"
+              @input="handleReferenceInput"
+              @blur="handleReferenceBlur"
+            />
+            <div v-if="referenceError" class="validation-error">
+              {{ referenceError }}
+            </div>
+            <div v-else-if="isValidatingReference" class="validation-loading">Checking...</div>
+          </div>
+
+          <div class="setting-group">
+            <div class="setting-header">
+              <span class="setting-title">Node Description</span>
+              <span class="setting-description">
+                Add a description to document this node's purpose
+              </span>
+            </div>
+            <el-input
+              v-model="localSettings.description"
+              type="textarea"
+              :rows="4"
+              placeholder="Add a description for this node..."
+              @change="handleDescriptionChange"
+            />
+          </div>
+        </div>
+      </el-tab-pane>
+
+      <el-tab-pane label="Schema Validator" name="output-schema">
+        <div class="settings-section">
+          <div class="setting-group">
+            <div class="setting-header">
+              <span class="setting-title">Enable Schema Validation</span>
+              <span class="setting-description">
+                Guarantee data quality with automatic schema enforcement and validation
+              </span>
+            </div>
+            <el-switch
+              v-model="outputFieldConfig.enabled"
+              size="small"
+              @change="handleOutputConfigChange"
+            />
+          </div>
+
+          <template v-if="outputFieldConfig.enabled">
+            <div class="setting-group">
+              <div class="setting-header">
+                <span class="setting-title">Validation Mode</span>
+                <span class="setting-description"> How to handle output fields </span>
+              </div>
+              <el-select
+                v-model="outputFieldConfig.validation_mode_behavior"
+                style="width: 100%"
+                @change="handleOutputConfigChange"
+              >
+                <el-option label="Strict - Keep only defined fields" value="select_only" />
+                <el-option
+                  label="Flexible - Add missing fields, remove extras"
+                  value="add_missing"
+                />
+                <el-option
+                  label="Permissive - Add missing fields, keep all extras"
+                  value="add_missing_keep_extra"
+                />
+                <el-option
+                  label="Validate - Error if any fields are missing"
+                  value="raise_on_missing"
+                />
+              </el-select>
+            </div>
+
+            <div class="setting-group">
+              <div class="setting-header">
+                <span class="setting-title">Type Checking</span>
+                <span class="setting-description">
+                  Enforce data type constraints and catch type mismatches at runtime
+                </span>
+              </div>
+              <el-switch
+                v-model="outputFieldConfig.validate_data_types"
+                size="small"
+                @change="handleOutputConfigChange"
+              />
+            </div>
+
+            <div class="setting-group">
+              <div class="setting-header">
+                <span class="setting-title">Schema Definition</span>
+                <div style="display: flex; gap: 0.5rem; margin-top: 0.5rem">
+                  <el-button
+                    size="small"
+                    :disabled="hasSchema"
+                    :loading="isLoadingSchema"
+                    @click="loadFieldsFromSchema"
+                  >
+                    Auto-Detect Schema
+                  </el-button>
+                  <el-button size="small" type="primary" @click="addField"> Add Field </el-button>
+                </div>
+              </div>
+
+              <div v-if="outputFieldConfig.fields.length === 0" class="no-fields">
+                <template v-if="isLoadingSchema"> Detecting schema... </template>
+                <template v-else>
+                  No schema defined yet. Click "Auto-Detect Schema" to import from upstream data or
+                  "Add Field" to define manually.
+                </template>
+              </div>
+
+              <el-table
+                v-else
+                :data="outputFieldConfig.fields"
+                style="width: 100%; margin-top: 1rem"
+                size="small"
+              >
+                <el-table-column width="50">
+                  <template #default>
+                    <el-icon style="cursor: move">
+                      <DCaret />
+                    </el-icon>
+                  </template>
+                </el-table-column>
+
+                <el-table-column label="Field Name" prop="name">
+                  <template #default="{ row }">
+                    <el-input v-model="row.name" size="small" @change="handleOutputConfigChange" />
+                  </template>
+                </el-table-column>
+
+                <el-table-column label="Data Type" prop="data_type" width="150">
+                  <template #default="{ row }">
+                    <el-select
+                      v-model="row.data_type"
+                      size="small"
+                      @change="handleOutputConfigChange"
+                    >
+                      <el-option label="String" value="String" />
+                      <el-option label="Int64" value="Int64" />
+                      <el-option label="Int32" value="Int32" />
+                      <el-option label="Float64" value="Float64" />
+                      <el-option label="Float32" value="Float32" />
+                      <el-option label="Boolean" value="Boolean" />
+                      <el-option label="Date" value="Date" />
+                      <el-option label="Datetime" value="Datetime" />
+                      <el-option label="Time" value="Time" />
+                      <el-option label="List" value="List" />
+                      <el-option label="Decimal" value="Decimal" />
+                    </el-select>
+                  </template>
+                </el-table-column>
+
+                <el-table-column label="Default Value" prop="default_value">
+                  <template #default="{ row }">
+                    <el-input
+                      v-model="row.default_value"
+                      size="small"
+                      placeholder="null"
+                      @change="handleOutputConfigChange"
+                    />
+                  </template>
+                </el-table-column>
+
+                <el-table-column width="60">
+                  <template #default="{ $index }">
+                    <el-button type="danger" size="small" text @click="removeField($index)">
+                      <el-icon><Delete /></el-icon>
+                    </el-button>
+                  </template>
+                </el-table-column>
+              </el-table>
+
+              <div v-if="outputFieldConfig.fields.length > 0" style="margin-top: 1rem" class="tip">
+                <strong>Tip:</strong> Default values are used when fields are missing from the input
+                data.
+              </div>
+            </div>
+          </template>
+        </div>
+      </el-tab-pane>
+    </el-tabs>
+  </div>
+</template>
+
+<script lang="ts" setup generic="T extends NodeBase">
+/* eslint-disable no-undef */
+import { computed, onMounted, ref, watch, reactive } from "vue";
+import type { NodeBase, OutputFieldConfig } from "./nodeInput";
+import { useNodeStore } from "../../../stores/node-store";
+import { useFlowStore } from "../../../stores/flow-store";
+import { useResultsStore } from "../../../stores/results-store";
+import { nodePlacementNote } from "../../../utils/placement";
+import { InfoFilled, DCaret, Delete } from "@element-plus/icons-vue";
+import AiInlineActions from "../../../features/ai/AiInlineActions.vue";
+import { listComputeBackends } from "../../../api/computeBackends.api";
+import { nodeExecutionLocationOptions, type BackendRow } from "../../../utils/executionLocation";
+import BackendHandshakeStatus from "../../settings/BackendHandshakeStatus.vue";
+
+const nodeStore = useNodeStore();
+const flowStore = useFlowStore();
+
+// — Inline ✨ popover state. The popover content lives in
+// AiInlineActions.vue and looks up node_type from the live VueFlow graph.
+const aiPopoverVisible = ref(false);
+
+const props = defineProps<{
+  modelValue: T;
+}>();
+
+const emit = defineEmits<{
+  (e: "update:model-value", value: T): void;
+  (e: "request-save"): Promise<boolean> | boolean | void;
+}>();
+/* eslint-enable no-undef */
+
+const isLoadingSchema = ref(false);
+
+// Column prediction blocked by an un-run kernel node (backend warning text).
+// The store slot holds whichever node fetched last, so gate on this drawer's id.
+const predictionWarning = computed(() => {
+  const data = nodeStore.currentNodeData;
+  if (!data || String(data.node_id) !== String(props.modelValue.node_id)) return null;
+  return data.prediction_warning ?? null;
+});
+
+const activeTab = ref("main");
+
+// Lets a node's main-tab content (rendered in the default slot) send the user to
+// the General Settings tab, where the Cache Results toggle lives. Exposed via a
+// template ref rather than provide/inject because slot content is a sibling of
+// this component in the tree, not a descendant, so inject wouldn't reach it.
+const openCacheSetting = () => {
+  activeTab.value = "general";
+};
+defineExpose({ openCacheSetting });
+
+const referenceError = ref<string | null>(null);
+const isValidatingReference = ref(false);
+let validationTimeout: ReturnType<typeof setTimeout> | null = null;
+
+const defaultReference = computed(() => `df_${props.modelValue?.node_id ?? ""}`);
+
+// — coerce the flow id to a number for the AI route (the NodeBase
+// type allows ``string | number`` but the inline_action route's Pydantic
+// shape is strict). Falls back to flowStore.flowId when the prop hasn't
+// been initialised yet.
+const aiFlowIdNumber = computed<number>(() => {
+  const raw = (props.modelValue as NodeBase | null)?.flow_id ?? flowStore.flowId;
+  return typeof raw === "number" ? raw : Number.parseInt(String(raw), 10);
+});
+
+// — human label for the synthetic chat user message ("Explain `name`.").
+// Resolves from VueFlow's stored label when present so the chat shows the
+// node name the user sees on the canvas, not just the numeric id.
+const aiNodeName = computed<string | undefined>(() => {
+  const instance = flowStore.vueFlowInstance;
+  const nodeId = props.modelValue?.node_id;
+  if (!instance || nodeId === undefined || nodeId === null) return undefined;
+  const node = instance.findNode?.(String(nodeId));
+  if (!node) return undefined;
+  const label = (node.data as { label?: string | null } | undefined)?.label;
+  return typeof label === "string" && label.length > 0 ? label : undefined;
+});
+
+watch(activeTab, (newTab, oldTab) => {
+  if (newTab === "output-schema" && oldTab !== "output-schema") {
+    emit("request-save");
+  }
+});
+
+const localSettings = ref<
+  Pick<NodeBase, "cache_results" | "description" | "node_reference" | "execution_location">
+>({
+  cache_results: props.modelValue?.cache_results ?? false,
+  description: props.modelValue?.description ?? "",
+  node_reference: props.modelValue?.node_reference ?? "",
+  execution_location: props.modelValue?.execution_location ?? "auto",
+});
+
+// A listing that fails leaves auto, worker and the node's own value.
+const backendRows = ref<BackendRow[]>([]);
+onMounted(async () => {
+  try {
+    backendRows.value = await listComputeBackends();
+  } catch {
+    backendRows.value = [];
+  }
+});
+const locationOptions = computed(() =>
+  nodeExecutionLocationOptions(localSettings.value.execution_location ?? "auto", backendRows.value),
+);
+const selectedBackend = computed(() =>
+  backendRows.value.find((backend) => backend.id === localSettings.value.execution_location),
+);
+
+// Core's preview reads the saved setting, so the note waits while another backend is picked but not saved.
+const resultsStore = useResultsStore();
+const placementNote = computed(() => {
+  const saved = props.modelValue?.execution_location ?? "auto";
+  if ((localSettings.value.execution_location ?? "auto") !== saved) return null;
+  return nodePlacementNote(
+    resultsStore.placements[flowStore.flowId],
+    props.modelValue.node_id,
+    saved !== "auto",
+  );
+});
+
+const outputFieldConfig = reactive<OutputFieldConfig>(
+  props.modelValue?.output_field_config ?? {
+    enabled: false,
+    validation_mode_behavior: "select_only",
+    fields: [],
+    validate_data_types: false,
+  },
+);
+
+watch(
+  () => props.modelValue,
+  (newValue) => {
+    if (newValue) {
+      localSettings.value = {
+        cache_results: newValue.cache_results,
+        description: newValue.description ?? "",
+        node_reference: newValue.node_reference ?? "",
+        execution_location: newValue.execution_location ?? "auto",
+      };
+
+      if (newValue.output_field_config) {
+        Object.assign(outputFieldConfig, newValue.output_field_config);
+      }
+    }
+  },
+  { deep: true },
+);
+
+const handleSettingChange = () => {
+  emit("update:model-value", {
+    ...props.modelValue,
+    cache_results: localSettings.value.cache_results,
+    description: localSettings.value.description,
+    node_reference: localSettings.value.node_reference,
+    execution_location: localSettings.value.execution_location,
+    output_field_config: outputFieldConfig.enabled ? outputFieldConfig : null,
+  });
+};
+
+const handleDescriptionChange = (value: string) => {
+  nodeStore.updateNodeDescription(props.modelValue.node_id, value);
+  handleSettingChange();
+};
+
+const validateReferenceLocally = (value: string): string | null => {
+  if (!value || value === "") {
+    return null; // Empty is valid (uses default)
+  }
+  if (value !== value.toLowerCase()) {
+    return "Reference must be lowercase";
+  }
+  if (/\s/.test(value)) {
+    return "Reference cannot contain spaces";
+  }
+  if (!/^[a-z][a-z0-9_]*$/.test(value)) {
+    return "Reference must start with a letter and contain only lowercase letters, numbers, and underscores";
+  }
+  return null;
+};
+
+const handleReferenceInput = (value: string) => {
+  if (validationTimeout) {
+    clearTimeout(validationTimeout);
+  }
+
+  const localError = validateReferenceLocally(value);
+  if (localError) {
+    referenceError.value = localError;
+    return;
+  }
+
+  referenceError.value = null;
+  if (value && value !== "") {
+    isValidatingReference.value = true;
+    validationTimeout = setTimeout(async () => {
+      try {
+        const result = await nodeStore.validateNodeReference(props.modelValue.node_id, value);
+        if (!result.valid) {
+          referenceError.value = result.error;
+        } else {
+          referenceError.value = null;
+        }
+      } catch (error) {
+        console.error("Error validating reference:", error);
+      } finally {
+        isValidatingReference.value = false;
+      }
+    }, 300);
+  }
+};
+
+const handleReferenceBlur = async () => {
+  if (validationTimeout) {
+    clearTimeout(validationTimeout);
+  }
+
+  const value = localSettings.value.node_reference || "";
+
+  const localError = validateReferenceLocally(value);
+  if (localError) {
+    referenceError.value = localError;
+    return;
+  }
+
+  if (value !== "") {
+    isValidatingReference.value = true;
+    try {
+      const result = await nodeStore.validateNodeReference(props.modelValue.node_id, value);
+      if (!result.valid) {
+        referenceError.value = result.error;
+        return;
+      }
+    } catch (error) {
+      console.error("Error validating reference:", error);
+      return;
+    } finally {
+      isValidatingReference.value = false;
+    }
+  }
+
+  if (!referenceError.value) {
+    try {
+      await nodeStore.setNodeReference(props.modelValue.node_id, value);
+      handleSettingChange();
+    } catch (error: any) {
+      referenceError.value = error.message || "Failed to save reference";
+    }
+  }
+};
+
+const handleOutputConfigChange = () => {
+  handleSettingChange();
+};
+
+const hasSchema = computed(() => {
+  return outputFieldConfig.fields.length > 0;
+});
+
+const addField = () => {
+  outputFieldConfig.fields.push({
+    name: "",
+    data_type: "String",
+    default_value: null,
+  });
+  handleOutputConfigChange();
+};
+
+const removeField = (index: number) => {
+  outputFieldConfig.fields.splice(index, 1);
+  handleOutputConfigChange();
+};
+
+const loadFieldsFromSchema = async () => {
+  try {
+    if (!props.modelValue || !props.modelValue.node_id) {
+      console.error("Cannot load schema: Invalid or missing node data");
+      return;
+    }
+
+    isLoadingSchema.value = true;
+
+    const saveResult = emit("request-save");
+
+    if (saveResult instanceof Promise) {
+      await saveResult;
+    }
+
+    // Give the backend a moment to process and update the schema
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    // Auto-detect needs the node's computed output schema, so opt back into
+    // include_output (settings opens skip it for speed).
+    const nodeData = await nodeStore.getNodeData(props.modelValue.node_id, false, true);
+
+    if (nodeData?.main_output?.table_schema) {
+      outputFieldConfig.fields = nodeData.main_output.table_schema.map((col: any) => ({
+        name: col.name,
+        data_type: col.data_type,
+        default_value: null,
+      }));
+      handleOutputConfigChange();
+    }
+  } catch (error) {
+    console.error("Error loading schema:", error);
+  } finally {
+    isLoadingSchema.value = false;
+  }
+};
+</script>
+
+<style scoped>
+.prediction-warning-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--spacing-2, 8px);
+  margin: var(--spacing-2, 8px) var(--spacing-2, 8px) 0;
+  padding: var(--spacing-2, 8px) var(--spacing-3, 12px);
+  border: 1px solid var(--color-warning);
+  border-radius: 6px;
+  background: var(--color-warning-light);
+  font-size: var(--font-size-xs, 12px);
+  color: var(--color-warning-dark);
+}
+
+.prediction-warning-banner__icon {
+  font-size: 16px;
+  line-height: 1.3;
+}
+
+.prediction-warning-banner__text {
+  flex: 1;
+}
+
+.settings-wrapper {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  position: relative;
+}
+
+.ai-inline-actions-trigger {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  z-index: 10;
+}
+
+.ai-inline-actions-trigger__button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--el-border-color-lighter);
+  background-color: var(--el-bg-color);
+  border-radius: 50%;
+  cursor: pointer;
+  color: var(--el-color-primary);
+  transition:
+    background-color 0.12s ease,
+    border-color 0.12s ease;
+}
+
+.ai-inline-actions-trigger__button:hover {
+  background-color: var(--el-color-primary-light-9);
+  border-color: var(--el-color-primary-light-5);
+}
+
+.ai-inline-actions-trigger__icon {
+  font-size: 0.95rem;
+}
+
+.settings-wrapper :deep(.el-tabs) {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+.settings-wrapper :deep(.el-tabs__header) {
+  flex-shrink: 0;
+}
+
+.settings-wrapper :deep(.el-tabs__content) {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.settings-wrapper :deep(.el-tab-pane) {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+}
+
+/* Tab panes that hold a single .settings-section render a form whose natural
+   height is shorter than the pane — keep the section pinned to the top
+   instead of stretching it. */
+.settings-section {
+  background-color: var(--el-bg-color-page);
+  border-radius: 8px;
+  padding: 1.25rem;
+  margin-top: 1rem;
+  flex-shrink: 0;
+}
+
+.setting-group {
+  margin-bottom: 1.5rem;
+  padding-bottom: 1.25rem;
+  border-bottom: 1px solid var(--el-border-color-lighter);
+}
+
+.setting-group:last-child {
+  border-bottom: none;
+  margin-bottom: 0;
+  padding-bottom: 0;
+}
+
+.setting-header {
+  margin-bottom: 0.75rem;
+}
+
+.setting-title {
+  display: block;
+  font-weight: 500;
+  margin-bottom: 0.25rem;
+}
+
+.setting-description {
+  display: block;
+  font-size: 0.875rem;
+  color: var(--el-text-color-secondary);
+}
+
+.setting-description-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.info-icon {
+  color: var(--el-text-color-secondary);
+  cursor: help;
+  font-size: 1rem;
+}
+
+.setting-description {
+  flex-grow: 1;
+}
+
+.execution-location-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.execution-location-select {
+  flex: 1;
+  min-width: 0;
+}
+
+.manage-backends-link {
+  font-size: 0.8rem;
+  color: var(--el-color-primary);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.manage-backends-link:hover {
+  text-decoration: underline;
+}
+
+.placement-note {
+  margin: 0.5rem 0 0;
+  padding: 0.4rem 0.6rem;
+  font-size: 0.75rem;
+  line-height: 1.4;
+  white-space: pre-line;
+  border-left: 3px solid var(--el-color-warning);
+  color: var(--el-text-color-regular);
+}
+
+.placement-note--refused {
+  border-left-color: var(--el-color-danger);
+}
+
+.validation-error {
+  margin-top: 0.5rem;
+  font-size: 0.75rem;
+  color: var(--el-color-danger);
+}
+
+.validation-loading {
+  margin-top: 0.5rem;
+  font-size: 0.75rem;
+  color: var(--el-text-color-secondary);
+}
+
+:deep(.el-input.is-error .el-input__wrapper) {
+  box-shadow: 0 0 0 1px var(--el-color-danger) inset;
+}
+
+.no-fields {
+  padding: 1rem;
+  text-align: center;
+  color: var(--el-text-color-secondary);
+  background-color: var(--el-fill-color-lighter);
+  border-radius: 4px;
+  margin-top: 1rem;
+}
+
+.tip {
+  padding: 0.5rem 1rem;
+  text-align: left;
+  color: var(--el-text-color-secondary);
+  background-color: var(--el-fill-color-lighter);
+  border-radius: 4px;
+  margin-top: 1rem;
+}
+</style>

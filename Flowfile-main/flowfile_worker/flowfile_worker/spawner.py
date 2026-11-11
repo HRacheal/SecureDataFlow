@@ -1,0 +1,487 @@
+import gc
+import os
+import queue as _queue
+import threading
+from base64 import b64encode
+from collections.abc import Callable
+from multiprocessing import Process
+from multiprocessing.queues import Queue
+from time import monotonic, sleep
+from typing import Any
+
+from polars.exceptions import PanicException
+
+from flowfile_worker import funcs, models, mp_context, pool, status_dict, status_dict_lock
+from flowfile_worker.pool import PoolMember
+from flowfile_worker.process_manager import ProcessManager
+from flowfile_worker.task_errors import keeping_failures, record_task_failure, split_failure
+
+process_manager = ProcessManager()
+
+# True runs every job in this process (a library host), False in a child (a serving host).
+in_process: bool = False
+
+flowfile_node_id_type = int | str
+
+# Bounds the result drain: a wedged child cannot hang the monitor, and a large payload still flushes.
+RESULT_QUEUE_TIMEOUT = 30.0
+
+# Poll backoff: fast at first, capped at 1.0s so long-running jobs do not busy-wait.
+_POLL_INITIAL_DELAY = 0.01
+_POLL_MAX_DELAY = 1.0
+_POLL_BACKOFF = 1.5
+
+# Wall-clock limit per task, so a wedged child cannot spin the monitor forever; 0 disables.
+_TASK_TIMEOUT = float(os.environ.get("FLOWFILE_WORKER_TASK_TIMEOUT", "3600"))
+
+
+def drain_result_queue(q: Queue, p: Process, timeout: float = RESULT_QUEUE_TIMEOUT):
+    """Read the single result a child puts on *q*, draining BEFORE the caller joins *p*.
+
+    A child that put() a payload larger than the OS pipe buffer (~64 KB) blocks in its
+    feeder thread until the parent reads it, so joining first would deadlock. Poll instead
+    of a single long get() so we bail the instant the child exits without a result (e.g. it
+    crashed after signalling completion but before put()), independent of put/signal order.
+    """
+    deadline = monotonic() + timeout
+    while True:
+        try:
+            return q.get(timeout=0.1)
+        except _queue.Empty:
+            if not p.is_alive():
+                # Child exited: any put() has been flushed. One last non-blocking read.
+                try:
+                    return q.get_nowait()
+                except _queue.Empty:
+                    return None
+            if monotonic() >= deadline:
+                return None
+
+
+def unpack_result(result):
+    """store/generic_task put (payload, row_count); every other op puts a bare payload."""
+    if isinstance(result, tuple) and len(result) == 2:
+        return result
+    return result, None
+
+
+def drain_member_envelope(q: Queue, p: Process) -> tuple[bool, Any]:
+    """Drain a pool member's completion envelope with a hard wall-clock bound.
+
+    q.get()'s timeout only bounds the poll, not the recv: a member terminated
+    mid-put (a raced /cancel_task) can leave a partial message that would block
+    the recv unboundedly, so the drain runs on a watchdog thread. No envelope
+    within the bound marks the member unfit for reuse.
+    """
+    box: list = []
+    watchdog = threading.Thread(target=lambda: box.append(drain_result_queue(q, p)), daemon=True)
+    watchdog.start()
+    watchdog.join(RESULT_QUEUE_TIMEOUT + 5.0)
+    if not box:
+        return False, None
+    return pool.unwrap_envelope(box[0])
+
+
+def handle_task(
+    task_id: str,
+    p: Process,
+    progress: mp_context.Value,
+    error_message: mp_context.Array,
+    q: Queue,
+    member: PoolMember | None = None,
+):
+    """
+    Monitors and manages a running process task, updating its status and handling completion/errors.
+
+    Args:
+        task_id (str): Unique identifier for the task
+        p (Process): The multiprocessing Process object being monitored
+        progress (mp_context.Value): Shared value object tracking task progress (0-100)
+        error_message (mp_context.Array): Shared array for storing error messages
+        q (Queue): Queue for storing task results
+        member (PoolMember | None): Set when *p* is a leased pool member. It puts one completion
+            envelope per task, on error too, which is drained rather than joined mid-task. A member
+            that was cancelled, timed out or died is not drained, since a killed writer's partial
+            envelope can block the read. Instead of the terminate/join teardown the member is
+            checked back in, reusable only if the envelope arrived.
+
+    Notes:
+        - Updates task status in status_dict while process is running
+        - An entry marked ``Cancelled`` while still ``Starting`` stays so, and the first poll stops the child
+        - A failure ends ``Error`` with progress -1 even when the child exits before the loop sees the -1
+        - Handles task cancellation, completion, and error states
+        - Cleans up process resources after completion
+    """
+    envelope_received = False
+    try:
+        with status_dict_lock:
+            if status_dict[task_id].status != "Cancelled":
+                status_dict[task_id].status = "Processing"
+
+        delay = _POLL_INITIAL_DELAY
+        deadline = (monotonic() + _TASK_TIMEOUT) if _TASK_TIMEOUT else None
+        timed_out = False
+        while p.is_alive():
+            with progress.get_lock():
+                current_progress = progress.value
+            with status_dict_lock:
+                status_dict[task_id].progress = current_progress
+
+                if status_dict[task_id].status == "Cancelled":
+                    p.terminate()
+                    break
+
+            if current_progress == -1:
+                with status_dict_lock:
+                    status_dict[task_id].status = "Error"
+                    with error_message.get_lock():
+                        kind, msg = split_failure(error_message.value.decode(errors="replace").rstrip("\x00"))
+                    status_dict[task_id].error_message = msg
+                    status_dict[task_id].error_kind = kind
+                break
+
+            # A child blocked on a large put() never exits, so stop here; the drain below unblocks it.
+            if current_progress == 100:
+                break
+
+            if deadline is not None and monotonic() > deadline:
+                timed_out = True
+                p.terminate()
+                break
+
+            sleep(delay)
+            delay = min(delay * _POLL_BACKOFF, _POLL_MAX_DELAY)
+
+        with status_dict_lock:
+            cancelled = status_dict[task_id].status == "Cancelled"
+        with progress.get_lock():
+            final_progress = progress.value
+
+        # Drain before joining (see drain_result_queue); errors travel in the shared Array, not the queue.
+        result = None
+        number_of_records = None
+        if member is not None:
+            # Unmap first so a stale /cancel_task cannot terminate a reusable member.
+            process_manager.remove_process(task_id)
+            if not cancelled and not timed_out and final_progress in (100, -1):
+                envelope_received, payload = drain_member_envelope(q, p)
+                if final_progress == 100:
+                    result, number_of_records = unpack_result(payload)
+        else:
+            if not cancelled and final_progress == 100:
+                result, number_of_records = unpack_result(drain_result_queue(q, p))
+            p.join()
+
+        with status_dict_lock:
+            status = status_dict[task_id]
+            if status.status != "Cancelled":
+                if final_progress == 100:
+                    status.status = "Completed"
+                    if number_of_records is not None:
+                        status.number_of_records = number_of_records
+                    if result is not None:
+                        # b64-encode bytes for JSON-safe storage in status_dict (REST responses)
+                        if isinstance(result, bytes):
+                            status.results = b64encode(result).decode("ascii")
+                        else:
+                            status.results = result
+                elif timed_out:
+                    status.status = "Error"
+                    status.error_message = f"Task exceeded the {_TASK_TIMEOUT:.0f}s time limit and was terminated"
+                    status.error_kind = "environment"
+                elif final_progress == -1:
+                    status.status = "Error"
+                    status.progress = -1
+                    if not status.error_message:
+                        with error_message.get_lock():
+                            decoded = error_message.value.decode(errors="replace").rstrip("\x00")
+                        status.error_kind, decoded = split_failure(decoded)
+                        status.error_message = decoded or "Task failed"
+                else:
+                    status.status = "Unknown Error"
+
+    finally:
+        if member is not None:
+            pool.task_pool.checkin(member, reusable=envelope_received)
+        else:
+            if p.is_alive():
+                p.terminate()
+            p.join()
+        process_manager.remove_process(task_id)
+        del p, progress, error_message
+        gc.collect(0)
+
+
+def run_inline(task_id: str, target: Callable, kwargs: dict) -> None:
+    """Run *target* in this process as job *task_id* and write how it ended in ``status_dict`` as ``handle_task`` does.
+
+    The ``in_process`` mode. *target* gets a child's three primitives, its queue a ``pool._ResultSlot``. There is no
+    monitor, time limit or cancel, by design: a job marked ``Cancelled`` keeps the mark and runs to its end. An
+    escaping ``Exception`` or Polars ``PanicException`` is recorded and ends the job ``Error``. Any other
+    ``BaseException`` propagates. An ``Error`` job keeps the recorded exception on ``Status._raised``.
+    """
+    progress = mp_context.Value("i", 0)
+    error_message = mp_context.Array("c", 1024)
+    slot = pool._ResultSlot()
+    with status_dict_lock:
+        if status_dict[task_id].status != "Cancelled":
+            status_dict[task_id].status = "Processing"
+    with keeping_failures() as failures:
+        try:
+            target(**kwargs, progress=progress, error_message=error_message, queue=slot)
+        except (Exception, PanicException) as e:
+            record_task_failure(error_message, progress, e)
+    with progress.get_lock():
+        final_progress = progress.value
+    with status_dict_lock:
+        status = status_dict[task_id]
+        if status.status == "Cancelled":
+            return
+        status.progress = final_progress
+        if final_progress == 100:
+            status.status = "Completed"
+            result, number_of_records = unpack_result(slot.item)
+            if number_of_records is not None:
+                status.number_of_records = number_of_records
+            if result is not None:
+                status.results = b64encode(result).decode("ascii") if isinstance(result, bytes) else result
+        elif final_progress == -1:
+            status.status = "Error"
+            with error_message.get_lock():
+                decoded = error_message.value.decode(errors="replace").rstrip("\x00")
+            status.error_kind, decoded = split_failure(decoded)
+            status.error_message = decoded or "Task failed"
+            status._raised = failures[-1] if failures else None
+        else:
+            status.status = "Unknown Error"
+
+
+def _launch(task_id: str, target: Callable, kwargs: dict) -> None:
+    """Run *target* with *kwargs* as job *task_id*: in this process when the host set ``in_process``, else in a spawned
+    child given the three primitives and monitored by ``handle_task``."""
+    if in_process:
+        run_inline(task_id, target, kwargs)
+        return
+    progress = mp_context.Value("i", 0)
+    error_message = mp_context.Array("c", 1024)
+    q = mp_context.Queue(maxsize=1)
+    p: Process = mp_context.Process(
+        target=target, kwargs={**kwargs, "progress": progress, "error_message": error_message, "queue": q}
+    )
+    p.start()
+    process_manager.add_process(task_id, p)
+    handle_task(task_id=task_id, p=p, progress=progress, error_message=error_message, q=q)
+
+
+def start_process(
+    polars_serializable_object: bytes,
+    task_id: str,
+    operation: models.OperationType,
+    file_ref: str,
+    flowfile_flow_id: int,
+    flowfile_node_id: flowfile_node_id_type,
+    kwargs: dict = None,
+) -> None:
+    """
+    Starts a new process for handling Polars dataframe operations.
+
+    Args:
+        polars_serializable_object (bytes): Serialized Polars dataframe
+        task_id (str): Unique identifier for the task
+        operation (models.OperationType): Type of operation to perform
+        file_ref (str): Reference to the file being processed
+        kwargs (dict, optional): Additional arguments for the operation. Defaults to {}
+        flowfile_flow_id: id of the flow that started the process
+        flowfile_node_id: id of the node that started the process
+
+    Notes:
+        - Runs the operation in this process instead (``run_inline``) when the host set ``in_process``
+        - Leases a warm pool member when the pool is on and the operation is poolable
+        - Otherwise creates shared memory objects and spawns a fresh process (default)
+        - Delegates to handle_task for process monitoring either way
+    """
+    if kwargs is None:
+        kwargs = {}
+    kwargs["polars_serializable_object"] = polars_serializable_object
+    kwargs["file_path"] = file_ref
+    kwargs["flowfile_flow_id"] = flowfile_flow_id
+    kwargs["flowfile_node_id"] = flowfile_node_id
+
+    member = None if in_process else pool.task_pool.acquire(operation)
+    if member is not None:
+        try:
+            member.submit(operation, kwargs)
+            process_manager.add_process(task_id, member.process)
+        except Exception:
+            # A failed lease must not leak the slot; handle_task owns checkin after this.
+            pool.task_pool.checkin(member, reusable=False)
+            raise
+        handle_task(
+            task_id=task_id,
+            p=member.process,
+            progress=member.progress,
+            error_message=member.error_message,
+            q=member.result_q,
+            member=member,
+        )
+        return
+
+    _launch(task_id, getattr(funcs, operation), kwargs)
+
+
+def start_generic_process(
+    func_ref: callable,
+    task_id: str,
+    file_ref: str,
+    flowfile_flow_id: int,
+    flowfile_node_id: flowfile_node_id_type,
+    kwargs: dict = None,
+) -> None:
+    """
+    Starts a new process for handling generic function execution.
+
+    Args:
+        func_ref (callable): Reference to the function to be executed
+        task_id (str): Unique identifier for the task
+        file_ref (str): Reference to the file being processed
+        flowfile_flow_id: id of the flow that started the process
+        flowfile_node_id: id of the node that started the process
+        kwargs (dict, optional): Additional arguments for the function. Defaults to None.
+
+    Notes:
+        - Creates shared memory objects for progress tracking and error handling
+        - Initializes and starts a new process for the generic function
+        - Delegates to handle_task for process monitoring
+    """
+    kwargs = {} if kwargs is None else kwargs
+    kwargs["func"] = func_ref
+    kwargs["file_path"] = file_ref
+    kwargs["flowfile_flow_id"] = flowfile_flow_id
+    kwargs["flowfile_node_id"] = flowfile_node_id
+    _launch(task_id, funcs.generic_task, kwargs)
+
+
+def start_train_model_process(
+    polars_serializable_object: bytes,
+    task_id: str,
+    file_ref: str,
+    model_type: str,
+    target_column: str,
+    feature_columns: list[str],
+    params: dict,
+    staging_path: str,
+    flowfile_flow_id: int,
+    flowfile_node_id: flowfile_node_id_type,
+) -> None:
+    """Spawn the training subprocess.
+
+    Mirrors :func:`start_fuzzy_process`. The trained-model bytes are written to
+    *staging_path*; ``handle_task`` will surface ``{sha256, size_bytes, model_type}``
+    via the queue so core can finalise the artifact upload.
+    """
+    kwargs = {
+        "polars_serializable_object": polars_serializable_object,
+        "file_path": file_ref,
+        "model_type": model_type,
+        "target_column": target_column,
+        "feature_columns": feature_columns,
+        "params": params or {},
+        "staging_path": staging_path,
+        "flowfile_flow_id": flowfile_flow_id,
+        "flowfile_node_id": flowfile_node_id,
+    }
+    _launch(task_id, funcs.train_model_task, kwargs)
+
+
+def start_apply_model_process(
+    polars_serializable_object: bytes,
+    task_id: str,
+    file_ref: str,
+    model_path: str,
+    output_column: str,
+    flowfile_flow_id: int,
+    flowfile_node_id: flowfile_node_id_type,
+) -> None:
+    """Spawn the apply-model subprocess.
+
+    Writes the scored data to *file_ref* (IPC). ``handle_task`` will surface the
+    serialised LazyFrame via the queue so core can deserialise it.
+    """
+    kwargs = {
+        "polars_serializable_object": polars_serializable_object,
+        "file_path": file_ref,
+        "model_path": model_path,
+        "output_column": output_column,
+        "flowfile_flow_id": flowfile_flow_id,
+        "flowfile_node_id": flowfile_node_id,
+    }
+    _launch(task_id, funcs.apply_model_task, kwargs)
+
+
+def start_fuzzy_process(
+    left_serializable_object: bytes,
+    right_serializable_object: bytes,
+    file_ref: str,
+    fuzzy_maps: list[models.FuzzyMapping],
+    task_id: str,
+    flowfile_flow_id: int,
+    flowfile_node_id: flowfile_node_id_type,
+) -> None:
+    """
+    Starts a new process for performing fuzzy joining operations on two datasets.
+
+    Args:
+        left_serializable_object (bytes): Serialized left dataframe
+        right_serializable_object (bytes): Serialized right dataframe
+        file_ref (str): Reference to the file being processed
+        fuzzy_maps (List[models.FuzzyMapping]): List of fuzzy mapping configurations
+        task_id (str): Unique identifier for the task
+        flowfile_flow_id: id of the flow that started the process
+        flowfile_node_id: id of the node that started the process
+    Notes:
+        - Creates shared memory objects for progress tracking and error handling
+        - Initializes and starts a new process for fuzzy joining operation
+        - Delegates to handle_task for process monitoring
+    """
+    _launch(
+        task_id,
+        funcs.fuzzy_join_task,
+        {
+            "left_serializable_object": left_serializable_object,
+            "right_serializable_object": right_serializable_object,
+            "fuzzy_maps": fuzzy_maps,
+            "file_path": file_ref,
+            "flowfile_flow_id": flowfile_flow_id,
+            "flowfile_node_id": flowfile_node_id,
+        },
+    )
+
+
+def start_custom_node_process(
+    custom_node_input: "models.CustomNodeExecuteInput",
+    file_ref: str,
+    task_id: str,
+) -> None:
+    """Spawn the custom-node subprocess.
+
+    Mirrors :func:`start_fuzzy_process`; the child target lives in
+    ``custom_node_runner`` and puts a JSON payload with output paths /
+    row counts (plus preview + logs for dry runs) on the queue.
+    """
+    from flowfile_worker import custom_node_runner
+
+    kwargs = {
+        "node_source": custom_node_input.node_source,
+        "class_name": custom_node_input.class_name,
+        "settings_values": custom_node_input.settings_values,
+        "secrets": custom_node_input.secrets,
+        "inputs": list(custom_node_input.inputs),
+        "output_names": custom_node_input.output_names,
+        "dry_run": custom_node_input.dry_run,
+        "row_limit": custom_node_input.row_limit,
+        "user_id": custom_node_input.user_id,
+        "file_path": file_ref,
+        "flowfile_flow_id": custom_node_input.flowfile_flow_id,
+        "flowfile_node_id": custom_node_input.flowfile_node_id,
+    }
+    _launch(task_id, custom_node_runner.execute_custom_node_task, kwargs)

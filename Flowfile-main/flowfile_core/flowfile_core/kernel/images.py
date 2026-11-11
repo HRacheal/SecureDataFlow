@@ -1,0 +1,79 @@
+"""Kernel image tags and their env overrides — pure, Docker-free.
+
+Split out of ``manager.py`` so ``matching.py`` can ask which image tag a flavour
+resolves to without importing the docker SDK. ``manager.py`` re-exports every
+name here, so it stays the place to look for image *resolution* (which needs a
+docker client); this module only knows the configured tags.
+"""
+
+import os
+
+from packaging.version import InvalidVersion, Version
+
+from flowfile_core.kernel.models import ImageFlavour
+from shared._version import get_version
+
+_KERNEL_IMAGE_BASE_DEFAULT = "edwardvaneechoud/flowfile-kernel-base:0.6.4"
+_KERNEL_IMAGE_ML_DEFAULT = "edwardvaneechoud/flowfile-kernel-ml:0.6.4"
+_KERNEL_IMAGE_LITE_DEFAULT = "edwardvaneechoud/flowfile-kernel-lite:0.6.4"
+# The notebook image bakes this app's flowfile, so its tag is the app version, not the kernel's.
+_KERNEL_IMAGE_NOTEBOOK_REPO = "edwardvaneechoud/flowfile-kernel-notebook"
+
+
+def _envvar_or_default(name: str, default: str) -> str:
+    """Read an env var, treating unset OR empty/whitespace as 'use default'.
+
+    Compose's ``${VAR:-}`` writes an empty string into the container when the
+    host hasn't set the var; treat that the same as 'unset' so we fall back to
+    the registry default instead of trying to ``docker run ""``.
+    """
+    return (os.environ.get(name) or "").strip() or default
+
+
+# FLOWFILE_KERNEL_IMAGE is the legacy override for the base image (kept for
+# backwards compatibility). FLOWFILE_KERNEL_IMAGE_BASE / _ML let an operator
+# pin each flavour to a specific tag (or their own registry). Reads happen at
+# lookup time, not module-import time, so the env var can be set after Python
+# starts (e.g. by a container entrypoint, or a pytest step env block) without
+# poisoning the rest of the process with the default value.
+def _kernel_image_base() -> str:
+    return _envvar_or_default(
+        "FLOWFILE_KERNEL_IMAGE_BASE",
+        _envvar_or_default("FLOWFILE_KERNEL_IMAGE", _KERNEL_IMAGE_BASE_DEFAULT),
+    )
+
+
+def _kernel_image_ml() -> str:
+    return _envvar_or_default("FLOWFILE_KERNEL_IMAGE_ML", _KERNEL_IMAGE_ML_DEFAULT)
+
+
+def _kernel_image_lite() -> str:
+    return _envvar_or_default("FLOWFILE_KERNEL_IMAGE_LITE", _KERNEL_IMAGE_LITE_DEFAULT)
+
+
+def _kernel_image_notebook() -> str:
+    return _envvar_or_default("FLOWFILE_KERNEL_IMAGE_NOTEBOOK", f"{_KERNEL_IMAGE_NOTEBOOK_REPO}:{get_version()}")
+
+
+def _flavour_images() -> dict[ImageFlavour, str]:
+    return {
+        ImageFlavour.BASE: _kernel_image_base(),
+        ImageFlavour.ML: _kernel_image_ml(),
+        ImageFlavour.LITE: _kernel_image_lite(),
+        ImageFlavour.NOTEBOOK: _kernel_image_notebook(),
+    }
+
+
+def parse_image_version(image_tag: str) -> Version | None:
+    """Parse the PEP 440 version of an image tag's ``:version`` suffix.
+
+    Prereleases parse and sort below their release (``0.24.0-rc.1`` < ``0.24.0``).
+    Returns None for tags without a version (e.g. ``:local``, digests), so callers
+    can skip update comparisons for non-release images.
+    """
+    if ":" not in image_tag:
+        return None
+    try:
+        return Version(image_tag.rsplit(":", 1)[1])
+    except InvalidVersion:
+        return None

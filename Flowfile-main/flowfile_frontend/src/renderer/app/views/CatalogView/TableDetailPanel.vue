@@ -1,0 +1,1355 @@
+<template>
+  <div class="table-detail">
+    <button class="back-btn" @click="emit('close')">
+      <i class="fa-solid fa-arrow-left"></i> Back
+    </button>
+    <!-- Header -->
+    <div class="detail-header">
+      <div class="header-main">
+        <div class="header-title">
+          <i
+            :class="
+              table.table_type === 'virtual'
+                ? 'fa-solid fa-bolt header-icon virtual-header-icon'
+                : 'fa-solid fa-table header-icon'
+            "
+          ></i>
+          <h2>{{ table.name }}</h2>
+          <span
+            v-if="table.table_type === 'virtual' && table.sql_query"
+            class="virtual-badge sql-virtual-badge"
+            >SQL Virtual</span
+          >
+          <span v-else-if="table.table_type === 'virtual'" class="virtual-badge">Virtual</span>
+          <span v-if="table.scd2" class="scd2-badge" title="Slowly changing dimension (type 2)"
+            >SCD2</span
+          >
+          <SharedBadge :access="table.access" />
+        </div>
+        <p v-if="table.description" class="description">{{ table.description }}</p>
+      </div>
+      <div class="header-actions">
+        <button
+          class="action-btn-lg"
+          :disabled="!table.file_exists"
+          @click="emit('queryTable', table.qualified_name ?? table.full_table_name ?? table.name)"
+        >
+          <i class="fa-solid fa-code"></i>
+          Query table
+        </button>
+        <button
+          v-if="table.table_type === 'virtual' && table.sql_query"
+          class="action-btn-lg"
+          :title="
+            canManage(table)
+              ? 'Edit this virtual table\'s SQL; saving updates the table'
+              : 'Open this virtual table\'s SQL as a draft (read-only access)'
+          "
+          @click="emit('editSql', { table, link: canManage(table) })"
+        >
+          <i class="fa-solid fa-pen-to-square"></i>
+          {{ canManage(table) ? "Edit SQL" : "Open SQL" }}
+        </button>
+        <button
+          class="action-btn-lg"
+          :class="{ active: table.is_favorite }"
+          @click="emit('toggleTableFavorite', table.id)"
+        >
+          <i :class="table.is_favorite ? 'fa-solid fa-star' : 'fa-regular fa-star'"></i>
+          {{ table.is_favorite ? "Favorited" : "Favorite" }}
+        </button>
+        <TableMaintenance v-if="table.table_type !== 'virtual'" :table="table" />
+        <button
+          v-if="canShare(table)"
+          class="action-btn-lg"
+          title="Share table"
+          @click="showShareDialog = true"
+        >
+          <i class="fa-solid fa-share-nodes"></i>
+          Share
+        </button>
+        <button
+          v-if="canManage(table)"
+          class="btn btn-danger btn-sm"
+          title="Delete table"
+          @click="emit('deleteTable', table.id)"
+        >
+          <i class="fa-solid fa-trash"></i>
+          Delete
+        </button>
+      </div>
+    </div>
+
+    <ShareDialog
+      v-model="showShareDialog"
+      resource-type="catalog_table"
+      :resource-id="table.id"
+      :resource-name="table.name"
+      :can-manage-grants="canManageGrants(table)"
+    />
+
+    <TableEditorDialog
+      v-if="showTableEditor"
+      v-model="showTableEditor"
+      :table="table"
+      @saved="emit('editsSaved', $event)"
+    />
+
+    <!-- File missing banner (physical tables only) -->
+    <div v-if="table.table_type !== 'virtual' && !table.file_exists" class="missing-banner">
+      <i class="fa-solid fa-triangle-exclamation"></i>
+      <div>
+        <strong>Table data not found</strong>
+        <p>
+          The data file for this table no longer exists on disk. Previews and queries will not work
+          until the data is regenerated or the table is re-registered.
+        </p>
+        <button
+          v-if="table.source_run_id"
+          class="btn btn-sm btn-primary recovery-btn"
+          @click="emit('recoverFromRun', table.source_run_id!)"
+        >
+          <i class="fa-solid fa-arrow-rotate-left"></i>
+          Recover source flow from snapshot
+        </button>
+      </div>
+    </div>
+
+    <!-- Metadata Grid -->
+    <div class="meta-grid">
+      <div class="meta-card">
+        <span class="meta-label">Rows</span>
+        <span class="meta-value">{{ formatNumber(table.row_count) }}</span>
+      </div>
+      <div class="meta-card">
+        <span class="meta-label">Columns</span>
+        <span class="meta-value">{{ table.column_count ?? "--" }}</span>
+      </div>
+      <div v-if="table.table_type !== 'virtual'" class="meta-card">
+        <span class="meta-label">Size</span>
+        <span class="meta-value">{{ formatSize(table.size_bytes) }}</span>
+      </div>
+      <div v-if="table.partition_columns && table.partition_columns.length > 0" class="meta-card">
+        <span class="meta-label">Partitioned by</span>
+        <span class="partition-chips">
+          <span v-for="col in table.partition_columns" :key="col" class="partition-chip">
+            {{ col }}
+          </span>
+        </span>
+      </div>
+      <div v-if="table.scd2" class="meta-card">
+        <span class="meta-label">SCD2 tracked by</span>
+        <el-popover placement="top-start" :width="320" trigger="hover" popper-class="scd2-popover">
+          <template #reference>
+            <span class="partition-chips scd2-summary">
+              <span v-for="key in table.scd2.business_keys" :key="key" class="partition-chip">
+                {{ key }}
+              </span>
+            </span>
+          </template>
+          <div class="scd2-popover-body">
+            <div class="scd2-popover-row">
+              <span class="scd2-popover-key">History columns</span>
+              <span class="scd2-popover-value">
+                {{ table.scd2.surrogate_key_column }} / {{ table.scd2.valid_from_column }} /
+                {{ table.scd2.valid_to_column }} / {{ table.scd2.is_current_column }}
+              </span>
+            </div>
+            <div class="scd2-popover-row">
+              <span class="scd2-popover-key">Full snapshot</span>
+              <span class="scd2-popover-value">{{ table.scd2.full_snapshot ? "Yes" : "No" }}</span>
+            </div>
+            <div class="scd2-popover-row">
+              <span class="scd2-popover-key">Compared columns</span>
+              <span class="scd2-popover-value">{{ table.scd2.compare_columns.join(", ") }}</span>
+            </div>
+          </div>
+        </el-popover>
+      </div>
+      <div v-if="table.table_type !== 'virtual'" class="meta-card">
+        <span class="meta-label">Change tracking</span>
+        <el-popover
+          v-if="table.cdc_enabled"
+          placement="top-start"
+          :width="400"
+          trigger="click"
+          popper-class="cdc-popover"
+          @show="loadCdcStatus"
+        >
+          <template #reference>
+            <span class="meta-value meta-link">
+              <i class="fa-solid fa-clock-rotate-left"></i>
+              <span class="meta-link-text">{{ cdcEnabledLabel }}</span>
+            </span>
+          </template>
+          <div class="cdc-popover-body">
+            <div v-if="cdcLoading" class="cdc-popover-empty">Loading cursors…</div>
+            <div v-else-if="cdcCursors.length === 0" class="cdc-popover-empty">
+              Nothing has read changes from this table yet.
+            </div>
+            <div v-for="c in cdcCursors" :key="c.consumer_key" class="cdc-cursor-row">
+              <div class="cdc-cursor-main">
+                <span class="cdc-cursor-name" :title="c.consumer_key">
+                  {{ c.consumer_label ?? c.consumer_key }}
+                </span>
+                <span class="cdc-cursor-meta">
+                  v{{ c.last_version }} · {{ pendingLabel(c.pending_commits) }}
+                </span>
+              </div>
+              <el-button text size="small" @click="resetCursor(c)">Reset</el-button>
+              <el-button text size="small" type="danger" @click="deleteCursor(c)">Delete</el-button>
+            </div>
+          </div>
+        </el-popover>
+        <span v-else class="meta-value meta-muted">Off</span>
+      </div>
+      <div class="meta-card">
+        <span class="meta-label">Created</span>
+        <span class="meta-value">{{ formatDate(table.created_at) }}</span>
+      </div>
+      <div
+        v-if="
+          table.table_type === 'virtual' &&
+          table.producer_registration_id &&
+          table.producer_registration_name
+        "
+        class="meta-card"
+      >
+        <span class="meta-label">Produced by</span>
+        <span
+          class="meta-value meta-link"
+          :title="table.producer_registration_name"
+          @click="emit('navigateToFlow', table.producer_registration_id)"
+        >
+          <i class="fa-solid fa-diagram-project"></i>
+          <span class="meta-link-text">{{ table.producer_registration_name }}</span>
+        </span>
+      </div>
+      <div
+        v-else-if="table.source_registration_id && table.source_registration_name"
+        class="meta-card"
+      >
+        <span class="meta-label">Produced by</span>
+        <span
+          class="meta-value meta-link"
+          :title="table.source_registration_name"
+          @click="emit('navigateToFlow', table.source_registration_id)"
+        >
+          <i class="fa-solid fa-diagram-project"></i>
+          <span class="meta-link-text">{{ table.source_registration_name }}</span>
+        </span>
+      </div>
+      <div v-if="table.prediction_table_id" class="meta-card">
+        <span class="meta-label">Scored by</span>
+        <span
+          v-if="table.prediction_table_name"
+          class="meta-value meta-static"
+          :title="table.prediction_table_name"
+        >
+          <i class="fa-solid fa-wand-magic-sparkles"></i>
+          <span class="meta-link-text">{{ table.prediction_table_name }}</span>
+        </span>
+        <span v-else class="meta-value meta-muted">Prediction table unavailable</span>
+      </div>
+      <div v-if="table.table_type === 'virtual' && !table.sql_query" class="meta-card">
+        <span class="meta-label">Optimization</span>
+        <span class="meta-value" :class="table.is_optimized ? 'optimized-badge' : ''">
+          {{ table.is_optimized ? "Optimized" : "Standard" }}
+        </span>
+      </div>
+      <div
+        v-if="table.laziness_blockers && table.laziness_blockers.length > 0"
+        class="laziness-blockers"
+      >
+        <span class="blockers-label">Nodes preventing optimization:</span>
+        <ul class="blocker-list">
+          <li v-for="(reason, i) in table.laziness_blockers" :key="i">{{ reason }}</li>
+        </ul>
+      </div>
+      <div
+        v-if="table.read_by_flows && table.read_by_flows.length > 0"
+        class="meta-card meta-card-clickable"
+        @click="showReadByModal = true"
+      >
+        <span class="meta-label">Read by</span>
+        <span class="meta-value">
+          {{ table.read_by_flows.length }} flow{{ table.read_by_flows.length !== 1 ? "s" : "" }}
+        </span>
+      </div>
+      <div v-if="tableHistory" class="meta-card">
+        <span class="meta-label">Version</span>
+        <span class="meta-value">{{ tableHistory.current_version }}</span>
+      </div>
+    </div>
+
+    <!-- SQL Definition (query-based virtual tables) -->
+    <div v-if="table.table_type === 'virtual' && table.sql_query" class="section">
+      <h3>SQL Definition</h3>
+      <pre class="sql-definition">{{ table.sql_query }}</pre>
+    </div>
+
+    <!-- Polars Query Plan (optimized virtual flow tables) -->
+    <div v-if="table.table_type === 'virtual' && table.polars_plan" class="section">
+      <h3>Polars Query Plan</h3>
+      <pre class="sql-definition">{{ table.polars_plan }}</pre>
+    </div>
+
+    <!-- Version History (physical tables only) -->
+    <div v-if="showVersionHistory" class="section">
+      <div class="section-header">
+        <h3>Version History</h3>
+        <div class="section-header-actions">
+          <span
+            v-if="historyStale"
+            class="history-stale-hint"
+            title="Cached more than 5 minutes ago — refresh to fetch the latest"
+            >may be stale</span
+          >
+          <el-button
+            v-if="hasHistory"
+            text
+            size="small"
+            :loading="loadingTableHistory"
+            title="Fetch latest version history"
+            @click="emit('refreshHistory')"
+          >
+            <i v-if="!loadingTableHistory" class="fa-solid fa-rotate-right"></i>
+          </el-button>
+        </div>
+      </div>
+      <div v-if="hasHistory" class="version-table-wrapper">
+        <table class="styled-table version-table">
+          <thead>
+            <tr>
+              <th>Version</th>
+              <th>Timestamp</th>
+              <th>Operation</th>
+              <th>Parameters</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr
+              v-for="entry in tableHistory!.history"
+              :key="entry.version"
+              class="version-row"
+              :class="{
+                'version-row-active': selectedVersion === entry.version,
+                'version-row-current': entry.version === tableHistory!.current_version,
+              }"
+              @click="emit('selectVersion', entry.version)"
+            >
+              <td class="version-number">
+                {{ entry.version }}
+                <span v-if="entry.version === tableHistory!.current_version" class="version-badge"
+                  >current</span
+                >
+              </td>
+              <td>{{ formatTimestamp(entry.timestamp) }}</td>
+              <td class="version-operation">{{ entry.operation ?? "--" }}</td>
+              <td class="version-params">
+                <span class="version-params-cell">
+                  {{ truncateParams(formatParams(entry.parameters)) }}
+                  <span
+                    v-if="formatParams(entry.parameters).length > 60"
+                    class="version-params-full"
+                  >
+                    {{ formatParams(entry.parameters) }}
+                  </span>
+                </span>
+              </td>
+              <td class="version-action">
+                <span
+                  v-if="entry.version !== tableHistory!.current_version"
+                  class="version-view-link"
+                  >view</span
+                >
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div v-else class="loading-state">Loading version history…</div>
+    </div>
+
+    <!-- Read by Flows Modal -->
+    <Teleport to="body">
+      <div v-if="showReadByModal" class="modal-overlay" @click.self="showReadByModal = false">
+        <div class="modal-container">
+          <div class="modal-header">
+            <h3 class="modal-title">Flows reading "{{ table.name }}"</h3>
+            <button class="modal-close" @click="showReadByModal = false">
+              <i class="fa-solid fa-xmark"></i>
+            </button>
+          </div>
+          <div class="modal-content">
+            <div
+              v-for="flow in table.read_by_flows"
+              :key="flow.id"
+              class="read-by-item"
+              @click="handleReadByClick(flow.id)"
+            >
+              <i class="fa-solid fa-diagram-project read-by-icon"></i>
+              <span>{{ flow.name }}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </Teleport>
+
+    <!-- Schema -->
+    <div v-if="table.schema_columns && table.schema_columns.length > 0" class="section">
+      <h3>Schema</h3>
+      <div class="schema-table-wrapper">
+        <table class="styled-table schema-table">
+          <thead>
+            <tr>
+              <th>Column</th>
+              <th>Type</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="col in table.schema_columns" :key="col.name">
+              <td class="col-name">{{ col.name }}</td>
+              <td class="col-type">{{ col.dtype }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Data Preview -->
+    <div class="section">
+      <div v-if="isViewingHistorical" class="version-banner">
+        <i class="fa-solid fa-clock-rotate-left"></i>
+        Viewing version {{ selectedVersion }}
+        <button class="version-banner-link" @click="emit('selectVersion', null)">
+          Back to latest
+        </button>
+      </div>
+      <div class="section-header">
+        <h3>Data Preview</h3>
+        <span v-if="preview" class="preview-info">
+          Showing {{ preview.rows.length }} of {{ preview.total_rows }} rows
+        </span>
+        <button
+          v-if="canEditData"
+          class="btn btn-sm btn-primary edit-data-btn"
+          title="Edit table data (cells, rows, columns) in place"
+          @click="showTableEditor = true"
+        >
+          <i class="fa-solid fa-pen-to-square"></i>
+          Edit data
+        </button>
+      </div>
+      <div v-if="loadingPreview" class="loading-state">Loading preview...</div>
+      <div v-else-if="previewError" class="preview-error">
+        <i class="fa-solid fa-triangle-exclamation"></i>
+        <div class="preview-error-body">
+          <p class="preview-error-title">Preview unavailable</p>
+          <p class="preview-error-message">{{ previewError }}</p>
+          <button
+            v-if="isViewingHistorical"
+            class="version-banner-link"
+            @click="emit('selectVersion', null)"
+          >
+            Back to latest
+          </button>
+        </div>
+      </div>
+      <div v-else-if="preview && preview.rows.length > 0" class="preview-table-wrapper">
+        <table class="styled-table preview-table">
+          <thead>
+            <tr>
+              <th v-for="(col, idx) in preview.columns" :key="idx">
+                <div class="col-header">
+                  <span class="col-header-name">{{ col }}</span>
+                  <span class="col-header-type">{{ preview.dtypes[idx] }}</span>
+                </div>
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="(row, rIdx) in preview.rows" :key="rIdx">
+              <td v-for="(cell, cIdx) in row" :key="cIdx">{{ formatCell(cell) }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div v-else-if="table.table_type === 'virtual'" class="empty-state">
+        This is a virtual table, no data preview available. Use the SQL editor or a flow to view the
+        data.
+      </div>
+      <div v-else-if="table.is_remote_storage && !preview" class="empty-state">
+        <el-button size="small" type="primary" @click="emit('loadPreview')">Load preview</el-button>
+      </div>
+      <div v-else class="empty-state">No data to preview.</div>
+    </div>
+
+    <!-- Visualizations -->
+    <div class="section viz-section">
+      <VisualizationsTab :table-id="table.id" />
+    </div>
+  </div>
+</template>
+
+<script setup lang="ts">
+// TODO(refactor): ~905 LOC, but cohesive. Defer unless touched.
+//   If split: per-section sub-components (PreviewSection, SchemaSection, VersionHistorySection).
+import { ref, computed, watch } from "vue";
+import { ElMessage, ElMessageBox } from "element-plus";
+import type {
+  CatalogTable,
+  CatalogTablePreview,
+  CdcCursor,
+  DeltaTableHistory,
+  TableCdcStatus,
+} from "../../types";
+import { CatalogApi } from "../../api/catalog.api";
+import { pendingLabel } from "../../utils/catalogCdc";
+import { formatDate, formatNumber, formatSize } from "./catalog-formatters";
+import VisualizationsTab from "./VisualizationsTab.vue";
+import TableMaintenance from "./TableMaintenance.vue";
+import TableEditorDialog from "./TableEditorDialog.vue";
+import ShareDialog from "../../components/sharing/ShareDialog.vue";
+import SharedBadge from "../../components/sharing/SharedBadge.vue";
+import { useResourceSharing } from "../../composables/useResourceSharing";
+
+const showReadByModal = ref(false);
+const showShareDialog = ref(false);
+const showTableEditor = ref(false);
+const { canShare, canManage, canManageGrants } = useResourceSharing();
+
+const props = defineProps<{
+  table: CatalogTable;
+  preview: CatalogTablePreview | null;
+  loadingPreview: boolean;
+  previewError: string | null;
+  tableHistory: DeltaTableHistory | null;
+  loadingTableHistory: boolean;
+  tableHistoryStale: boolean;
+  selectedVersion: number | null;
+}>();
+
+const emit = defineEmits([
+  "close",
+  "deleteTable",
+  "toggleTableFavorite",
+  "navigateToFlow",
+  "selectVersion",
+  "queryTable",
+  "editSql",
+  "recoverFromRun",
+  "loadPreview",
+  "refreshHistory",
+  "editsSaved",
+]);
+
+const hasHistory = computed(() => props.tableHistory && props.tableHistory.history.length > 0);
+
+// Show the Version History section when there's history (cached or freshly loaded) or while it loads.
+const showVersionHistory = computed(
+  () => props.table.table_type !== "virtual" && (!!hasHistory.value || props.loadingTableHistory),
+);
+
+const historyStale = computed(() => !!hasHistory.value && props.tableHistoryStale);
+
+const isViewingHistorical = computed(
+  () =>
+    props.selectedVersion !== null &&
+    props.tableHistory !== null &&
+    props.selectedVersion !== props.tableHistory.current_version,
+);
+
+// Edit surface: physical non-SCD2 tables with data on disk, manage access required.
+// Legacy Parquet tables pass this gate but are refused server-side with a clear message.
+const canEditData = computed(
+  () =>
+    canManage(props.table) &&
+    props.table.table_type !== "virtual" &&
+    props.table.file_exists &&
+    !props.table.scd2,
+);
+
+const cdcStatus = ref<TableCdcStatus | null>(null);
+const cdcLoading = ref(false);
+
+const cdcCursors = computed(() => cdcStatus.value?.cursors ?? []);
+
+const cdcEnabledLabel = computed(() =>
+  props.table.cdc_enabled_version !== null
+    ? `On · since v${props.table.cdc_enabled_version}`
+    : "On",
+);
+
+watch(
+  () => props.table.id,
+  () => {
+    cdcStatus.value = null;
+  },
+);
+
+async function loadCdcStatus() {
+  cdcLoading.value = true;
+  try {
+    cdcStatus.value = await CatalogApi.getTableCdc(props.table.id);
+  } catch (e: any) {
+    cdcStatus.value = null;
+    ElMessage.error(e?.response?.data?.detail ?? e?.message ?? "Could not load change cursors");
+  } finally {
+    cdcLoading.value = false;
+  }
+}
+
+async function resetCursor(cursor: CdcCursor) {
+  const label = cursor.consumer_label ?? cursor.consumer_key;
+  try {
+    await ElMessageBox.confirm(
+      `Move "${label}" to the table's current version? Changes it has not read yet are skipped.`,
+      "Reset cursor",
+      { confirmButtonText: "Reset", cancelButtonText: "Cancel", type: "warning" },
+    );
+  } catch {
+    return;
+  }
+  try {
+    await CatalogApi.resetCdcCursor(props.table.id, cursor.consumer_key, "now");
+    await loadCdcStatus();
+    ElMessage.success("Cursor reset");
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail ?? e?.message ?? "Could not reset the cursor");
+  }
+}
+
+async function deleteCursor(cursor: CdcCursor) {
+  const label = cursor.consumer_label ?? cursor.consumer_key;
+  try {
+    await ElMessageBox.confirm(
+      `Delete "${label}"? Its next run starts over from whatever its reader is configured to start from.`,
+      "Delete cursor",
+      { confirmButtonText: "Delete", cancelButtonText: "Cancel", type: "warning" },
+    );
+  } catch {
+    return;
+  }
+  try {
+    await CatalogApi.deleteCdcCursor(props.table.id, cursor.consumer_key);
+    await loadCdcStatus();
+    ElMessage.success("Cursor deleted");
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail ?? e?.message ?? "Could not delete the cursor");
+  }
+}
+
+function formatTimestamp(ts: string | null): string {
+  if (!ts) return "--";
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return ts;
+  return d.toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function handleReadByClick(flowId: number) {
+  emit("navigateToFlow", flowId);
+  showReadByModal.value = false;
+}
+
+function formatParams(params: Record<string, any> | null): string {
+  if (!params || Object.keys(params).length === 0) return "--";
+  return Object.entries(params)
+    .map(([k, v]) => `${k}: ${v}`)
+    .join(", ");
+}
+
+function truncateParams(value: string): string {
+  if (value.length <= 60) return value;
+  return value.slice(0, 60) + "...";
+}
+
+function formatCell(value: any): string {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "number" && !Number.isInteger(value)) {
+    return value.toFixed(4);
+  }
+  return String(value);
+}
+</script>
+
+<style>
+/* Non-scoped: Element Plus teleports popover content outside the component tree. */
+.scd2-popover .scd2-popover-row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--spacing-2);
+  margin-top: var(--spacing-1);
+}
+
+.scd2-popover .scd2-popover-row:first-child {
+  margin-top: 0;
+}
+
+.scd2-popover .scd2-popover-key {
+  flex: 0 0 auto;
+  min-width: 120px;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+}
+
+.scd2-popover .scd2-popover-value {
+  font-family: var(--font-family-mono, monospace);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-primary);
+  overflow-wrap: anywhere;
+}
+
+.cdc-popover .cdc-popover-empty {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+}
+
+.cdc-popover .cdc-cursor-row {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-2);
+  padding: var(--spacing-1) 0;
+  border-bottom: 1px solid var(--color-border-primary);
+}
+
+.cdc-popover .cdc-cursor-row:last-child {
+  border-bottom: none;
+}
+
+.cdc-popover .cdc-cursor-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.cdc-popover .cdc-cursor-name {
+  display: block;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cdc-popover .cdc-cursor-meta {
+  font-size: 11px;
+  color: var(--color-text-secondary);
+}
+</style>
+
+<style scoped>
+.table-detail {
+  max-width: 1000px;
+  margin: 0 auto;
+}
+
+/* ========== Header ========== */
+.detail-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: var(--spacing-6);
+}
+
+.header-title {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-3);
+}
+
+.header-icon {
+  font-size: 20px;
+  color: var(--color-primary);
+}
+
+.virtual-header-icon {
+  color: var(--el-color-primary, var(--color-primary));
+}
+
+.virtual-badge {
+  font-size: var(--font-size-xs, 11px);
+  font-weight: var(--font-weight-semibold, 600);
+  color: var(--el-color-primary, var(--color-primary));
+  background: var(--el-color-primary-light-9, rgba(64, 158, 255, 0.1));
+  padding: 2px 8px;
+  border-radius: var(--border-radius-sm, 4px);
+  line-height: 1.4;
+}
+
+.sql-virtual-badge {
+  color: var(--el-color-success, #67c23a);
+  background: var(--el-color-success-light-9, rgba(103, 194, 58, 0.1));
+}
+
+.scd2-badge {
+  font-size: var(--font-size-xs, 11px);
+  font-weight: var(--font-weight-semibold, 600);
+  color: var(--el-color-warning, #e6a23c);
+  background: var(--el-color-warning-light-9, rgba(230, 162, 60, 0.1));
+  padding: 2px 8px;
+  border-radius: var(--border-radius-sm, 4px);
+  line-height: 1.4;
+}
+
+.scd2-summary {
+  cursor: default;
+  user-select: none;
+}
+
+.optimized-badge {
+  color: var(--color-success, #67c23a);
+  font-weight: var(--font-weight-semibold, 600);
+}
+
+.laziness-blockers {
+  padding: 10px 12px;
+  background: rgba(245, 158, 11, 0.08);
+  border: 1px solid rgba(245, 158, 11, 0.3);
+  border-radius: var(--border-radius-md);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+  margin-bottom: var(--spacing-3);
+}
+
+.blockers-label {
+  font-weight: var(--font-weight-medium);
+  color: var(--color-warning, #f59e0b);
+}
+
+.blocker-list {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.blocker-list li {
+  font-family: var(--font-family-mono, monospace);
+  font-size: var(--font-size-xs);
+}
+
+.header-title h2 {
+  margin: 0;
+  font-size: var(--font-size-xl);
+  font-weight: var(--font-weight-semibold);
+}
+
+.description {
+  margin: var(--spacing-2) 0 0 0;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.header-actions {
+  display: flex;
+  gap: var(--spacing-2);
+}
+
+.action-btn-lg {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-2);
+  padding: var(--spacing-1) var(--spacing-3);
+  background: transparent;
+  color: var(--color-text-secondary);
+  border: 1px solid var(--color-border-primary);
+  border-radius: var(--border-radius-md);
+  font-size: var(--font-size-xs);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+.action-btn-lg:hover {
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+}
+.action-btn-lg.active {
+  color: var(--color-warning);
+  border-color: var(--color-warning);
+}
+
+.partition-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--spacing-1);
+  margin-top: var(--spacing-1);
+}
+.partition-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px var(--spacing-2);
+  background: var(--color-primary-soft, rgba(59, 130, 246, 0.1));
+  color: var(--color-primary);
+  border-radius: var(--border-radius-sm, 4px);
+  font-size: var(--font-size-xs);
+  font-weight: 500;
+}
+
+/* ========== Meta Grid (override minmax for table) ========== */
+.meta-grid {
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  margin-bottom: var(--spacing-6);
+}
+
+.meta-card {
+  display: block;
+}
+
+.meta-label {
+  display: block;
+  margin-bottom: var(--spacing-1);
+}
+
+.meta-value {
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-semibold);
+}
+
+.meta-link {
+  cursor: pointer;
+  color: var(--color-primary);
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-1);
+  font-size: var(--font-size-sm);
+  min-width: 0;
+}
+
+.meta-link-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.meta-link:hover {
+  text-decoration: underline;
+}
+
+/* Same layout as .meta-link without the affordances — this one does not navigate. */
+.meta-static {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-1);
+  font-size: var(--font-size-sm);
+  min-width: 0;
+}
+
+.meta-muted {
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-normal, 400);
+  color: var(--color-text-muted);
+}
+
+.meta-card-clickable {
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.meta-card-clickable:hover {
+  border-color: var(--color-primary);
+}
+
+.read-by-item {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-2);
+  padding: var(--spacing-2) var(--spacing-3);
+  background: var(--color-background-secondary);
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--border-radius-md);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.read-by-item:hover {
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+}
+
+.read-by-icon {
+  color: var(--color-primary);
+  font-size: var(--font-size-xs);
+}
+
+/* ========== Sections ========== */
+.section {
+  margin-bottom: var(--spacing-6);
+}
+
+.preview-info {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+}
+
+/* ========== Schema Table ========== */
+.schema-table-wrapper {
+  max-height: 300px;
+  overflow-y: auto;
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--border-radius-md);
+}
+
+/* schema-table extends .styled-table */
+.schema-table th {
+  font-size: var(--font-size-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.col-name {
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-primary);
+}
+
+.schema-table .col-type {
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+}
+
+/* ========== Data Preview Table ========== */
+.preview-table-wrapper {
+  max-height: 500px;
+  overflow: auto;
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--border-radius-md);
+}
+
+/* preview-table extends .styled-table */
+.preview-table {
+  table-layout: auto;
+  white-space: nowrap;
+}
+
+.preview-table th,
+.preview-table td {
+  width: auto;
+}
+
+.col-header {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.col-header-name {
+  font-weight: var(--font-weight-medium);
+  font-size: var(--font-size-sm);
+  color: var(--color-text-primary);
+}
+
+.col-header-type {
+  font-family: var(--font-family-mono);
+  font-size: 10px;
+  color: var(--color-text-muted);
+}
+
+.preview-table td {
+  max-width: 300px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ========== Version History ========== */
+.section-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.history-stale-hint {
+  font-size: 0.7rem;
+  font-style: italic;
+  color: var(--color-text-secondary, #9ca3af);
+  opacity: 0.7;
+}
+
+.version-table-wrapper {
+  max-height: 240px;
+  overflow-y: auto;
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--border-radius-md);
+}
+
+/* Override the 3-column width distribution from .styled-table */
+.version-table th,
+.version-table td {
+  width: auto;
+}
+
+.version-table th:first-child,
+.version-table td:first-child {
+  width: 15%;
+}
+
+.version-table th:nth-child(2),
+.version-table td:nth-child(2) {
+  width: 25%;
+}
+
+.version-table th:nth-child(3),
+.version-table td:nth-child(3) {
+  width: 15%;
+}
+
+.version-table th:nth-child(4),
+.version-table td:nth-child(4) {
+  width: 35%;
+}
+
+.version-table th:last-child,
+.version-table td:last-child {
+  width: 10%;
+}
+
+.version-table th {
+  font-size: var(--font-size-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.version-row {
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+
+.version-row:hover {
+  background: var(--color-background-hover, rgba(0, 0, 0, 0.03));
+}
+
+.version-row-active {
+  background: var(--color-primary-light, rgba(59, 130, 246, 0.08));
+}
+
+.version-row-current td {
+  font-weight: var(--font-weight-medium);
+}
+
+.version-number {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-2);
+  font-weight: var(--font-weight-medium);
+}
+
+.version-badge {
+  font-size: 10px;
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-success, #16a34a);
+  background: var(--color-success-light, rgba(22, 163, 74, 0.1));
+  padding: 1px 6px;
+  border-radius: var(--border-radius-sm);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.version-operation {
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+}
+
+.version-params {
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+  position: relative;
+  max-width: 0;
+}
+
+.version-params-cell {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: default;
+}
+
+.version-params-full {
+  display: none;
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 10;
+  background: var(--color-background-primary, #fff);
+  border: 1px solid var(--color-border-primary);
+  border-radius: var(--border-radius-md);
+  padding: var(--spacing-2) var(--spacing-3);
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-width: 400px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+}
+
+.version-params-cell:hover .version-params-full {
+  display: block;
+}
+
+.version-action {
+  text-align: right;
+}
+
+.version-view-link {
+  font-size: var(--font-size-xs);
+  color: var(--color-primary);
+  cursor: pointer;
+}
+
+.version-view-link:hover {
+  text-decoration: underline;
+}
+
+/* ========== Version Banner ========== */
+.version-banner {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-2);
+  padding: var(--spacing-2) var(--spacing-3);
+  margin-bottom: var(--spacing-3);
+  background: color-mix(in srgb, var(--color-warning) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-warning) 30%, transparent);
+  border-radius: var(--border-radius-md);
+  font-size: var(--font-size-sm);
+  color: var(--color-text-primary);
+}
+
+.version-banner i {
+  color: var(--color-warning, #eab308);
+}
+
+.version-banner-link {
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: var(--color-primary);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+  padding: 0;
+  text-decoration: underline;
+}
+
+.version-banner-link:hover {
+  color: var(--color-primary-dark, #1d4ed8);
+}
+
+/* ========== Missing File Banner ========== */
+.missing-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--spacing-3);
+  padding: var(--spacing-3) var(--spacing-4);
+  margin-bottom: var(--spacing-4);
+  background: color-mix(in srgb, var(--color-warning) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-warning) 30%, transparent);
+  border-radius: var(--border-radius-md);
+  color: var(--color-text-primary);
+}
+
+.missing-banner > i {
+  color: var(--color-warning);
+  font-size: var(--font-size-lg);
+  margin-top: 2px;
+  flex-shrink: 0;
+}
+
+.missing-banner strong {
+  font-size: var(--font-size-sm);
+  display: block;
+  margin-bottom: var(--spacing-1);
+}
+
+.missing-banner p {
+  margin: 0;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+  line-height: 1.5;
+}
+
+.recovery-btn {
+  margin-top: var(--spacing-2);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--spacing-1);
+}
+
+.action-btn-lg:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
+/* ========== Preview Error ========== */
+.preview-error {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--spacing-3);
+  padding: var(--spacing-3) var(--spacing-4);
+  background: color-mix(in srgb, var(--color-warning) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-warning) 30%, transparent);
+  border-radius: var(--border-radius-md);
+  color: var(--color-text-primary);
+}
+
+.preview-error > i {
+  color: var(--color-warning);
+  font-size: var(--font-size-lg);
+  margin-top: 2px;
+  flex-shrink: 0;
+}
+
+.preview-error-title {
+  margin: 0 0 var(--spacing-1);
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+}
+
+.preview-error-message {
+  margin: 0;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+  line-height: 1.5;
+}
+
+.preview-error .version-banner-link {
+  margin-left: 0;
+  margin-top: var(--spacing-2);
+}
+
+/* ========== States ========== */
+.loading-state {
+  padding: var(--spacing-6);
+  text-align: center;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+}
+
+/* ========== SQL Definition ========== */
+.sql-definition {
+  background: var(--color-background-secondary, #f5f7fa);
+  border: 1px solid var(--color-border-light, #e4e7ed);
+  border-radius: var(--border-radius-md);
+  padding: var(--spacing-3) var(--spacing-4);
+  font-family: var(--font-family-mono, monospace);
+  font-size: var(--font-size-sm, 13px);
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--color-text-primary);
+  margin: 0;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+/* ========== Modal (read-by list items) ========== */
+.modal-content {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-1);
+}
+</style>

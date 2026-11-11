@@ -1,0 +1,2463 @@
+import asyncio
+import functools
+import json
+import logging
+import os
+import re
+import socket
+import tempfile
+import threading
+import time
+import uuid
+from collections.abc import Iterable
+from concurrent.futures import Future
+from concurrent.futures import TimeoutError as FutureTimeoutError
+from datetime import datetime, timezone
+from pathlib import Path
+
+import docker
+import docker.errors
+import docker.types
+import docker.utils
+import httpx
+from packaging.version import Version
+
+from flowfile_core.auth import sharing
+from flowfile_core.configs.flow_logger import FlowLogger
+from flowfile_core.events import publish
+from flowfile_core.flowfile.execution import registry as compute_registry
+
+# Re-exported for existing callers; the tags live in docker-free images.py so matching.py can read them.
+from flowfile_core.kernel.images import (  # noqa: F401
+    _KERNEL_IMAGE_BASE_DEFAULT,
+    _KERNEL_IMAGE_LITE_DEFAULT,
+    _KERNEL_IMAGE_ML_DEFAULT,
+    _envvar_or_default,
+    _flavour_images,
+    _kernel_image_base,
+    _kernel_image_lite,
+    _kernel_image_ml,
+    parse_image_version,
+)
+from flowfile_core.kernel.models import (
+    ArtifactPersistenceInfo,
+    CleanupRequest,
+    CleanupResult,
+    ClearNodeArtifactsResult,
+    ExecuteRequest,
+    ExecuteResult,
+    ImageFlavour,
+    KernelConfig,
+    KernelInfo,
+    KernelMemoryInfo,
+    KernelState,
+    RecoveryStatus,
+    ResolvedPackage,
+)
+from flowfile_core.kernel.urls import core_base_url
+from shared.run_completion import _pid_is_alive  # cross-platform; os.kill(pid, 0) kills on Windows
+from shared.storage_config import storage
+
+logger = logging.getLogger(__name__)
+
+_KERNEL_DOWN_MSG = (
+    "Kernel is not running — its container was stopped or removed (often after a "
+    "core restart). Run the cell again to restart it."
+)
+
+_CELL_EXECUTION_TIMEOUT = 86_400.0
+
+
+@functools.lru_cache(maxsize=1)
+def _http_ssl_context():
+    # httpx builds an SSL context per client (~250ms on Windows), so short-lived clients share one.
+    return httpx.create_ssl_context()
+
+
+def _async_client(timeout: float) -> httpx.AsyncClient:
+    return httpx.AsyncClient(timeout=httpx.Timeout(timeout), verify=_http_ssl_context())
+
+
+def _sync_client(timeout: float) -> httpx.Client:
+    return httpx.Client(timeout=httpx.Timeout(timeout), verify=_http_ssl_context())
+
+
+def _resolve_image(
+    flavour: ImageFlavour,
+    custom_image: str | None,
+    docker_client=None,
+) -> str:
+    """Resolve the image tag to use for ``flavour``.
+
+    When ``docker_client`` is provided, falls back to a locally-built variant
+    (``flowfile-kernel-<flavour>:local`` or any other tag matching the repo
+    name) if the registry default isn't present. Without a client (e.g. unit
+    tests not exercising the docker layer) returns the registry default
+    unchanged.
+    """
+    if flavour == ImageFlavour.CUSTOM:
+        if not custom_image:
+            raise ValueError("custom_image must be provided when image_flavour='custom'")
+        _validate_custom_image(custom_image)
+        return custom_image
+    registry_default = _flavour_images()[flavour]
+    if docker_client is None:
+        return registry_default
+    return _resolve_local_image(flavour, docker_client, registry_default) or registry_default
+
+
+def _resolve_local_image(
+    flavour: ImageFlavour,
+    docker_client,
+    registry_default: str,
+) -> str | None:
+    """Return a locally-available tag for ``flavour``, or ``None`` if nothing matches.
+
+    Priority:
+    1. The registry default itself if present locally
+    2. ``flowfile-kernel-<flavour>:local`` (docker-compose dev build convention)
+    3. Any other tag of the ``flowfile-kernel-<flavour>`` repo, newest first
+    """
+    try:
+        docker_client.images.get(registry_default)
+        return registry_default
+    except docker.errors.ImageNotFound:
+        pass
+    except docker.errors.APIError:
+        return None
+
+    repo_name = f"flowfile-kernel-{flavour.value}"
+    try:
+        images = docker_client.images.list(name=repo_name)
+    except docker.errors.APIError:
+        return None
+    if not images:
+        return None
+
+    # A stale dev build must not shadow a newer pin; images of unknown version stay trusted.
+    pinned = parse_image_version(registry_default)
+    if pinned is not None:
+        kept = []
+        for img in images:
+            known = _image_version(img, repo_name)
+            if known is not None and known < pinned:
+                logger.info("Ignoring local image %s: older than pinned %s", img.tags, registry_default)
+                continue
+            kept.append(img)
+        images = kept
+        if not images:
+            return None
+
+    preferred_tag = f"{repo_name}:local"
+    for img in images:
+        if preferred_tag in (img.tags or ()):
+            return preferred_tag
+
+    # Fall back to the most recently-created tag for this repo
+    images_sorted = sorted(
+        images,
+        key=lambda i: i.attrs.get("Created", "") if isinstance(i.attrs, dict) else "",
+        reverse=True,
+    )
+    for img in images_sorted:
+        for tag in img.tags or ():
+            if tag.startswith(f"{repo_name}:"):
+                return tag
+    return None
+
+
+def _image_version(img, repo_name: str) -> Version | None:
+    """Highest version among an image's ``*/flowfile-kernel-<flavour>`` tags, if any."""
+    versions = []
+    for tag in img.tags or ():
+        repo = tag.rsplit(":", 1)[0]
+        if repo == repo_name or repo.endswith(f"/{repo_name}"):
+            version = parse_image_version(tag)
+            if version is not None:
+                versions.append(version)
+    return max(versions) if versions else None
+
+
+def newest_installed_version(repo: str, docker_client) -> tuple[str, Version] | None:
+    """Return ``(tag, version)`` of the newest locally-present image for ``repo``.
+
+    Only considers tags of ``repo`` carrying a version; ``:local``
+    / digest / non-version tags are ignored. Returns None when none are present.
+    Used to detect that an older official kernel image is installed.
+    """
+    try:
+        images = docker_client.images.list(name=repo)
+    except Exception:
+        return None
+    best: tuple[str, Version] | None = None
+    prefix = f"{repo}:"
+    for img in images:
+        for tag in img.tags or ():
+            if not tag.startswith(prefix):
+                continue
+            version = parse_image_version(tag)
+            if version is None:
+                continue
+            if best is None or version > best[1]:
+                best = (tag, version)
+    return best
+
+
+def _friendly_pull_error(exc: Exception, image_tag: str) -> str:
+    """Translate a raw docker pull exception into a short, user-facing message.
+
+    The raw exception (e.g. ``404 Client Error for http+docker://.../images/create``)
+    is still written to the logs via ``logger.exception``; this is only what the
+    Kernel Manager surfaces to the user.
+    """
+    text = str(exc).lower()
+    if isinstance(exc, docker.errors.ImageNotFound) or "not found" in text or "manifest" in text:
+        return f"{image_tag} isn't available on the registry yet."
+    if any(s in text for s in ("unauthorized", "denied", "authentication", "401", "403")):
+        return f"Not authorized to pull {image_tag}. Check your registry login."
+    network_markers = (
+        "timed out",
+        "timeout",
+        "connection",
+        "could not resolve",
+        "no such host",
+        "unreachable",
+    )
+    if any(s in text for s in network_markers):
+        return f"Couldn't reach the registry to pull {image_tag}. Check your connection."
+    if "no space" in text:
+        return "Not enough disk space to pull the image."
+    first = next((ln.strip() for ln in str(exc).splitlines() if ln.strip()), exc.__class__.__name__)
+    return first[:200]
+
+
+# No shell metacharacters, so specs go straight into a docker build; \Z because `$` allows a trailing newline.
+_VALID_PACKAGE_SPEC = re.compile(r"\A[A-Za-z0-9_.\-+\[\]<>=!~,]+\Z")
+_KERNEL_ID_TAG_RE = re.compile(r"[^a-z0-9._-]")
+_VALID_TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.\-]{0,127}$")
+_DIGEST_RE = re.compile(r"@sha256:[A-Fa-f0-9]{12,}$")
+
+# Derived-image labels, so orphan GC touches only this install's images without parsing tags.
+_IMAGE_LABEL_CORE_INSTANCE = "flowfile_core_instance"
+_IMAGE_LABEL_KERNEL_ID = "flowfile_kernel_id"
+# The FROM tag a derived image was baked on, so a moved pin rebuilds it instead of reusing a stale bake.
+_IMAGE_LABEL_BASE_IMAGE = "flowfile_base_image"
+# Which *process* started a container, as opposed to which install built an image.
+_CONTAINER_LABEL_CORE_RUNTIME = "flowfile_core_runtime"
+# That process's pid, so a later core can tell whether the owner is still alive.
+_CONTAINER_LABEL_CORE_PID = "flowfile_core_pid"
+
+# Grace window before anything counts as an orphan.
+_GC_MIN_AGE_SECONDS = 600
+
+
+def _gc_enabled() -> bool:
+    """``FLOWFILE_KERNEL_GC=0`` disables startup container/image reclamation."""
+    return (os.environ.get("FLOWFILE_KERNEL_GC") or "").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _too_young_to_reap(created: str | None) -> bool:
+    """Whether a Docker ``Created`` timestamp is inside the grace window.
+
+    Unparseable or missing timestamps count as young: refusing to reap on bad
+    input leaks an orphan, while the alternative destroys a live kernel.
+    """
+    if not isinstance(created, str) or not created:
+        return True
+    text = created.rstrip("Z")
+    if "." in text:  # Docker reports nanoseconds; datetime accepts at most micro
+        head, _, frac = text.partition(".")
+        text = f"{head}.{frac[:6]}"
+    try:
+        stamp = datetime.fromisoformat(text).replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return True
+    return (datetime.now(timezone.utc) - stamp).total_seconds() < _GC_MIN_AGE_SECONDS
+
+
+def _load_or_create_core_instance_id() -> str:
+    """Return a stable UUID identifying this Core install.
+
+    Persisted under ``<storage.base_directory>/core_instance_id.txt`` so a
+    Core restart matches its previously-built derived images. Falls back to
+    an in-memory UUID if the file can't be written (e.g. read-only FS).
+    """
+    try:
+        path = storage.base_directory / "core_instance_id.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            existing = path.read_text().strip()
+            if existing:
+                return existing
+        new_id = str(uuid.uuid4())
+        path.write_text(new_id)
+        return new_id
+    except OSError:
+        logger.warning("Could not persist core instance id; using volatile id for this run only")
+        return str(uuid.uuid4())
+
+
+def _derived_image_tag(kernel_id: str) -> str:
+    """Stable tag for the per-kernel derived image."""
+    safe = _KERNEL_ID_TAG_RE.sub("-", kernel_id.lower())
+    return f"flowfile-kernel-derived-{safe}:latest"
+
+
+def _validate_packages(packages: list[str]) -> None:
+    for pkg in packages:
+        if not _VALID_PACKAGE_SPEC.match(pkg):
+            raise ValueError(
+                f"Invalid package specifier {pkg!r}: only PyPI-safe characters "
+                "(alphanumerics, '.-_+[]<>=!~,') are allowed."
+            )
+
+
+# Strip a pip spec like ``pandas[extra]>=2.3,<3`` down to its package name.
+_PACKAGE_NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]+")
+
+
+def _spec_to_name(spec: str) -> str:
+    """Extract the canonical package name from a pip specifier."""
+    match = _PACKAGE_NAME_RE.match(spec.strip())
+    if not match:
+        return spec.strip().lower()
+    # PEP 503 normalisation: lowercase + collapse runs of -_. to '-'
+    return re.sub(r"[-_.]+", "-", match.group(0).lower())
+
+
+def _validate_custom_image(uri: str) -> None:
+    """Custom image URIs must pin an explicit version (tag or @sha256 digest).
+
+    Untagged refs default to ``:latest`` on Docker and break reproducibility.
+    """
+    ref = (uri or "").strip()
+    if not ref:
+        raise ValueError("Custom image URI is empty.")
+    if _DIGEST_RE.search(ref):
+        return
+    last_slash = ref.rfind("/")
+    last_segment = ref[last_slash + 1 :] if last_slash >= 0 else ref
+    if ":" not in last_segment:
+        raise ValueError(
+            f"Custom image {ref!r} has no explicit tag. "
+            "Append a version, e.g. 'myorg/kernel:1.2.3' or use '@sha256:...'."
+        )
+    tag = last_segment.split(":", 1)[1]
+    if not tag or not _VALID_TAG_RE.match(tag):
+        raise ValueError(
+            f"Custom image {ref!r} has an invalid tag {tag!r}. "
+            "Tags must start with an alphanumeric and may include '.-_'."
+        )
+
+
+_BASE_PORT = 19000
+_PORT_RANGE = 1000  # 19000-19999
+_HEALTH_TIMEOUT = 120
+_HEALTH_POLL_INTERVAL = 2
+_START_FLIGHT_GRACE = 600
+_CONVERGE_ATTEMPTS = 5
+_CONVERGE_DELAY_S = 0.5
+_DOCKER_PROBE_TIMEOUT_SECONDS = 5.0
+
+
+def _probe_docker() -> None:
+    """Fail fast when the Docker daemon is hung or absent.
+
+    ``docker.from_env()`` negotiates the API version with the SDK's 60 s default
+    read timeout, so a hung daemon would cost a full minute per construction
+    attempt. The probe performs that same version GET through a short-timeout
+    client and lets the SDK's ``DockerException`` propagate; the real client is
+    built afterwards with the default timeout, which pulls/builds/commits rely on.
+    """
+    docker.from_env(timeout=_DOCKER_PROBE_TIMEOUT_SECONDS).close()
+
+
+def _is_docker_mode() -> bool:
+    """Check if running in Docker mode based on FLOWFILE_MODE."""
+    return os.environ.get("FLOWFILE_MODE") == "docker"
+
+
+def _is_port_available(port: int) -> bool:
+    """Check whether a TCP port is free on localhost."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
+def _rebase_to_posix(local_path: str, host_prefix: str, container_prefix: str) -> str | None:
+    """Rebase *local_path* under *host_prefix* onto *container_prefix* as a POSIX path.
+
+    Normalizes backslashes so Windows host paths produce pure-POSIX container
+    paths. Returns None when *local_path* is not under *host_prefix*.
+    """
+    p = local_path.replace("\\", "/").rstrip("/")
+    base = host_prefix.replace("\\", "/").rstrip("/")
+    if p == base:
+        return container_prefix
+    if p.startswith(base + "/"):
+        return container_prefix + "/" + p[len(base) + 1 :]
+    return None
+
+
+def _notebook_env(kernel: KernelInfo) -> dict[str, str]:
+    """A notebook kernel's flowfile never migrates, seeds or GCs anything and holds no catalog database: its engine
+    refuses every connection (``flowfile_frame.notebook_kernel``). Its storage folder is the container's own: the
+    kernel mounts no host folder, and reads files, catalog tables, flow files and custom node sources through core.
+    It computes on the worker embedded in its own process (``registry.child_env``)."""
+    if sharing.sharing_enabled() or kernel.image_flavour != ImageFlavour.NOTEBOOK:
+        return {}
+    return {
+        "FLOWFILE_SKIP_STARTUP_MIGRATION": "1",
+        "FLOWFILE_SKIP_INIT_DB": "1",
+        "FLOWFILE_KERNEL_GC": "0",
+        "FLOWFILE_TELEMETRY": "0",
+        **compute_registry.child_env(),
+    }
+
+
+def ordered_input_files(names: Iterable[str]) -> list[str]:
+    """Order kernel input file names (``{name}_{index}.parquet``) by their integer index.
+
+    The index is the wiring position, so it (not the lexicographic name, where
+    ``df_10_1`` sorts before ``df_9_0``) restores the order ``read_inputs()["main"]``
+    must have. Names without a numeric index follow, sorted by name.
+    """
+
+    def _key(file_name: str) -> tuple[int, int, str]:
+        _, sep, index = file_name.removesuffix(".parquet").rpartition("_")
+        if sep and index.isdecimal():
+            return 0, int(index), file_name
+        return 1, 0, file_name
+
+    return sorted(names, key=_key)
+
+
+_BUILD_NOISE = re.compile(
+    r"^(Step \d+/\d+|---> |Running in |Removing intermediate|Successfully (built|tagged)|Collecting |Downloading |"
+    r"Using cached |Requirement already satisfied|Obtaining |Installing build dependencies|Getting requirements|"
+    r"Preparing metadata|Installing backend dependencies|Building wheels? for|Created wheel|Stored in directory|"
+    r"\[notice\]|Looking in indexes)"
+)
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+_SUMMARY_LINES = 15
+_SUMMARY_CHARS = 1500
+
+
+def bake_failure_summary(packages: list[str], log_lines: list[str], reason: str = "") -> str:
+    """A short account of a failed package bake: which packages, then the last meaningful lines of the build log.
+
+    Blank lines, progress bars and Docker/pip progress chatter are dropped; at most ``_SUMMARY_LINES`` lines and
+    ``_SUMMARY_CHARS`` characters are kept, from the end. The full log goes to core's log instead. ``reason`` is
+    Docker's own error, which the log stream does not carry (a full disk while committing the layer, after pip
+    succeeded), so it closes the summary.
+    """
+    lines = []
+    for raw in [*log_lines, reason]:
+        for line in _ANSI_ESCAPE.sub("", str(raw)).splitlines():
+            text = line.strip()
+            if text and "━" not in text and not _BUILD_NOISE.match(text):
+                lines.append(line.rstrip())
+    tail = "\n".join(lines[-_SUMMARY_LINES:])[-_SUMMARY_CHARS:]
+    head = f"Installing {', '.join(packages)} into the kernel image failed."
+    return f"{head}\n{tail}" if tail else head
+
+
+class KernelManager:
+    def __init__(self, shared_volume_path: str | None = None):
+        _probe_docker()
+        self._docker = docker.from_env()
+        # Stable per-install id stamped on derived images, so orphan GC touches only this install's images.
+        self._core_instance_id = _load_or_create_core_instance_id()
+        # Per-process, unlike the install id: only the starter may tear a container down.
+        self._runtime_id = uuid.uuid4().hex
+        self._started_here: set[str] = set()
+        self._kernels: dict[str, KernelInfo] = {}
+        self._kernel_owners: dict[str, int] = {}  # kernel_id -> user_id
+        # Guards the registry dicts and port allocation; reentrant, never held over Docker I/O or the scratch lock.
+        self._kernels_lock = threading.RLock()
+        # Scratch FlowRegistration per kernel: the artifact producer when no source_registration_id is in scope.
+        self._scratch_flow_ids: dict[str, int] = {}
+        # So two concurrent create/publish paths can't both insert a kernel's scratch FlowRegistration.
+        self._scratch_flow_lock = threading.Lock()
+        # image tag -> "pulling" or "error:<msg>", absent when idle; the lock is never held over a pull.
+        self._pull_state: dict[str, str] = {}
+        self._pull_state_lock = threading.Lock()
+        # Keyed per op: an image can serve `complete` and still 404 a newer /lsp endpoint.
+        self._lsp_unsupported_warned: set[tuple[str, str]] = set()
+        # Single-flight starts: kernel_id -> Future shared by concurrent callers.
+        self._start_flights: dict[str, Future] = {}
+        self._start_flights_lock = threading.Lock()
+        # Per-derived-tag build locks so concurrent starts bake an image once.
+        self._build_locks: dict[str, threading.Lock] = {}
+        self._build_locks_lock = threading.Lock()
+        # One cell per kernel, as cells share one namespace; taken before flight/leaf locks, never by interrupt.
+        self._exec_locks: dict[str, threading.Lock] = {}
+        self._exec_locks_lock = threading.Lock()
+        # kernel_id -> exec_token holding its exec lock; written by the holder, read lock-free by interrupt.
+        self._active_execs: dict[str, str] = {}
+        # resolve() so the kernel's host-path prefix translation matches the resolved paths core returns
+        self._shared_volume = str(Path(shared_volume_path or storage.cache_directory).resolve())
+        # Catalog Delta tables live outside the shared volume, so kernels mount them separately.
+        self._catalog_tables_dir = str(storage.catalog_tables_directory.resolve())
+
+        # When core runs in a container, kernels join its network for service discovery.
+        self._docker_network: str | None = os.environ.get("FLOWFILE_DOCKER_NETWORK") or self._detect_docker_network()
+
+        # In Docker mode kernels mount the volume covering _shared_volume at the same path, so paths match.
+        self._kernel_volume: str | None = None
+        self._kernel_volume_type: str | None = None
+        self._kernel_mount_target: str | None = None  # mount point inside containers
+        # Separate from _kernel_volume when catalog tables sit under the user data directory.
+        self._catalog_volume: str | None = None
+        self._catalog_volume_type: str | None = None
+        self._catalog_mount_target: str | None = None
+        if _is_docker_mode():
+            vol_name, vol_type, mount_dest = self._discover_volume_for_path(self._shared_volume)
+            if vol_name:
+                self._kernel_volume = vol_name
+                self._kernel_volume_type = vol_type
+                self._kernel_mount_target = mount_dest
+                logger.info(
+                    "Docker-in-Docker mode: volume=%s (type=%s) at %s covers shared_path=%s, network=%s",
+                    vol_name,
+                    vol_type,
+                    mount_dest,
+                    self._shared_volume,
+                    self._docker_network,
+                )
+            else:
+                logger.warning(
+                    "Could not discover volume for shared_path=%s; "
+                    "kernel containers will use bind mounts (local mode only)",
+                    self._shared_volume,
+                )
+
+            cvol_name, cvol_type, cmount_dest = self._discover_volume_for_path(self._catalog_tables_dir)
+            if cvol_name and cvol_name != self._kernel_volume:
+                self._catalog_volume = cvol_name
+                self._catalog_volume_type = cvol_type
+                self._catalog_mount_target = cmount_dest
+                logger.info(
+                    "Catalog volume=%s (type=%s) at %s covers catalog_tables_path=%s",
+                    cvol_name,
+                    cvol_type,
+                    cmount_dest,
+                    self._catalog_tables_dir,
+                )
+
+        # GC asks "is this in the registry?", so a registry that failed to load is not an answer.
+        restored = self._restore_kernels_from_db()
+        gc_enabled = _gc_enabled()
+        if not restored:
+            logger.error(
+                "Kernel registry could not be restored, so container/image GC is skipped this "
+                "start — a transient database failure must not destroy live kernels and their "
+                "derived images (each is a multi-minute rebuild). Fix the database error and "
+                "restart; run 'make clean_kernels' if orphans need clearing by hand."
+            )
+        self._reclaim_running_containers(prune_orphans=restored and gc_enabled)
+        self._remove_orphan_build_containers()
+        if restored and gc_enabled:
+            self._remove_orphan_derived_images()
+
+    @property
+    def shared_volume_path(self) -> str:
+        return self._shared_volume
+
+    # Docker-in-Docker helpers
+
+    def _detect_docker_network(self) -> str | None:
+        """Auto-detect the Docker network this container is connected to.
+
+        When core runs inside Docker, we inspect the current container's
+        network settings and return the first user-defined network.  This
+        allows kernel containers to be attached to the same network without
+        requiring an explicit FLOWFILE_DOCKER_NETWORK env var.
+        """
+        if not _is_docker_mode():
+            return None
+        try:
+            hostname = socket.gethostname()
+            container = self._docker.containers.get(hostname)
+            networks = container.attrs["NetworkSettings"]["Networks"]
+            for name in networks:
+                if name not in ("bridge", "host", "none"):
+                    return name
+        except Exception as exc:
+            logger.debug("Could not auto-detect Docker network: %s", exc)
+        return None
+
+    def _discover_volume_for_path(self, path: str) -> tuple[str | None, str | None, str | None]:
+        """Find which Docker volume/bind covers *path* in this container.
+
+        Inspects the current container's mounts and returns the one whose
+        ``Destination`` is a prefix of *path* (longest match wins).
+
+        Returns ``(source_or_name, mount_type, destination)`` or
+        ``(None, None, None)`` if no mount covers the path.
+        """
+        try:
+            hostname = socket.gethostname()
+            container = self._docker.containers.get(hostname)
+            mounts = container.attrs.get("Mounts", [])
+            logger.debug("Container %s mounts: %s", hostname, mounts)
+
+            best: dict | None = None
+            for mount in mounts:
+                dest = mount.get("Destination", "")
+                if path.startswith(dest) and (best is None or len(dest) > len(best.get("Destination", ""))):
+                    best = mount
+
+            if best:
+                mount_type = best.get("Type", "volume")
+                dest = best["Destination"]
+                name = best.get("Name") if mount_type == "volume" else best.get("Source")
+                return name, mount_type, dest
+
+            logger.warning("No mount covers path %s in container %s", path, hostname)
+        except Exception as exc:
+            logger.warning("Could not inspect container mounts: %s", exc)
+        return None, None, None
+
+    def _kernel_url(self, kernel: KernelInfo) -> str:
+        """Return the base URL for communicating with a kernel container.
+
+        In Docker-in-Docker mode, use the container name on the shared
+        Docker network.  Otherwise, use localhost with the mapped host port.
+        """
+        if self._docker_network:
+            return f"http://flowfile-kernel-{kernel.id}:9999"
+        return f"http://localhost:{kernel.port}"
+
+    def to_kernel_path(self, local_path: str) -> str:
+        """Translate a local filesystem path to the path visible inside a kernel container.
+
+        In Docker-in-Docker mode the volume is mounted at the same path in all
+        containers, so paths are identical.  In local mode the host shared dir is
+        bind-mounted at ``/shared`` and the host catalog_tables dir at
+        ``/catalog_tables``; we swap whichever prefix matches, always producing
+        a pure-POSIX path (Windows host paths contain backslashes the Linux
+        container would treat as literal filename characters).
+        """
+        if self._kernel_volume:
+            # Same volume, same mount point — no translation needed
+            return local_path
+        # Local mode: try each known prefix
+        for host_prefix, container_prefix in (
+            (self._catalog_tables_dir, "/catalog_tables"),
+            (self._shared_volume, "/shared"),
+        ):
+            rebased = _rebase_to_posix(local_path, host_prefix, container_prefix)
+            if rebased is not None:
+                return rebased
+        return local_path
+
+    def resolve_node_paths(self, request: "ExecuteRequest") -> None:
+        """Populate ``input_paths`` and ``output_dir`` from ``flow_id``/``node_id``.
+
+        When the frontend sends only ``flow_id`` and ``node_id`` (without
+        pre-built filesystem paths), this method resolves the actual paths
+        on the shared volume and translates them for the kernel container.
+        If ``input_paths`` is already populated (e.g. from the ``flow_graph`` package),
+        this is a no-op.
+        """
+        if request.input_paths or not request.flow_id or not request.node_id:
+            return
+
+        input_dir = os.path.join(
+            self._shared_volume,
+            str(request.flow_id),
+            str(request.node_id),
+            "inputs",
+        )
+        output_dir = os.path.join(
+            self._shared_volume,
+            str(request.flow_id),
+            str(request.node_id),
+            "outputs",
+        )
+
+        # Inputs are {name}_{index}.parquet (e.g. orders_0.parquet), grouped by name.
+        if os.path.isdir(input_dir):
+            parquet_files = ordered_input_files(f for f in os.listdir(input_dir) if f.endswith(".parquet"))
+            if parquet_files:
+                input_paths: dict[str, list[str]] = {}
+                all_paths: list[str] = []
+                for f in parquet_files:
+                    kernel_path = self.to_kernel_path(os.path.join(input_dir, f))
+                    all_paths.append(kernel_path)
+                    # Extract name from filename pattern: name_index.parquet
+                    stem = f[: -len(".parquet")]
+                    parts = stem.rsplit("_", 1)
+                    name = parts[0] if len(parts) == 2 and parts[1].isdigit() else "main"
+                    input_paths.setdefault(name, []).append(kernel_path)
+                input_paths["main"] = all_paths
+                request.input_paths = input_paths
+
+        request.output_dir = self.to_kernel_path(output_dir)
+
+    def _build_run_kwargs(self, kernel_id: str, kernel: KernelInfo, env: dict) -> dict:
+        """Build Docker ``containers.run()`` keyword arguments.
+
+        Adapts volume mounts and networking for local vs Docker-in-Docker.
+        Always mounts the catalog_tables directory so kernel cells can read
+        and write Delta-format catalog tables directly; no other host folder
+        is ever mounted (a notebook kernel reads files through core).
+        """
+        run_kwargs: dict = {
+            "detach": True,
+            "name": f"flowfile-kernel-{kernel_id}",
+            "environment": env,
+            "mem_limit": f"{kernel.memory_gb}g",
+            "nano_cpus": int(kernel.cpu_cores * 1e9),
+            # Ownership, so GC and shutdown don't have to infer it from the name.
+            "labels": {
+                _IMAGE_LABEL_CORE_INSTANCE: self._core_instance_id,
+                _CONTAINER_LABEL_CORE_RUNTIME: self._runtime_id,
+                _CONTAINER_LABEL_CORE_PID: str(os.getpid()),
+                _IMAGE_LABEL_KERNEL_ID: _KERNEL_ID_TAG_RE.sub("-", kernel_id.lower()),
+            },
+        }
+
+        if self._kernel_volume:
+            # The same volume at the same path, so file paths match in core, worker and kernel.
+            mount_type = self._kernel_volume_type or "volume"
+            mount_target = self._kernel_mount_target or "/app/internal_storage"
+            mounts = [
+                docker.types.Mount(
+                    target=mount_target,
+                    source=self._kernel_volume,
+                    type=mount_type,
+                    read_only=False,
+                )
+            ]
+            # Catalog tables sit under the user data directory, usually a volume of its own.
+            if self._catalog_volume:
+                mounts.append(
+                    docker.types.Mount(
+                        target=self._catalog_mount_target or "/app/user_data",
+                        source=self._catalog_volume,
+                        type=self._catalog_volume_type or "volume",
+                        read_only=False,
+                    )
+                )
+            run_kwargs["mounts"] = mounts
+            if self._docker_network:
+                run_kwargs["network"] = self._docker_network
+        else:
+            # Local: bind-mount the shared dir + the catalog_tables dir, and map ports.
+            os.makedirs(self._catalog_tables_dir, exist_ok=True)
+            run_kwargs["volumes"] = {
+                self._shared_volume: {"bind": "/shared", "mode": "rw"},
+                self._catalog_tables_dir: {"bind": "/catalog_tables", "mode": "rw"},
+            }
+            run_kwargs["ports"] = {"9999/tcp": kernel.port}
+            run_kwargs["extra_hosts"] = {"host.docker.internal": "host-gateway"}
+
+        return run_kwargs
+
+    # Database persistence helpers
+
+    def _restore_kernels_from_db(self) -> bool:
+        """Load persisted kernel configs from the database on startup.
+
+        Returns whether the registry is authoritative. A failure here still
+        leaves the manager usable, but the empty registry it produces is
+        indistinguishable from "no kernels exist" — and the GC passes that
+        follow read it as ground truth, so they must know the difference.
+        """
+        try:
+            from flowfile_core.database.connection import get_db_context
+            from flowfile_core.kernel.persistence import get_all_kernel_scratch_ids, get_all_kernels
+
+            with get_db_context() as db:
+                kernel_rows = list(get_all_kernels(db))
+                scratch_ids = get_all_kernel_scratch_ids(db)
+            # Guard the registry mutation against a concurrent reconcile/create/delete.
+            with self._kernels_lock:
+                for config, resolved_packages, user_id in kernel_rows:
+                    if config.id in self._kernels:
+                        continue
+                    kernel = KernelInfo(
+                        id=config.id,
+                        name=config.name,
+                        state=KernelState.STOPPED,
+                        packages=config.packages,
+                        resolved_packages=resolved_packages,
+                        memory_gb=config.memory_gb,
+                        cpu_cores=config.cpu_cores,
+                        gpu=config.gpu,
+                        image_flavour=config.image_flavour,
+                        custom_image=config.custom_image,
+                    )
+                    self._kernels[config.id] = kernel
+                    self._kernel_owners[config.id] = user_id
+                    logger.info("Restored kernel '%s' for user %d from database", config.id, user_id)
+                # Missing ids (kernels older than the column) are filled in lazily by get_scratch_flow_id.
+                for kernel_id, scratch_id in scratch_ids.items():
+                    if scratch_id is not None:
+                        self._scratch_flow_ids[kernel_id] = scratch_id
+            return True
+        except Exception:
+            # Full traceback: a missing column here once hid behind a one-line warning.
+            logger.exception("Could not restore kernels from database")
+            return False
+
+    def reconcile_configs_from_db(self, owner_id: int | None = None) -> None:
+        """Sync the in-memory kernel registry with the persisted configs after a project import.
+
+        When ``owner_id`` is provided (the normal import path), only that owner's kernels are
+        reconciled: newly imported rows are added, rows pruned from the DB are removed, and no other
+        tenant's kernels are touched (L11). Without ``owner_id`` the full registry is reconciled
+        (startup / admin path). The ``_kernels_lock`` is held for the full mutation so concurrent
+        imports can't interleave partial states.
+
+        A running kernel keeps its live container — only a STOPPED kernel's cached config is
+        refreshed to match the imported definition (a running container still reflects the config it
+        was started with). Kernels with a start flight in progress are skipped entirely so the
+        reconcile can't prune or reconfigure a kernel out from under its flight leader. CREATING
+        kernels are likewise never pruned: they are deliberately not in the DB until the image bake
+        finishes, so absence from the DB says nothing about them."""
+        try:
+            from flowfile_core.database.connection import get_db_context
+            from flowfile_core.kernel.persistence import get_all_kernels
+
+            with get_db_context() as db:
+                all_rows = {cfg.id: (cfg, resolved, uid) for cfg, resolved, uid in get_all_kernels(db)}
+        except Exception:
+            logger.warning("Could not reconcile kernels from database", exc_info=True)
+            return
+
+        with self._kernels_lock:
+            if owner_id is not None:
+                # Scope to importing owner's kernels only.
+                owner_rows = {kid: v for kid, v in all_rows.items() if v[2] == owner_id}
+                # Drop the owner's kernels that are no longer in the DB (pruned); never touch other owners.
+                for kernel_id in list(self._kernels):
+                    if (
+                        self._kernel_owners.get(kernel_id) == owner_id
+                        and kernel_id not in owner_rows
+                        and not self._has_active_flight(kernel_id)
+                        and self._kernels[kernel_id].state != KernelState.CREATING
+                    ):
+                        self._cleanup_container(kernel_id)
+                        self._kernels.pop(kernel_id, None)
+                        self._kernel_owners.pop(kernel_id, None)
+                        self._scratch_flow_ids.pop(kernel_id, None)
+                rows = owner_rows
+            else:
+                # Full reconcile (startup): drop any kernel absent from the DB entirely.
+                for kernel_id in list(self._kernels):
+                    if (
+                        kernel_id not in all_rows
+                        and not self._has_active_flight(kernel_id)
+                        and self._kernels[kernel_id].state != KernelState.CREATING
+                    ):
+                        self._cleanup_container(kernel_id)
+                        self._kernels.pop(kernel_id, None)
+                        self._kernel_owners.pop(kernel_id, None)
+                        self._scratch_flow_ids.pop(kernel_id, None)
+                rows = all_rows
+
+            # Add missing rows as STOPPED kernels; refresh the cached config of stopped ones.
+            for kernel_id, (config, resolved_packages, user_id) in rows.items():
+                existing = self._kernels.get(kernel_id)
+                if existing is None:
+                    self._kernels[kernel_id] = KernelInfo(
+                        id=config.id,
+                        name=config.name,
+                        state=KernelState.STOPPED,
+                        packages=config.packages,
+                        resolved_packages=resolved_packages,
+                        memory_gb=config.memory_gb,
+                        cpu_cores=config.cpu_cores,
+                        gpu=config.gpu,
+                        image_flavour=config.image_flavour,
+                        custom_image=config.custom_image,
+                    )
+                    self._kernel_owners[kernel_id] = user_id
+                elif existing.state == KernelState.STOPPED and not self._has_active_flight(kernel_id):
+                    existing.name = config.name
+                    existing.packages = config.packages
+                    existing.resolved_packages = resolved_packages
+                    existing.memory_gb = config.memory_gb
+                    existing.cpu_cores = config.cpu_cores
+                    existing.gpu = config.gpu
+                    existing.image_flavour = config.image_flavour
+                    existing.custom_image = config.custom_image
+                    self._kernel_owners[kernel_id] = user_id
+
+    def _persist_kernel(self, kernel: KernelInfo, user_id: int) -> None:
+        """Save a kernel record to the database, then re-project the project's kernels manifest."""
+        try:
+            from flowfile_core.database.connection import get_db_context
+            from flowfile_core.kernel.persistence import save_kernel
+
+            with get_db_context() as db:
+                save_kernel(db, kernel, user_id)
+            from flowfile_core.project import project_sync
+
+            project_sync.kernels_changed(user_id)
+        except Exception as exc:
+            logger.warning("Could not persist kernel '%s': %s", kernel.id, exc)
+
+    def _remove_kernel_from_db(self, kernel_id: str) -> None:
+        """Remove a kernel record from the database."""
+        try:
+            from flowfile_core.database.connection import get_db_context
+            from flowfile_core.kernel.persistence import delete_kernel
+
+            with get_db_context() as db:
+                delete_kernel(db, kernel_id)
+        except Exception as exc:
+            logger.warning("Could not remove kernel '%s' from database: %s", kernel_id, exc)
+
+    def _provision_scratch_flow(self, kernel_id: str, user_id: int) -> None:
+        """Create a scratch FlowRegistration row for *kernel_id* if missing.
+
+        It is the ``source_registration_id`` of a publish with no flow in scope, so every artifact keeps a
+        producing flow without the user registering one.
+
+        The scratch flow is registered inside the seeded ``General/default``
+        schema so that artifacts published from cells without an explicit
+        ``namespace_id`` inherit that namespace and become visible in the
+        catalog UI's tree view (which only walks ``namespace_id`` non-null
+        rows). Safe to call multiple times — does nothing if the kernel
+        already has one cached. Failures are logged and swallowed; publish
+        calls then fall back to the legacy "no source registration" path
+        (warning + return -1).
+        """
+        # Check-then-insert under one lock; the path runs once per kernel, so contention is rare.
+        with self._scratch_flow_lock:
+            if kernel_id in self._scratch_flow_ids:
+                return
+            try:
+                from flowfile_core.catalog import SQLAlchemyCatalogRepository
+                from flowfile_core.catalog.service import CatalogService
+                from flowfile_core.database.connection import get_db_context
+                from flowfile_core.database.models import FlowRegistration
+                from flowfile_core.kernel.persistence import set_kernel_scratch_flow_id
+
+                with get_db_context() as db:
+                    # Without a default schema yet, artifacts still publish but stay out of the catalog tree.
+                    try:
+                        default_namespace_id = CatalogService(
+                            SQLAlchemyCatalogRepository(db)
+                        ).get_default_namespace_id()
+                    except Exception:
+                        default_namespace_id = None
+                    flow = FlowRegistration(
+                        name=f"_kernel_scratch_{kernel_id}",
+                        description=(
+                            "Auto-created producer for artifacts published from "
+                            f"kernel '{kernel_id}' interactive cells."
+                        ),
+                        flow_path=f"<kernel:{kernel_id}>",
+                        namespace_id=default_namespace_id,
+                        owner_id=user_id,
+                    )
+                    db.add(flow)
+                    db.commit()
+                    db.refresh(flow)
+                    set_kernel_scratch_flow_id(db, kernel_id, flow.id)
+                    self._scratch_flow_ids[kernel_id] = flow.id
+                    logger.debug(
+                        "Provisioned scratch FlowRegistration id=%s (namespace=%s) for kernel '%s'",
+                        flow.id,
+                        default_namespace_id,
+                        kernel_id,
+                    )
+            except Exception:
+                logger.exception(
+                    "Could not provision scratch FlowRegistration for kernel '%s'",
+                    kernel_id,
+                )
+
+    def _discard_scratch_flow(self, kernel_id: str) -> None:
+        """Delete the scratch FlowRegistration row (if any) on kernel deletion.
+
+        Routed through ``CatalogService`` rather than a raw ``db.delete`` so the
+        canonical delete fan-out runs: sharing grants are dropped (SQLite reuses
+        rowids, so a stale grant would re-attach to a future flow), historical runs
+        are detached instead of left dangling, and a scratch flow whose artifacts
+        are still live is kept rather than leaving them with a missing producer.
+        """
+        scratch_id = self._scratch_flow_ids.pop(kernel_id, None)
+        if scratch_id is None:
+            return
+        try:
+            from flowfile_core.catalog import SQLAlchemyCatalogRepository
+            from flowfile_core.catalog.exceptions import FlowHasArtifactsError, FlowNotFoundError
+            from flowfile_core.catalog.service import CatalogService
+            from flowfile_core.database.connection import get_db_context
+
+            with get_db_context() as db:
+                try:
+                    CatalogService(SQLAlchemyCatalogRepository(db)).delete_flow(scratch_id, delete_file=False)
+                except FlowNotFoundError:
+                    pass
+                except FlowHasArtifactsError:
+                    logger.debug(
+                        "Kept scratch FlowRegistration id=%s for kernel '%s': artifacts still reference it",
+                        scratch_id,
+                        kernel_id,
+                    )
+        except Exception as exc:
+            logger.warning(
+                "Could not delete scratch FlowRegistration id=%s for kernel '%s': %s",
+                scratch_id,
+                kernel_id,
+                exc,
+            )
+
+    def get_scratch_flow_id(self, kernel_id: str) -> int | None:
+        """Return the kernel's scratch FlowRegistration id, provisioning lazily if absent.
+
+        Called by the execute path when no explicit ``source_registration_id``
+        is in scope. The lazy-provision branch covers kernels created before
+        the auto-scratch feature shipped (their row has ``NULL`` in the new
+        column) and edges where the scratch was removed out-of-band.
+        """
+        cached = self._scratch_flow_ids.get(kernel_id)
+        if cached is not None:
+            return cached
+        user_id = self._kernel_owners.get(kernel_id)
+        if user_id is None:
+            return None
+        self._provision_scratch_flow(kernel_id, user_id)
+        return self._scratch_flow_ids.get(kernel_id)
+
+    # Port allocation
+
+    @staticmethod
+    def _container_label(container, key: str) -> str | None:
+        labels = getattr(container, "labels", None)
+        return labels.get(key) if isinstance(labels, dict) else None
+
+    def _is_our_install_container(self, container) -> bool:
+        """Whether this install built the container — the scope startup GC uses.
+
+        Unlabelled containers count as ours: they predate labelling, and this
+        pass is the only thing that will ever clean them up.
+        """
+        label = self._container_label(container, _IMAGE_LABEL_CORE_INSTANCE)
+        return label is None or label == self._core_instance_id
+
+    def _claims_ownership(self, container) -> bool:
+        """Whether this process may shut *container* down at exit.
+
+        Ours outright, or this install started it from a process that has since
+        died — a core killed without cleaning up hands its kernels to whoever
+        restarts, otherwise every hard kill leaks a container forever. A live
+        owner keeps its own kernels, which is what stops one core from tearing
+        down another's mid-run.
+
+        A pid can be recycled across a reboot, so a stale label may read as
+        alive; that direction only leaks, never kills someone else's kernel.
+        """
+        if self._container_label(container, _CONTAINER_LABEL_CORE_RUNTIME) == self._runtime_id:
+            return True
+        if not self._is_our_install_container(container):
+            return False
+        pid_label = self._container_label(container, _CONTAINER_LABEL_CORE_PID)
+        if pid_label is None:
+            return False  # predates the label — can't tell, so don't touch it
+        try:
+            pid = int(pid_label)
+        except (TypeError, ValueError):
+            return False
+        return not _pid_is_alive(pid)
+
+    def _reclaim_running_containers(self, prune_orphans: bool = True) -> None:
+        """Adopt pre-existing flowfile-kernel containers on startup: running ones
+        become IDLE, stopped leftovers are recorded so the next start replaces them.
+
+        ``prune_orphans=False`` keeps the adoption half and skips destroying
+        containers the registry doesn't know about — correct when the registry
+        itself is untrustworthy.
+        """
+        try:
+            containers = self._docker.containers.list(all=True, filters={"name": "flowfile-kernel-"})
+        except (docker.errors.APIError, docker.errors.DockerException) as exc:
+            logger.warning("Could not list running containers: %s", exc)
+            return
+
+        for container in containers:
+            name = container.name
+            if not name.startswith("flowfile-kernel-"):
+                continue
+            kernel_id = name[len("flowfile-kernel-") :]
+
+            if kernel_id in self._kernels:
+                kernel = self._kernels[kernel_id]
+                if container.status == "running":
+                    # Kernel was restored from DB — update with runtime info
+                    port = self._host_port_of(container) if not self._kernel_volume else None
+                    kernel.container_id = container.id
+                    if port is not None:
+                        kernel.port = port
+                    kernel.state = KernelState.IDLE
+                    # Inherit shutdown duty from a dead owner, or the container outlives every restart.
+                    if self._claims_ownership(container):
+                        self._started_here.add(kernel_id)
+                    logger.info(
+                        "Reclaimed running kernel '%s' (container %s)",
+                        kernel_id,
+                        container.short_id,
+                    )
+                else:
+                    # Record the leftover so the next start replaces it instead of 409ing.
+                    kernel.container_id = container.id
+                    kernel.state = KernelState.STOPPED
+                    logger.info(
+                        "Found stopped kernel container '%s' (container %s); will be replaced on next start",
+                        kernel_id,
+                        container.short_id,
+                    )
+            elif not prune_orphans:
+                logger.warning(
+                    "Leaving kernel container '%s' alone: it has no registry entry, but the "
+                    "registry is not authoritative this start",
+                    kernel_id,
+                )
+            elif not self._is_our_install_container(container):
+                logger.info(
+                    "Leaving kernel container '%s' alone: it belongs to another core process",
+                    kernel_id,
+                )
+            elif _too_young_to_reap(container.attrs.get("Created")):
+                logger.info(
+                    "Leaving kernel container '%s' alone: created too recently to be an orphan",
+                    kernel_id,
+                )
+            else:
+                # Orphan container with no DB record — stop it
+                logger.warning(
+                    "Found orphan kernel container '%s' with no database record, stopping it",
+                    kernel_id,
+                )
+                try:
+                    container.stop(timeout=10)
+                    container.remove(force=True)
+                except Exception as exc:
+                    logger.warning("Error stopping orphan container '%s': %s", kernel_id, exc)
+
+    @staticmethod
+    def _host_port_of(container) -> int | None:
+        """Host port mapped to the kernel's 9999/tcp, if any (local mode only)."""
+        try:
+            bindings = container.attrs["NetworkSettings"]["Ports"].get("9999/tcp")
+            if bindings:
+                return int(bindings[0]["HostPort"])
+        except (KeyError, IndexError, TypeError, ValueError):
+            pass
+        return None
+
+    def _allocate_port(self) -> int:
+        """Find the next available port in the kernel port range."""
+        used_ports = {k.port for k in self._kernels.values() if k.port is not None}
+        for port in range(_BASE_PORT, _BASE_PORT + _PORT_RANGE):
+            if port not in used_ports and _is_port_available(port):
+                return port
+        raise RuntimeError(f"No available ports in range {_BASE_PORT}-{_BASE_PORT + _PORT_RANGE - 1}")
+
+    # Image discovery and pulling
+
+    def resolve_local_image(self, flavour: ImageFlavour) -> str | None:
+        """Public accessor for the local-image fallback resolver.
+
+        Returns the tag actually in use for ``flavour`` (registry default if
+        present locally, else a ``flowfile-kernel-<flavour>:*`` variant). Used
+        by the docker-status route so the UI can show "Found locally: X".
+        """
+        if flavour == ImageFlavour.CUSTOM:
+            return None
+        registry_default = _flavour_images()[flavour]
+        return _resolve_local_image(flavour, self._docker, registry_default)
+
+    def get_pull_state(self, image_tag: str) -> str | None:
+        """Return current pull state for ``image_tag``, or ``None`` if idle."""
+        with self._pull_state_lock:
+            return self._pull_state.get(image_tag)
+
+    def start_image_pull(self, flavour: ImageFlavour) -> str:
+        """Kick off a background pull for the flavour's registry-default image.
+
+        Idempotent: if a pull is already running for that tag, returns the
+        existing state without spawning a duplicate worker.
+        """
+        if flavour == ImageFlavour.CUSTOM:
+            raise ValueError(
+                "Cannot pull the 'custom' flavour: no canonical image to pull. "
+                "Provide a custom image URI when creating the kernel instead."
+            )
+        image_tag = _flavour_images()[flavour]
+        with self._pull_state_lock:
+            existing = self._pull_state.get(image_tag)
+            if existing == "pulling":
+                return existing
+            self._pull_state[image_tag] = "pulling"
+
+        threading.Thread(
+            target=self._do_pull,
+            args=(image_tag,),
+            name=f"image-pull-{image_tag}",
+            daemon=True,
+        ).start()
+        return "pulling"
+
+    def _do_pull(self, image_tag: str) -> None:
+        """Fetch ``image_tag``: on a background thread for ``start_image_pull``, inline for ``_ensure_image``.
+
+        On success clears the pull state (the image is now locally available,
+        and a follow-up ``docker-status`` poll will reflect that). On failure
+        stores ``error:<message>`` so the UI can show what went wrong.
+        """
+        try:
+            # docker-py's parser keeps registry ports and @sha256 digests intact; a naive split on ":" does not.
+            repo, tag = docker.utils.parse_repository_tag(image_tag)
+            self._docker.images.pull(repo, tag=tag or "latest")
+            with self._pull_state_lock:
+                self._pull_state.pop(image_tag, None)
+            logger.info("Pulled image '%s'", image_tag)
+        except Exception as exc:
+            msg = _friendly_pull_error(exc, image_tag)
+            with self._pull_state_lock:
+                self._pull_state[image_tag] = f"error:{msg}"
+            logger.exception("Failed to pull image '%s'", image_tag)
+
+    def _image_present(self, image_tag: str) -> bool:
+        try:
+            self._docker.images.get(image_tag)
+            return True
+        except docker.errors.ImageNotFound:
+            return False
+
+    def _ensure_image(self, image_tag: str) -> None:
+        """Make sure ``image_tag`` is on the host, pulling it inline when it is not.
+
+        A background pull already running for the tag (``start_image_pull``) is
+        awaited instead of duplicated. The pull itself runs on the calling thread,
+        so callers must not hold ``_kernels_lock``. A failed pull raises
+        ``RuntimeError`` with the friendly message and leaves the ``error:<msg>``
+        state recorded, so docker-status shows it exactly as for background pulls.
+        """
+        if self._image_present(image_tag):
+            return
+        with self._pull_state_lock:
+            in_flight = self._pull_state.get(image_tag) == "pulling"
+            if not in_flight:
+                self._pull_state[image_tag] = "pulling"
+        if in_flight:
+            while self.get_pull_state(image_tag) == "pulling":
+                time.sleep(0.5)
+            if self._image_present(image_tag):
+                return
+        else:
+            self._do_pull(image_tag)
+        state = self.get_pull_state(image_tag) or ""
+        if state.startswith("error:"):
+            raise RuntimeError(state.removeprefix("error:"))
+        if in_flight:
+            raise RuntimeError(f"Image '{image_tag}' is still missing after the pull finished.")
+
+    # Derived image build (per-kernel, packages baked in)
+
+    def _tag_build_lock(self, tag: str) -> threading.Lock:
+        with self._build_locks_lock:
+            return self._build_locks.setdefault(tag, threading.Lock())
+
+    def _build_derived_image(self, kernel: KernelInfo) -> str:
+        """Build a derived image with the kernel's extra packages baked in.
+
+        Reuses the existing image if it is already present locally. At most one
+        build runs per tag; concurrent callers wait and reuse the result.
+        Returns the derived image tag.
+        """
+        _validate_packages(kernel.packages)
+        base_image = _resolve_image(kernel.image_flavour, kernel.custom_image, self._docker)
+        derived_tag = _derived_image_tag(kernel.id)
+
+        with self._tag_build_lock(derived_tag):
+            return self._build_derived_image_locked(kernel, base_image, derived_tag)
+
+    def _build_derived_image_locked(self, kernel: KernelInfo, base_image: str, derived_tag: str) -> str:
+        try:
+            existing = self._docker.images.get(derived_tag)
+        except docker.errors.ImageNotFound:
+            existing = None
+        if existing is not None:
+            # The base pin moved (an app or kernel release): bake again on the new base.
+            if self._container_label(existing, _IMAGE_LABEL_BASE_IMAGE) == base_image:
+                logger.info("Reusing existing derived image '%s'", derived_tag)
+                return derived_tag
+            logger.info("Derived image '%s' was built on another base than '%s'; rebuilding", derived_tag, base_image)
+            self._remove_derived_image(kernel.id)
+
+        # Pull the FROM image ourselves: docker build would otherwise reach the registry with a confusing error.
+        self._ensure_image(base_image)
+
+        # JSON exec form: each package is its own argv item, with no shell and no quoting.
+        pip_args = ["pip", "install", "--no-cache-dir", "--constraint", "/opt/constraints.txt"] + list(kernel.packages)
+        safe_kernel_id = _KERNEL_ID_TAG_RE.sub("-", kernel.id.lower())
+        dockerfile = (
+            f"FROM {base_image}\n"
+            f"LABEL {_IMAGE_LABEL_CORE_INSTANCE}={self._core_instance_id}\n"
+            f"LABEL {_IMAGE_LABEL_KERNEL_ID}={safe_kernel_id}\n"
+            f"LABEL {_IMAGE_LABEL_BASE_IMAGE}={json.dumps(base_image)}\n"
+            f"RUN {json.dumps(pip_args)}\n"
+        )
+
+        logger.info(
+            "Building derived image '%s' on top of '%s' (%d extra packages)",
+            derived_tag,
+            base_image,
+            len(kernel.packages),
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "Dockerfile").write_text(dockerfile)
+            try:
+                self._docker.images.build(
+                    path=tmpdir,
+                    tag=derived_tag,
+                    rm=True,
+                    forcerm=True,
+                    pull=False,
+                )
+            except docker.errors.BuildError as exc:
+                log = [
+                    line.get("stream", "").rstrip()
+                    for line in (exc.build_log or [])
+                    if isinstance(line, dict) and line.get("stream")
+                ]
+                logger.error("Baking packages into '%s' failed: %s\n%s", derived_tag, exc, "\n".join(log))
+                reason = exc.msg if isinstance(exc.msg, str) else ""
+                raise RuntimeError(bake_failure_summary(kernel.packages, log, reason)) from exc
+        return derived_tag
+
+    def _resolve_installed_versions(self, image_tag: str, package_specs: list[str]) -> list[ResolvedPackage]:
+        """Run ``pip list`` inside the derived image and return the resolved
+        version for each user-requested package.
+
+        Best-effort: returns an empty list if the inspection fails so a single
+        flaky read doesn't break kernel creation.
+        """
+        if not package_specs:
+            return []
+        wanted = {_spec_to_name(s): s for s in package_specs}
+        # Explicit lifecycle so the finally removes the container on every path.
+        container = None
+        try:
+            container = self._docker.containers.create(
+                image_tag,
+                name=f"flowfile-pipresolve-{uuid.uuid4().hex[:12]}",
+                entrypoint=["pip"],
+                command=["list", "--format=json", "--disable-pip-version-check"],
+            )
+            container.start()
+            container.wait(timeout=120)
+            output = container.logs(stdout=True, stderr=False)
+        except (docker.errors.ContainerError, docker.errors.APIError, docker.errors.DockerException, OSError) as exc:
+            logger.warning("Could not inspect '%s' for resolved versions: %s", image_tag, exc)
+            return []
+        finally:
+            if container is not None:
+                try:
+                    container.remove(force=True)
+                except docker.errors.DockerException:
+                    pass
+
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        try:
+            installed = json.loads(output)
+        except (TypeError, json.JSONDecodeError) as exc:
+            logger.warning("Could not parse pip list output from '%s': %s", image_tag, exc)
+            return []
+
+        installed_by_name = {
+            re.sub(r"[-_.]+", "-", str(p.get("name", "")).lower()): str(p.get("version", ""))
+            for p in installed
+            if isinstance(p, dict)
+        }
+
+        # Preserve the order the user specified.
+        resolved: list[ResolvedPackage] = []
+        for spec in package_specs:
+            name = _spec_to_name(spec)
+            version = installed_by_name.get(name)
+            if version:
+                # pip's canonical name, else the name the user typed before any extras.
+                display_name = next(
+                    (
+                        str(p["name"])
+                        for p in installed
+                        if isinstance(p, dict) and re.sub(r"[-_.]+", "-", str(p.get("name", "")).lower()) == name
+                    ),
+                    wanted[name].split("[", 1)[0],
+                )
+                resolved.append(ResolvedPackage(name=display_name, version=version))
+        return resolved
+
+    def _remove_derived_image(self, kernel_id: str) -> None:
+        """Best-effort removal of the per-kernel derived image."""
+        tag = _derived_image_tag(kernel_id)
+        try:
+            self._docker.images.remove(tag, force=True)
+            logger.info("Removed derived image '%s'", tag)
+        except docker.errors.ImageNotFound:
+            pass
+        except docker.errors.APIError as exc:
+            logger.warning("Could not remove derived image '%s': %s", tag, exc)
+
+    def _remove_orphan_derived_images(self) -> None:
+        """Remove derived kernel images whose owning kernel no longer exists.
+
+        Called once at startup, after ``_restore_kernels_from_db``, so any
+        derived image left over from a kernel that was deleted between core
+        runs (e.g. core crashed between dropping the DB row and removing the
+        image) gets reclaimed. Each orphan is hundreds of MB.
+
+        Filters by the ``flowfile_core_instance`` label so two Core instances
+        sharing a Docker daemon don't wipe each other's images. Uses the
+        ``flowfile_kernel_id`` label as the source of truth — falls back to
+        tag-name parsing only for legacy un-labelled images.
+        """
+        try:
+            images = self._docker.images.list(
+                filters={"label": f"{_IMAGE_LABEL_CORE_INSTANCE}={self._core_instance_id}"}
+            )
+        except (docker.errors.APIError, docker.errors.DockerException) as exc:
+            logger.warning("Could not list images for orphan GC: %s", exc)
+            return
+
+        # Sanitisation is not reversible, so compare on the sanitised id.
+        expected = {_KERNEL_ID_TAG_RE.sub("-", kid.lower()) for kid in self._kernels}
+        prefix = "flowfile-kernel-derived-"
+
+        for image in images:
+            labels = image.labels or {}
+            safe_id = labels.get(_IMAGE_LABEL_KERNEL_ID)
+            if not safe_id:
+                # An image built before the labels: read the kernel id from its tag.
+                for tag in image.tags or []:
+                    if tag.startswith(prefix):
+                        safe_id = tag.split(":", 1)[0][len(prefix) :]
+                        break
+            if not safe_id or safe_id in expected:
+                continue
+            # A fresh image is more likely a bake still finishing elsewhere than an orphan.
+            if _too_young_to_reap((image.attrs or {}).get("Created")):
+                logger.info("Leaving derived image for '%s' alone: created too recently", safe_id)
+                continue
+            # The canonical tag, else the image id when no tag is left.
+            target = next(
+                (t for t in (image.tags or []) if t.startswith(prefix)),
+                image.id,
+            )
+            try:
+                self._docker.images.remove(target, force=True)
+                logger.info("Removed orphan derived image '%s'", target)
+            except docker.errors.ImageNotFound:
+                pass
+            except docker.errors.APIError as exc:
+                logger.warning("Could not remove orphan derived image '%s': %s", target, exc)
+
+    def _remove_orphan_build_containers(self) -> None:
+        """Remove pip-resolver and build-step containers left by an interrupted
+        bake; kernel containers are excluded by name so adopted ones survive."""
+        try:
+            # A running resolver may be a sibling core's, and removes itself when done.
+            candidates = [
+                c
+                for c in self._docker.containers.list(all=True, filters={"name": "flowfile-pipresolve-"})
+                if c.name.startswith("flowfile-pipresolve-") and c.status != "running"
+            ]
+            candidates += [
+                c
+                for c in self._docker.containers.list(
+                    all=True,
+                    filters={"label": f"{_IMAGE_LABEL_CORE_INSTANCE}={self._core_instance_id}"},
+                )
+                if not c.name.startswith("flowfile-kernel-") and c.status != "running"
+            ]
+        except (docker.errors.APIError, docker.errors.DockerException) as exc:
+            logger.warning("Could not list containers for build-orphan GC: %s", exc)
+            return
+
+        for container in candidates:
+            try:
+                container.remove(force=True)
+                logger.info("Removed orphan build container '%s'", container.name)
+            except docker.errors.NotFound:
+                pass
+            except (docker.errors.APIError, docker.errors.DockerException) as exc:
+                logger.warning("Could not remove orphan build container '%s': %s", container.name, exc)
+
+    def _build_kernel_env(self, kernel_id: str, kernel: KernelInfo) -> dict[str, str]:
+        """Build the environment dictionary for a kernel container.
+
+        This centralizes all environment variables passed to kernel containers,
+        including Core API connection, authentication, and persistence settings.
+        """
+        # Packages are pre-baked into the derived image, so the entrypoint's install loop must do nothing.
+        env = {"KERNEL_PACKAGES": ""}
+        # FLOWFILE_CORE_URL: how kernel reaches Core API from inside Docker.
+        env["FLOWFILE_CORE_URL"] = core_base_url(bool(self._docker_network))
+        # Kernel-to-core auth; get_internal_token() mints the token in Electron mode before the kernel starts.
+        try:
+            from flowfile_core.auth.jwt import get_internal_token
+
+            env["FLOWFILE_INTERNAL_TOKEN"] = get_internal_token()
+        except (ValueError, ImportError):
+            # Token not configured (e.g. local dev without env var) – skip
+            internal_token = os.environ.get("FLOWFILE_INTERNAL_TOKEN")
+            if internal_token:
+                env["FLOWFILE_INTERNAL_TOKEN"] = internal_token
+        # FLOWFILE_KERNEL_ID: pass kernel ID for lineage tracking
+        env["FLOWFILE_KERNEL_ID"] = kernel_id
+        # Lets the kernel translate core's paths to /shared; in Docker-in-Docker the paths already match.
+        if not self._kernel_volume:
+            env["FLOWFILE_HOST_SHARED_DIR"] = self._shared_volume
+        # The shared directory as the kernel sees it, for flowfile_ctx.get_shared_location().
+        env["FLOWFILE_KERNEL_SHARED_DIR"] = self.to_kernel_path(self._shared_volume)
+        # Catalog table paths translate like the shared dir: the host path (local mode only), the kernel's view.
+        if not self._kernel_volume:
+            env["FLOWFILE_HOST_CATALOG_TABLES_DIR"] = self._catalog_tables_dir
+        env["FLOWFILE_KERNEL_CATALOG_TABLES_DIR"] = self.to_kernel_path(self._catalog_tables_dir)
+        env["KERNEL_ID"] = kernel_id
+        env["PERSISTENCE_ENABLED"] = "true" if kernel.persistence_enabled else "false"
+        env["PERSISTENCE_PATH"] = self.to_kernel_path(os.path.join(self._shared_volume, "artifacts"))
+        env["RECOVERY_MODE"] = kernel.recovery_mode.value
+        if not self._kernel_volume:
+            env.update(_notebook_env(kernel))
+        return env
+
+    async def create_kernel(self, config: KernelConfig, user_id: int) -> KernelInfo:
+        # Validate first, so nothing invalid is registered or starts a long pull or build.
+        try:
+            base_image = _resolve_image(config.image_flavour, config.custom_image, self._docker)
+            _validate_packages(config.packages)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+
+        # One lock for the check, the port and the registration; CREATING shows the kernel while it bakes.
+        with self._kernels_lock:
+            if config.id in self._kernels:
+                raise ValueError(f"Kernel '{config.id}' already exists")
+            # Docker-in-Docker reaches kernels by container name on the shared network, so no host port.
+            port = None if self._kernel_volume else self._allocate_port()
+            kernel = KernelInfo(
+                id=config.id,
+                name=config.name,
+                state=KernelState.CREATING,
+                port=port,
+                packages=config.packages,
+                memory_gb=config.memory_gb,
+                cpu_cores=config.cpu_cores,
+                gpu=config.gpu,
+                health_timeout=config.health_timeout,
+                image_flavour=config.image_flavour,
+                custom_image=config.custom_image,
+                persistence_enabled=config.persistence_enabled,
+                recovery_mode=config.recovery_mode,
+            )
+            self._kernels[config.id] = kernel
+            self._kernel_owners[config.id] = user_id
+
+        # Pull the base and pre-bake packages so starts skip pip; in threads, as both can take 30-60 s.
+        try:
+            try:
+                await asyncio.to_thread(self._ensure_image, base_image)
+                derived_tag = await asyncio.to_thread(self._build_derived_image, kernel) if config.packages else None
+            except (RuntimeError, ValueError) as exc:
+                raise ValueError(f"Failed to prepare kernel image: {exc}") from exc
+
+            if derived_tag is not None:
+                kernel.resolved_packages = await asyncio.to_thread(
+                    self._resolve_installed_versions, derived_tag, config.packages
+                )
+        except BaseException:
+            # The kernel never existed; the identity check spares a later re-create's entry.
+            with self._kernels_lock:
+                if self._kernels.get(config.id) is kernel:
+                    self._kernels.pop(config.id, None)
+                    self._kernel_owners.pop(config.id, None)
+            raise
+
+        kernel.state = KernelState.STOPPED
+        self._persist_kernel(kernel, user_id)
+        # So artifacts published from interactive cells have a producer.
+        self._provision_scratch_flow(config.id, user_id)
+        logger.info("Created kernel '%s' on port %s for user %d", config.id, port, user_id)
+        return kernel
+
+    async def start_kernel(self, kernel_id: str) -> KernelInfo:
+        return await asyncio.to_thread(self._get_or_start_kernel, kernel_id)
+
+    def start_kernel_sync(self, kernel_id: str, flow_logger: FlowLogger | None = None) -> KernelInfo:
+        """Synchronous version of start_kernel() for use from non-async code."""
+        return self._get_or_start_kernel(kernel_id, flow_logger=flow_logger)
+
+    def _get_or_start_kernel(self, kernel_id: str, flow_logger: FlowLogger | None = None) -> KernelInfo:
+        """Single-flight start: one leader runs the start sequence, concurrent
+        callers wait on the same flight and share its outcome."""
+        kernel = self._get_kernel_or_raise(kernel_id)
+        if kernel.state == KernelState.CREATING:
+            raise ValueError(f"Kernel '{kernel_id}' is still being created")
+        if kernel.state in (KernelState.IDLE, KernelState.EXECUTING):
+            return kernel
+        with self._start_flights_lock:
+            flight = self._start_flights.get(kernel_id)
+            leader = flight is None
+            if leader:
+                flight = Future()
+                self._start_flights[kernel_id] = flight
+        if not leader:
+            return self._wait_for_flight(kernel_id, flight)
+        try:
+            result = self._start_kernel_inner(kernel_id, flow_logger)
+        except BaseException as exc:
+            flight.set_exception(exc)
+            raise
+        else:
+            flight.set_result(result)
+            return result
+        finally:
+            with self._start_flights_lock:
+                self._start_flights.pop(kernel_id, None)
+
+    def _wait_for_flight(self, kernel_id: str, flight: Future) -> KernelInfo:
+        kernel = self._get_kernel_or_raise(kernel_id)
+        deadline = time.monotonic() + kernel.health_timeout + _START_FLIGHT_GRACE
+        while time.monotonic() < deadline:
+            try:
+                return flight.result(timeout=0.5)
+            except (TimeoutError, FutureTimeoutError):
+                # A done flight means the leader itself raised a TimeoutError.
+                if flight.done():
+                    raise
+        raise TimeoutError(f"Timed out waiting for kernel '{kernel_id}' to start")
+
+    def _has_active_flight(self, kernel_id: str) -> bool:
+        with self._start_flights_lock:
+            return kernel_id in self._start_flights
+
+    def _wait_out_flight(self, kernel_id: str, timeout: float | None = None) -> None:
+        """Block until any in-progress start for this kernel finishes (outcome ignored)."""
+        with self._start_flights_lock:
+            flight = self._start_flights.get(kernel_id)
+        if flight is None:
+            return
+        try:
+            if timeout is None:
+                self._wait_for_flight(kernel_id, flight)
+            else:
+                flight.result(timeout=timeout)
+        except Exception:
+            pass
+
+    def _start_kernel_inner(self, kernel_id: str, flow_logger: FlowLogger | None = None) -> KernelInfo:
+        """The actual start sequence. Only ever runs in a flight leader."""
+        kernel = self._get_kernel_or_raise(kernel_id)
+        if kernel.state in (KernelState.IDLE, KernelState.EXECUTING):
+            return kernel
+
+        # Clear any stale container from a failed start or unclean shutdown.
+        self._cleanup_container(kernel_id)
+        kernel.container_id = None
+
+        base_image = _resolve_image(kernel.image_flavour, kernel.custom_image, self._docker)
+
+        # The pin moves with the app (notebook) or a kernel release: a start after an update pulls the new tag.
+        try:
+            self._ensure_image(base_image)
+        except RuntimeError as exc:
+            kernel.state = KernelState.ERROR
+            kernel.error_message = f"Docker image '{base_image}' is not available: {exc}"
+            if flow_logger:
+                flow_logger.error(kernel.error_message)
+            raise RuntimeError(kernel.error_message) from exc
+
+        # Reuses the derived image create_kernel baked, or bakes it if an interrupted run never did.
+        if kernel.packages:
+            try:
+                image = self._build_derived_image(kernel)
+            except (RuntimeError, ValueError) as exc:
+                kernel.state = KernelState.ERROR
+                kernel.error_message = str(exc)
+                if flow_logger:
+                    flow_logger.error(kernel.error_message)
+                raise RuntimeError(kernel.error_message) from exc
+        else:
+            image = base_image
+
+        kernel.image = image
+
+        # Guard the shared-registry read so concurrent launches don't collide on a port.
+        if kernel.port is None and not self._kernel_volume:
+            with self._kernels_lock:
+                kernel.port = self._allocate_port()
+
+        kernel.state = KernelState.STARTING
+        kernel.error_message = None
+
+        # The failure path may only remove a container this flight obtained.
+        created_id: str | None = None
+        try:
+            env = self._build_kernel_env(kernel_id, kernel)
+            run_kwargs = self._build_run_kwargs(kernel_id, kernel, env)
+            container = self._create_or_adopt_container(kernel_id, kernel, image, run_kwargs)
+            created_id = container.id
+            kernel.container_id = container.id
+            # An adopted container belongs to whoever started it; shutdown must leave it running.
+            if self._container_label(container, _CONTAINER_LABEL_CORE_RUNTIME) == self._runtime_id:
+                self._started_here.add(kernel_id)
+            else:
+                self._started_here.discard(kernel_id)
+            self._wait_for_healthy_sync(kernel_id, timeout=kernel.health_timeout)
+            kernel.state = KernelState.IDLE
+            if flow_logger:
+                flow_logger.info(f"Kernel {kernel_id} is idle (container {container.short_id}, image {image})")
+            logger.info("Kernel '%s' is idle (container %s, image %s)", kernel_id, container.short_id, image)
+        except (docker.errors.DockerException, httpx.HTTPError, TimeoutError, OSError) as exc:
+            kernel.state = KernelState.ERROR
+            kernel.error_message = str(exc)
+            flow_logger.error(f"Failed to start kernel {kernel_id}: {exc}") if flow_logger else None
+            logger.error("Failed to start kernel '%s': %s", kernel_id, exc)
+            if created_id is not None:
+                self._remove_container_by_id(created_id)
+                if kernel.container_id == created_id:
+                    kernel.container_id = None
+            raise
+        return kernel
+
+    def _create_or_adopt_container(self, kernel_id: str, kernel: KernelInfo, image: str, run_kwargs: dict):
+        """Create the kernel container, converging on name conflicts.
+
+        A 409 means something holds the name ``flowfile-kernel-<id>`` — an
+        untracked leftover, a removal still in progress, or a create window.
+        Resolve it by adopting the holder when it runs the desired image (start
+        it if stopped), removing it otherwise, and retrying a bounded number of
+        times so transient Docker states converge instead of erroring."""
+        name = f"flowfile-kernel-{kernel_id}"
+        desired_image_id = self._docker.images.get(image).id
+        last_exc: Exception | None = None
+        for attempt in range(_CONVERGE_ATTEMPTS):
+            if attempt:
+                time.sleep(_CONVERGE_DELAY_S)
+            try:
+                return self._docker.containers.run(image, **run_kwargs)
+            except docker.errors.APIError as exc:
+                if exc.status_code != 409:
+                    raise
+                last_exc = exc
+
+            try:
+                holder = self._docker.containers.get(name)
+            except docker.errors.NotFound:
+                continue  # create/removal window — the name should free up
+            except docker.errors.APIError as exc:
+                last_exc = exc
+                continue
+
+            if holder.attrs.get("Image") != desired_image_id:
+                # Stale container (e.g. derived image rebuilt under the same tag).
+                self._remove_container_by_id(holder.id)
+                continue
+
+            if holder.status != "running":
+                try:
+                    holder.start()
+                except (docker.errors.APIError, docker.errors.DockerException) as exc:
+                    last_exc = exc
+                    self._remove_container_by_id(holder.id)
+                    continue
+
+            if not self._kernel_volume:
+                # The adopted container's published port wins over any allocation.
+                holder.reload()
+                port = self._host_port_of(holder)
+                if port is None:
+                    # Unreachable adoption would burn the full health timeout.
+                    self._remove_container_by_id(holder.id)
+                    continue
+                kernel.port = port
+            logger.info("Adopted container '%s' for kernel '%s'", name, kernel_id)
+            return holder
+        raise docker.errors.DockerException(
+            f"Could not start or adopt container '{name}' after {_CONVERGE_ATTEMPTS} attempts"
+        ) from last_exc
+
+    async def stop_kernel(self, kernel_id: str) -> None:
+        kernel = self._get_kernel_or_raise(kernel_id)
+        if kernel.state == KernelState.CREATING:
+            raise ValueError(f"Kernel '{kernel_id}' is still being created")
+        # Don't tear down a container an in-progress start still owns.
+        await asyncio.to_thread(self._wait_out_flight, kernel_id)
+        self._cleanup_container(kernel_id)
+        kernel.state = KernelState.STOPPED
+        kernel.container_id = None
+        from flowfile_core.notebook import kernel_runner  # lazy: kernel_runner imports this package
+
+        kernel_runner.forget_kernel(kernel_id, self._shared_volume)
+        logger.info("Stopped kernel '%s'", kernel_id)
+
+    async def update_kernel(self, kernel_id: str, packages: list[str]) -> KernelInfo:
+        """Update a kernel's package list.
+
+        The kernel must be stopped — package edits trigger a rebuild of the
+        derived image and we don't want to surprise users with a hot restart.
+        """
+        kernel = self._get_kernel_or_raise(kernel_id)
+
+        if kernel.state == KernelState.CREATING:
+            raise RuntimeError(f"Kernel '{kernel_id}' is still being created")
+        if kernel.state in (
+            KernelState.IDLE,
+            KernelState.EXECUTING,
+            KernelState.STARTING,
+        ):
+            raise RuntimeError(
+                f"Cannot edit kernel '{kernel_id}' while it is {kernel.state.value}. " "Stop the kernel first."
+            )
+
+        _validate_packages(packages)
+
+        old_packages = list(kernel.packages)
+        old_resolved = list(kernel.resolved_packages)
+        if packages == old_packages:
+            return kernel
+
+        kernel.packages = packages
+        kernel.resolved_packages = []
+
+        # Old derived image (if any) is now stale.
+        if old_packages:
+            self._remove_derived_image(kernel_id)
+
+        # On failure roll the package list back, so the persisted state matches the images on disk.
+        if packages:
+            try:
+                derived_tag = await asyncio.to_thread(self._build_derived_image, kernel)
+            except (RuntimeError, ValueError) as exc:
+                kernel.packages = old_packages
+                kernel.resolved_packages = old_resolved
+                # Rebuild the previous derived image so the kernel is startable.
+                if old_packages:
+                    try:
+                        await asyncio.to_thread(self._build_derived_image, kernel)
+                    except Exception as restore_exc:  # noqa: BLE001
+                        logger.warning(
+                            "Could not restore previous derived image for '%s': %s",
+                            kernel_id,
+                            restore_exc,
+                        )
+                raise ValueError(f"Failed to update kernel image: {exc}") from exc
+
+            kernel.resolved_packages = await asyncio.to_thread(self._resolve_installed_versions, derived_tag, packages)
+
+        user_id = self._kernel_owners.get(kernel_id)
+        if user_id is not None:
+            self._persist_kernel(kernel, user_id)
+        logger.info("Updated kernel '%s' packages → %s", kernel_id, packages)
+        return kernel
+
+    async def delete_kernel(self, kernel_id: str) -> None:
+        kernel = self._get_kernel_or_raise(kernel_id)
+        if kernel.state == KernelState.CREATING:
+            raise ValueError(f"Kernel '{kernel_id}' is still being created — wait for creation to finish")
+        owner_id = self._kernel_owners.get(kernel_id)  # capture before the pop, for the project hook
+        # Unconditional: a STOPPED/ERROR kernel may still track a leftover container.
+        await self.stop_kernel(kernel_id)
+        had_packages = bool(kernel.packages)
+        # Explicitly, or the scratch flow outlives its kernel; a missing row is tolerated.
+        self._discard_scratch_flow(kernel_id)
+        with self._kernels_lock:
+            del self._kernels[kernel_id]
+            self._kernel_owners.pop(kernel_id, None)
+        self._remove_kernel_from_db(kernel_id)
+        if had_packages:
+            self._remove_derived_image(kernel_id)
+        # Fine after the row is gone, as the manifest is regenerated whole; a None owner (older kernel) no-ops.
+        from flowfile_core.project import project_sync
+
+        project_sync.kernels_changed(owner_id)
+        logger.info("Deleted kernel '%s'", kernel_id)
+
+    def shutdown_all(self) -> None:
+        """Stop and remove all running kernel containers. Called on core shutdown."""
+        # Wait out starts in flight, so a leader can't re-create a container after the sweep.
+        with self._start_flights_lock:
+            starting = list(self._start_flights)
+        for kernel_id in starting:
+            self._wait_out_flight(kernel_id, timeout=15)
+        kernel_ids = list(self._kernels.keys())
+        for kernel_id in kernel_ids:
+            kernel = self._kernels.get(kernel_id)
+            if not kernel or kernel.state not in (KernelState.IDLE, KernelState.EXECUTING, KernelState.STARTING):
+                continue
+            # The DB-shared registry also lists kernels another core started and this one adopted.
+            if kernel_id not in self._started_here:
+                logger.info(
+                    "Leaving kernel '%s' running: this process did not start it",
+                    kernel_id,
+                )
+                continue
+            logger.info("Shutting down kernel '%s'", kernel_id)
+            self._cleanup_container(kernel_id)
+            kernel.state = KernelState.STOPPED
+            kernel.container_id = None
+            self._started_here.discard(kernel_id)
+        logger.info("All kernels started by this process have been shut down")
+
+    # Execution
+
+    def _check_oom_killed(self, kernel_id: str) -> bool:
+        """Check if the kernel container was killed due to an out-of-memory condition."""
+        kernel = self._kernels.get(kernel_id)
+        if kernel is None or kernel.container_id is None:
+            return False
+        try:
+            container = self._docker.containers.get(kernel.container_id)
+            state = container.attrs.get("State", {})
+            return state.get("OOMKilled", False)
+        except (docker.errors.NotFound, docker.errors.APIError):
+            return False
+
+    def _is_container_running(self, kernel_id: str) -> bool:
+        # True on transient Docker errors, so a daemon hiccup doesn't mark the kernel down.
+        kernel = self._kernels.get(kernel_id)
+        ref = (kernel.container_id if kernel else None) or f"flowfile-kernel-{kernel_id}"
+        try:
+            return self._docker.containers.get(ref).status == "running"
+        except docker.errors.NotFound:
+            return False
+        except docker.errors.DockerException:
+            return True
+
+    async def execute(self, kernel_id: str, request: ExecuteRequest) -> ExecuteResult:
+        return await asyncio.to_thread(self.execute_sync, kernel_id, request)
+
+    def _exec_lock_for(self, kernel_id: str) -> threading.Lock:
+        with self._exec_locks_lock:
+            return self._exec_locks.setdefault(kernel_id, threading.Lock())
+
+    @staticmethod
+    def _acquire_cancellable(lock: threading.Lock, cancel_event: threading.Event | None) -> bool:
+        if cancel_event is None:
+            lock.acquire()
+            return True
+        while not lock.acquire(timeout=0.5):
+            if cancel_event.is_set():
+                return False
+        return True
+
+    def execute_sync(
+        self,
+        kernel_id: str,
+        request: ExecuteRequest,
+        flow_logger: FlowLogger | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> ExecuteResult:
+        """Execute one cell on a kernel, serialised per kernel.
+
+        When *cancel_event* is provided the HTTP call runs in a daemon thread
+        so the caller can be unblocked promptly when the event is set.
+        """
+        kernel = self._get_kernel_or_raise(kernel_id)
+        # Before the lock, so concurrent callers share one start flight and its failure.
+        if kernel.state not in (KernelState.IDLE, KernelState.EXECUTING):
+            self._ensure_running_sync(kernel_id, flow_logger=flow_logger)
+
+        # The scratch flow is the producer when no registered flow set source_registration_id.
+        if request.source_registration_id is None:
+            request.source_registration_id = self.get_scratch_flow_id(kernel_id)
+
+        # Stamped server-side: client requests carry no token, and an adopted container may hold a stale one.
+        try:
+            from flowfile_core.auth.jwt import get_internal_token
+
+            request.internal_token = get_internal_token()
+        except (ValueError, ImportError):
+            pass
+
+        # One token per execution, so a cancel names a cell; a flow run mints its own up front.
+        if not request.exec_token:
+            request.exec_token = uuid.uuid4().hex
+
+        lock = self._exec_lock_for(kernel_id)
+        if not self._acquire_cancellable(lock, cancel_event):
+            # Nothing was submitted, so no interrupt: it would kill another node's cell on this kernel.
+            return ExecuteResult(success=False, error="Execution cancelled by user")
+        try:
+            self._active_execs[kernel_id] = request.exec_token
+            publish("kernel_exec")
+            return self._execute_locked(kernel_id, kernel, request, flow_logger, cancel_event)
+        finally:
+            if self._active_execs.get(kernel_id) == request.exec_token:
+                del self._active_execs[kernel_id]
+            lock.release()
+
+    def _execute_locked(
+        self,
+        kernel_id: str,
+        kernel: KernelInfo,
+        request: ExecuteRequest,
+        flow_logger: FlowLogger | None,
+        cancel_event: threading.Event | None,
+    ) -> ExecuteResult:
+        # The kernel may have died while we were queued behind another cell.
+        if kernel.state not in (KernelState.IDLE, KernelState.EXECUTING):
+            self._ensure_running_sync(kernel_id, flow_logger=flow_logger)
+
+        kernel.state = KernelState.EXECUTING
+        try:
+            url = f"{self._kernel_url(kernel)}/execute"
+
+            if cancel_event is None:
+                # Simple blocking call (no cancellation support)
+                with _sync_client(_CELL_EXECUTION_TIMEOUT) as client:
+                    response = client.post(url, json=request.model_dump())
+                    response.raise_for_status()
+                    return ExecuteResult(**response.json())
+
+            # Cancellation-aware path.
+            result_holder: list[ExecuteResult | None] = [None]
+            error_holder: list[BaseException | None] = [None]
+
+            def _post() -> None:
+                try:
+                    with _sync_client(_CELL_EXECUTION_TIMEOUT) as client:
+                        resp = client.post(url, json=request.model_dump())
+                        resp.raise_for_status()
+                        result_holder[0] = ExecuteResult(**resp.json())
+                except BaseException as exc:
+                    error_holder[0] = exc
+
+            t = threading.Thread(target=_post, daemon=True)
+            t.start()
+
+            while t.is_alive():
+                t.join(timeout=0.5)
+                if cancel_event.is_set():
+                    # Best-effort interrupt, then return immediately
+                    self.interrupt_execution_sync(kernel_id, request.exec_token)
+                    return ExecuteResult(success=False, error="Execution cancelled by user")
+
+            if error_holder[0] is not None:
+                raise error_holder[0]
+            if result_holder[0] is not None:
+                return result_holder[0]
+            raise RuntimeError("Kernel execution returned no result")
+
+        except (httpx.HTTPError, OSError) as exc:
+            if self._check_oom_killed(kernel_id):
+                kernel.state = KernelState.ERROR
+                kernel.error_message = "Kernel ran out of memory"
+                oom_msg = (
+                    f"Kernel ran out of memory. The container exceeded its {kernel.memory_gb} GB "
+                    "memory limit and was terminated. Consider increasing the kernel's memory "
+                    "allocation or reducing your data size."
+                )
+                if flow_logger:
+                    flow_logger.error(oom_msg)
+                return ExecuteResult(success=False, error=oom_msg)
+            if not self._is_container_running(kernel_id):
+                # Keep container_id: the stopped container holds the name until the next start's cleanup.
+                kernel.state = KernelState.STOPPED
+                if flow_logger:
+                    flow_logger.error(_KERNEL_DOWN_MSG)
+                return ExecuteResult(success=False, error=_KERNEL_DOWN_MSG)
+            if isinstance(exc, httpx.TimeoutException):
+                # Interrupt the cell, or it keeps mutating the namespace while the next cell runs.
+                self.interrupt_execution_sync(kernel_id, request.exec_token)
+                return ExecuteResult(
+                    success=False,
+                    error=(
+                        f"Cell exceeded the {_CELL_EXECUTION_TIMEOUT:.0f}s execution limit and was interrupted. "
+                        "The kernel stopped responding — check whether its container is healthy."
+                    ),
+                )
+            raise
+        finally:
+            if kernel.state == KernelState.EXECUTING:
+                kernel.state = KernelState.IDLE
+
+    def interrupt_execution_sync(self, kernel_id: str, exec_token: str | None = None) -> bool:
+        """Interrupt running user code on a kernel.
+
+        *exec_token* names the execution to cancel. Kernels are shared, so an
+        interrupt is refused unless that execution is the one currently holding
+        the kernel — otherwise cancelling a queued or already-finished cell would
+        kill whichever flow happens to be running now. ``None`` means untargeted
+        (interrupt whatever is running) and is only for callers that own the
+        kernel outright.
+
+        Tries the HTTP ``/interrupt`` endpoint first (works when the kernel
+        runs user code in a background thread and keeps the event loop free).
+        Falls back to sending ``SIGUSR1`` via Docker if the HTTP call fails
+        (e.g. older kernel image, or the event loop is blocked).
+        """
+        kernel = self._kernels.get(kernel_id)
+        if kernel is None or kernel.container_id is None:
+            logger.warning("Cannot interrupt kernel '%s': not found or no container", kernel_id)
+            return False
+        if kernel.state != KernelState.EXECUTING:
+            return False
+        if exec_token is not None and self._active_execs.get(kernel_id) != exec_token:
+            logger.info(
+                "Skipping interrupt on kernel '%s': the cancelled execution is not the one running",
+                kernel_id,
+            )
+            return False
+
+        # Try HTTP /interrupt first.
+        should_try_http = self._docker_network is not None or kernel.port is not None
+        if should_try_http:
+            try:
+                url = f"{self._kernel_url(kernel)}/interrupt"
+                with _sync_client(5.0) as client:
+                    resp = client.post(url, json={"exec_token": exec_token or ""})
+                    if resp.status_code == 200:
+                        logger.info("Interrupted kernel '%s' via HTTP", kernel_id)
+                        return True
+            except (httpx.HTTPError, OSError):
+                logger.debug("HTTP /interrupt failed for kernel '%s', falling back to SIGUSR1", kernel_id)
+
+        # Fallback: Docker SIGUSR1.
+        try:
+            container = self._docker.containers.get(kernel.container_id)
+            container.kill(signal="SIGUSR1")
+            logger.info("Sent SIGUSR1 to kernel '%s' (container %s)", kernel_id, kernel.container_id[:12])
+            return True
+        except docker.errors.NotFound:
+            logger.warning("Container for kernel '%s' not found", kernel_id)
+            return False
+        except (docker.errors.APIError, docker.errors.DockerException) as exc:
+            logger.error("Failed to send SIGUSR1 to kernel '%s': %s", kernel_id, exc)
+            return False
+
+    async def interrupt_execution(self, kernel_id: str, exec_token: str | None = None) -> bool:
+        """Async wrapper around :meth:`interrupt_execution_sync`."""
+        return self.interrupt_execution_sync(kernel_id, exec_token)
+
+    async def clear_artifacts(self, kernel_id: str) -> None:
+        kernel = self._get_kernel_or_raise(kernel_id)
+        if kernel.state not in (KernelState.IDLE, KernelState.EXECUTING):
+            await self._ensure_running(kernel_id)
+
+        url = f"{self._kernel_url(kernel)}/clear"
+        async with _async_client(30.0) as client:
+            response = await client.post(url)
+            response.raise_for_status()
+
+    def clear_artifacts_sync(self, kernel_id: str) -> None:
+        """Synchronous wrapper around clear_artifacts() for use from non-async code."""
+        kernel = self._get_kernel_or_raise(kernel_id)
+        if kernel.state not in (KernelState.IDLE, KernelState.EXECUTING):
+            self._ensure_running_sync(kernel_id)
+
+        url = f"{self._kernel_url(kernel)}/clear"
+        with _sync_client(30.0) as client:
+            response = client.post(url)
+            response.raise_for_status()
+
+    async def clear_node_artifacts(
+        self,
+        kernel_id: str,
+        node_ids: list[int],
+        flow_id: int | None = None,
+    ) -> ClearNodeArtifactsResult:
+        """Clear only artifacts published by the given node IDs."""
+        kernel = self._get_kernel_or_raise(kernel_id)
+        if kernel.state not in (KernelState.IDLE, KernelState.EXECUTING):
+            await self._ensure_running(kernel_id)
+
+        url = f"{self._kernel_url(kernel)}/clear_node_artifacts"
+        payload: dict = {"node_ids": node_ids}
+        if flow_id is not None:
+            payload["flow_id"] = flow_id
+        async with _async_client(30.0) as client:
+            response = await client.post(url, json=payload)
+            response.raise_for_status()
+            return ClearNodeArtifactsResult(**response.json())
+
+    def clear_node_artifacts_sync(
+        self,
+        kernel_id: str,
+        node_ids: list[int],
+        flow_id: int | None = None,
+        flow_logger: FlowLogger | None = None,
+    ) -> ClearNodeArtifactsResult:
+        """Synchronous wrapper for clearing artifacts by node IDs."""
+        kernel = self._get_kernel_or_raise(kernel_id)
+        if kernel.state not in (KernelState.IDLE, KernelState.EXECUTING):
+            self._ensure_running_sync(kernel_id, flow_logger=flow_logger)
+
+        url = f"{self._kernel_url(kernel)}/clear_node_artifacts"
+        payload: dict = {"node_ids": node_ids}
+        if flow_id is not None:
+            payload["flow_id"] = flow_id
+        with _sync_client(30.0) as client:
+            response = client.post(url, json=payload)
+            response.raise_for_status()
+            return ClearNodeArtifactsResult(**response.json())
+
+    async def clear_namespace(self, kernel_id: str, flow_id: int) -> None:
+        """Clear the execution namespace for a flow (variables, imports, etc.)."""
+        kernel = self._get_kernel_or_raise(kernel_id)
+        if kernel.state not in (KernelState.IDLE, KernelState.EXECUTING):
+            await self._ensure_running(kernel_id)
+
+        url = f"{self._kernel_url(kernel)}/clear_namespace"
+        async with _async_client(30.0) as client:
+            response = await client.post(url, params={"flow_id": flow_id})
+            response.raise_for_status()
+
+    async def get_node_artifacts(self, kernel_id: str, node_id: int) -> dict:
+        """Get artifacts published by a specific node."""
+        kernel = self._get_kernel_or_raise(kernel_id)
+        if kernel.state not in (KernelState.IDLE, KernelState.EXECUTING):
+            await self._ensure_running(kernel_id)
+
+        url = f"{self._kernel_url(kernel)}/artifacts/node/{node_id}"
+        async with _async_client(30.0) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            return response.json()
+
+    async def lsp_request(self, kernel_id: str, op: str, payload: dict) -> dict:
+        """Forward a code-intelligence request to the kernel's ``/lsp/{op}`` engine.
+
+        Editor-facing, so it must never raise and never start a stopped kernel
+        (typing must not spin containers): a missing/idle-less kernel, an old image
+        without the endpoint (404), or any transport error all degrade to ``{}`` and
+        the caller serves an empty result. Short timeout — completion is latency-bound.
+        """
+        try:
+            kernel = self._get_kernel_or_raise(kernel_id)
+        except (KeyError, RuntimeError):  # _get_kernel_or_raise raises KeyError when the id is gone
+            return {}
+        if kernel.state not in (KernelState.IDLE, KernelState.EXECUTING):
+            return {}
+        url = f"{self._kernel_url(kernel)}/lsp/{op}"
+        try:
+            async with _async_client(5.0) as client:
+                response = await client.post(url, json=payload)
+                response.raise_for_status()
+                return response.json()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404 and (kernel_id, op) not in self._lsp_unsupported_warned:
+                self._lsp_unsupported_warned.add((kernel_id, op))
+                if op == "dataframe_schemas":
+                    message = (
+                        "Kernel '%s' (runtime %s, image '%s') does not serve dataframe schemas (needs a kernel "
+                        "image 0.6.0 or newer); notebook column completions fall back to static inference. "
+                        "Pull %s and restart the kernel."
+                    )
+                else:
+                    message = (
+                        "Kernel '%s' (runtime %s, image '%s') has no code-intelligence endpoint; notebook "
+                        "completions fall back to client-side sources. Pull %s and restart the kernel."
+                    )
+                logger.warning(
+                    message,
+                    kernel_id,
+                    kernel.kernel_version,
+                    kernel.image,
+                    _flavour_images().get(kernel.image_flavour, "a current kernel image"),
+                )
+            else:
+                logger.debug("kernel lsp/%s failed: %s", op, exc)
+            return {}
+        except (httpx.HTTPError, OSError) as exc:
+            logger.debug("kernel lsp/%s failed: %s", op, exc)
+            return {}
+
+    async def get_display_outputs(self, kernel_id: str, flow_id: int, node_id: int) -> list[dict]:
+        """Retrieve stored display outputs from the last execution of a node."""
+        kernel = self._get_kernel_or_raise(kernel_id)
+        if kernel.state not in (KernelState.IDLE, KernelState.EXECUTING):
+            await self._ensure_running(kernel_id)
+
+        url = f"{self._kernel_url(kernel)}/display_outputs"
+        async with _async_client(30.0) as client:
+            response = await client.get(url, params={"flow_id": flow_id, "node_id": node_id})
+            response.raise_for_status()
+            return response.json()
+
+    async def get_artifact_preview(self, kernel_id: str, flow_id: int, name: str) -> dict | None:
+        """Retrieve a rendered preview blob for a published artifact (session-only, kernel-held)."""
+        kernel = self._get_kernel_or_raise(kernel_id)
+        if kernel.state not in (KernelState.IDLE, KernelState.EXECUTING):
+            await self._ensure_running(kernel_id)
+
+        url = f"{self._kernel_url(kernel)}/artifact_preview"
+        async with _async_client(30.0) as client:
+            response = await client.get(url, params={"flow_id": flow_id, "name": name})
+            response.raise_for_status()
+            return response.json()
+
+    # Artifact Persistence & Recovery
+
+    async def recover_artifacts(self, kernel_id: str) -> RecoveryStatus:
+        """Trigger manual artifact recovery on a running kernel."""
+        kernel = self._get_kernel_or_raise(kernel_id)
+        if kernel.state not in (KernelState.IDLE, KernelState.EXECUTING):
+            raise RuntimeError(f"Kernel '{kernel_id}' is not running (state: {kernel.state})")
+
+        url = f"{self._kernel_url(kernel)}/recover"
+        async with _async_client(120.0) as client:
+            response = await client.post(url)
+            response.raise_for_status()
+            return RecoveryStatus(**response.json())
+
+    async def get_recovery_status(self, kernel_id: str) -> RecoveryStatus:
+        """Get the current recovery status of a kernel."""
+        kernel = self._get_kernel_or_raise(kernel_id)
+        if kernel.state not in (KernelState.IDLE, KernelState.EXECUTING):
+            raise RuntimeError(f"Kernel '{kernel_id}' is not running (state: {kernel.state})")
+
+        url = f"{self._kernel_url(kernel)}/recovery-status"
+        async with _async_client(30.0) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            return RecoveryStatus(**response.json())
+
+    async def cleanup_artifacts(self, kernel_id: str, request: CleanupRequest) -> CleanupResult:
+        """Clean up old persisted artifacts on a kernel."""
+        kernel = self._get_kernel_or_raise(kernel_id)
+        if kernel.state not in (KernelState.IDLE, KernelState.EXECUTING):
+            raise RuntimeError(f"Kernel '{kernel_id}' is not running (state: {kernel.state})")
+
+        url = f"{self._kernel_url(kernel)}/cleanup"
+        async with _async_client(60.0) as client:
+            response = await client.post(url, json=request.model_dump())
+            response.raise_for_status()
+            return CleanupResult(**response.json())
+
+    async def get_persistence_info(self, kernel_id: str) -> ArtifactPersistenceInfo:
+        """Get persistence configuration and stats for a kernel."""
+        kernel = self._get_kernel_or_raise(kernel_id)
+        if kernel.state not in (KernelState.IDLE, KernelState.EXECUTING):
+            raise RuntimeError(f"Kernel '{kernel_id}' is not running (state: {kernel.state})")
+
+        url = f"{self._kernel_url(kernel)}/persistence"
+        async with _async_client(30.0) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            return ArtifactPersistenceInfo(**response.json())
+
+    async def get_memory_stats(self, kernel_id: str) -> KernelMemoryInfo:
+        """Get current memory usage from a running kernel container."""
+        kernel = self._get_kernel_or_raise(kernel_id)
+        if kernel.state not in (KernelState.IDLE, KernelState.EXECUTING):
+            raise RuntimeError(f"Kernel '{kernel_id}' is not running (state: {kernel.state})")
+
+        url = f"{self._kernel_url(kernel)}/memory"
+        try:
+            async with _async_client(5.0) as client:
+                response = await client.get(url)
+                response.raise_for_status()
+                return KernelMemoryInfo(**response.json())
+        except (httpx.HTTPError, OSError) as exc:
+            raise RuntimeError(f"Could not retrieve memory stats from kernel '{kernel_id}': {exc}") from exc
+
+    async def list_kernel_artifacts(self, kernel_id: str) -> list:
+        """List all artifacts in a running kernel."""
+        kernel = self._get_kernel_or_raise(kernel_id)
+        if kernel.state not in (KernelState.IDLE, KernelState.EXECUTING):
+            raise RuntimeError(f"Kernel '{kernel_id}' is not running (state: {kernel.state})")
+
+        url = f"{self._kernel_url(kernel)}/artifacts"
+        async with _async_client(30.0) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            return response.json()
+
+    # Queries
+
+    async def list_kernels(self, user_id: int | None = None) -> list[KernelInfo]:
+        if user_id is not None:
+            return [k for kid, k in self._kernels.items() if self._kernel_owners.get(kid) == user_id]
+        return list(self._kernels.values())
+
+    async def get_kernel(self, kernel_id: str) -> KernelInfo | None:
+        return self._kernels.get(kernel_id)
+
+    def get_kernel_sync(self, kernel_id: str) -> KernelInfo | None:
+        """Sync lookup for callers outside the event loop (run-time dependency pre-check)."""
+        return self._kernels.get(kernel_id)
+
+    def get_kernel_owner(self, kernel_id: str) -> int | None:
+        return self._kernel_owners.get(kernel_id)
+
+    # Internal helpers
+
+    def _get_kernel_or_raise(self, kernel_id: str) -> KernelInfo:
+        kernel = self._kernels.get(kernel_id)
+        if kernel is None:
+            raise KeyError(f"Kernel '{kernel_id}' not found")
+        return kernel
+
+    async def _ensure_running(self, kernel_id: str) -> None:
+        """Start the kernel if it is not ready (single-flight), then wait until IDLE."""
+        kernel = self._get_kernel_or_raise(kernel_id)
+        if kernel.state == KernelState.CREATING:
+            raise RuntimeError(f"Kernel '{kernel_id}' is still being created")
+        if kernel.state in (KernelState.IDLE, KernelState.EXECUTING):
+            return
+        logger.info("Kernel '%s' is %s, ensuring it is running...", kernel_id, kernel.state.value)
+        await asyncio.to_thread(self._get_or_start_kernel, kernel_id)
+
+    def _ensure_running_sync(self, kernel_id: str, flow_logger: FlowLogger | None = None) -> None:
+        """Synchronous version of _ensure_running."""
+        kernel = self._get_kernel_or_raise(kernel_id)
+        if kernel.state == KernelState.CREATING:
+            raise RuntimeError(f"Kernel '{kernel_id}' is still being created")
+        if kernel.state in (KernelState.IDLE, KernelState.EXECUTING):
+            return
+        msg = f"Kernel '{kernel_id}' is {kernel.state.value}, ensuring it is running..."
+        logger.info(msg)
+        if flow_logger:
+            flow_logger.info(msg)
+        self._get_or_start_kernel(kernel_id, flow_logger=flow_logger)
+
+    def _cleanup_container(self, kernel_id: str) -> None:
+        kernel = self._kernels.get(kernel_id)
+        if kernel is None or kernel.container_id is None:
+            return
+        self._remove_container_by_id(kernel.container_id)
+
+    def _remove_container_by_id(self, container_id: str) -> None:
+        try:
+            container = self._docker.containers.get(container_id)
+            container.stop(timeout=10)
+            container.remove(force=True)
+        except docker.errors.NotFound:
+            pass
+        except (docker.errors.APIError, docker.errors.DockerException) as exc:
+            logger.warning("Error cleaning up container '%s': %s", container_id, exc)
+
+    def _wait_for_healthy_sync(self, kernel_id: str, timeout: int = _HEALTH_TIMEOUT) -> None:
+        kernel = self._get_kernel_or_raise(kernel_id)
+        url = f"{self._kernel_url(kernel)}/health"
+        deadline = time.monotonic() + timeout
+
+        while time.monotonic() < deadline:
+            try:
+                with _sync_client(5.0) as client:
+                    response = client.get(url)
+                    if response.status_code == 200:
+                        data = response.json()
+                        kernel.kernel_version = data.get("version")
+                        return
+            except (httpx.HTTPError, OSError) as exc:
+                logger.debug("Health poll for kernel '%s' failed: %s", kernel_id, exc)
+            time.sleep(_HEALTH_POLL_INTERVAL)
+
+        raise TimeoutError(f"Kernel '{kernel_id}' did not become healthy within {timeout}s")

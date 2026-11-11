@@ -1,0 +1,307 @@
+import os
+import platform
+import shutil
+import sys
+import time
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+import requests
+
+import flowfile as ff
+from flowfile import col, open_graph_in_editor
+
+from flowfile.api import (
+    FLOWFILE_BASE_URL,
+    build_server_command,
+    get_auth_token,
+    is_flowfile_running,
+    is_poetry_environment,
+    start_flowfile_server_process,
+    stop_flowfile_server_process,
+)
+
+
+def find_parent_directory(target_dir_name, start_path=None):
+    """Navigate up directories until finding the target directory"""
+    current_path = Path(start_path) if start_path else Path.cwd()
+
+    while current_path != current_path.parent:
+        if current_path.name == target_dir_name:
+            return current_path
+        if current_path.name == target_dir_name:
+            return current_path
+        current_path = current_path.parent
+
+    raise FileNotFoundError(f"Directory '{target_dir_name}' not found")
+
+
+def ensure_folder_empty(folder_path: str) -> None:
+    """Remove all contents from folder, create if missing."""
+    folder = Path(folder_path)
+
+    if folder.exists():
+        shutil.rmtree(folder)
+
+    folder.mkdir(parents=True, exist_ok=True)
+
+
+def _get_active_flows():
+    headers = {
+        "accept": "application/json",
+        "Authorization": f"Bearer {get_auth_token()}"
+    }
+    return requests.get(f"{FLOWFILE_BASE_URL}/active_flowfile_sessions/", headers=headers).json()
+
+
+def _get_flow_id_on_flow_location(flow_name: str = '_test_pipeline.yml') -> int | None:
+    active_flows = _get_active_flows()
+    search_name = Path(flow_name).name
+
+    for flow in active_flows:
+        flow_path: str = flow.get('path')
+        flow_filename = Path(flow_path).name
+        if search_name in flow_filename:
+            return flow.get('flow_id')
+
+
+def _trigger_flow_execution(flow_id: int) -> None:
+    headers = {
+        "accept": "application/json",
+        "Authorization": f"Bearer {get_auth_token()}"
+    }
+    r = requests.post(f"{FLOWFILE_BASE_URL}/flow/run/?flow_id=" + str(flow_id), headers=headers)
+    if not r.ok:
+        raise Exception(f"Failed to trigger flow execution: {r.text}")
+
+
+def _poll_for_execution_completion(flow_id: int, timeout: int = 60, expect_success: bool = True) -> bool:
+    """Poll for flow execution completion."""
+    start_time = time.time()
+    headers = {
+        "accept": "application/json",
+        "Authorization": f"Bearer {get_auth_token()}"
+    }
+    while time.time() - start_time < timeout:
+        try:
+            response = requests.get(f"{FLOWFILE_BASE_URL}/flow/run_status/?flow_id={flow_id}", headers=headers)
+            if response.status_code == 200:
+                status = response.json()
+                if expect_success:
+                    if status.get("success"):
+                        return True
+                else:
+                    return True
+        except requests.RequestException:
+            pass
+        time.sleep(1)
+    return False
+
+
+class TestFlowfileAPI:
+    """Integration tests for Flowfile API with minimal mocking."""
+
+    @pytest.fixture(autouse=True)
+    def setup_and_teardown(self):
+        """Ensure clean state before and after each test."""
+        self.original_env = os.environ.copy()
+
+        stop_flowfile_server_process()
+        ensure_folder_empty("supporting_files")
+
+        yield
+
+        os.environ.clear()
+        os.environ.update(self.original_env)
+
+        stop_flowfile_server_process()
+
+    def test_is_flowfile_running_when_not_running(self):
+        """Test that is_flowfile_running returns False when server is not running."""
+        stop_flowfile_server_process()
+        time.sleep(1)
+
+        assert is_flowfile_running() is False
+
+    def test_is_flowfile_running_when_running(self):
+        """Test that is_flowfile_running returns True when server is running."""
+        success, _ = start_flowfile_server_process()
+        if success:
+            assert is_flowfile_running() is True
+        else:
+            pytest.skip("Server failed to start, skipping running test")
+
+    def test_start_and_stop_server_process(self):
+        """Test starting and stopping the Flowfile server process."""
+        success, single_mode = start_flowfile_server_process()
+        assert isinstance(success, bool)
+        assert isinstance(single_mode, bool)
+
+        if success:
+            assert is_flowfile_running() is True
+
+            stop_flowfile_server_process()
+            time.sleep(2)
+
+            assert is_flowfile_running() is False
+
+    def test_poetry_environment_detection(self):
+        """Test Poetry environment detection logic."""
+        os.environ["FORCE_POETRY"] = "true"
+        assert is_poetry_environment() is True
+        os.environ.pop("FORCE_POETRY", None)
+        os.environ["POETRY_ACTIVE"] = "1"
+        assert is_poetry_environment() is True
+
+        os.environ.pop("POETRY_ACTIVE", None)
+        result = is_poetry_environment()
+        assert isinstance(result, bool)
+
+    def test_build_server_command(self):
+        """Test command building for different environments."""
+        with patch('flowfile.api.is_poetry_environment', return_value=True):
+            with patch('flowfile.api.is_command_available', return_value=True):
+                cmd = build_server_command("flowfile")
+                assert cmd[0] == "poetry"
+                assert "run" in cmd
+                assert "flowfile" in cmd
+                assert "--no-browser" in cmd
+
+        with patch('flowfile.api.is_poetry_environment', return_value=False):
+            cmd = build_server_command("flowfile")
+            if platform.system() != "Windows":
+                expected_script_path = str(Path(sys.executable).parent / "flowfile")
+                assert cmd[0] == expected_script_path
+                assert "run" in cmd
+                assert "ui" in cmd
+                assert "--no-browser" in cmd
+
+    def test_get_auth_token_integration(self):
+        """Test getting auth token from running server."""
+        success, _ = start_flowfile_server_process()
+        if not success:
+            pytest.skip("Server failed to start, skipping auth token test")
+
+        time.sleep(2)
+
+        token = get_auth_token()
+        assert token is None or isinstance(token, str)
+        if token:
+            assert len(token) > 20
+
+    def test_end_to_end_pipeline_integration(self):
+        """Test the complete pipeline from graph creation to UI opening."""
+        server_started, _ = start_flowfile_server_process()
+        flow_path = Path('supporting_files') / '_test_pipeline.yml'
+        if not server_started:
+            pytest.skip("Server failed to start, skipping integration test")
+
+        time.sleep(2)
+        df = ff.from_dict({
+            "id": [1, 2, 3, 4, 5],
+            "category": ["A", "B", "A", "C", "B"],
+            "value": [100, 200, 150, 300, 250]
+        })
+
+        result = df.filter(col("value") > 150).with_columns([
+            (col("value") * 2).alias("double_value")
+        ])
+        output_path = Path("supporting_files") / "output.csv"
+        grouped = result.group_by("category").agg(ff.col("value").sum())
+        result_with_write = grouped.write_csv(str(output_path))
+        if output_path.exists():
+            os.remove(output_path)
+
+        success = open_graph_in_editor(result_with_write.flow_graph,
+                                       storage_location=str(flow_path),
+                                       automatically_open_browser=False)
+        assert isinstance(success, bool)
+        assert flow_path.exists()
+        flow_id = _get_flow_id_on_flow_location("_test_pipeline.yml")
+        _trigger_flow_execution(flow_id)
+        execution_complete = _poll_for_execution_completion(flow_id)
+
+        if execution_complete:
+            assert output_path.exists()
+
+        ensure_folder_empty('supporting_files')
+
+    @pytest.mark.parametrize(
+        "poetry_env_mock, poetry_cmd_mock, scenario",
+        [
+            (True, True, "Poetry Available"),
+            (False, False, "Poetry Not Available (Fallback)"),
+        ]
+    )
+    def test_end_to_end_pipeline_integration_start(self, poetry_env_mock, poetry_cmd_mock, scenario):
+        """
+        Test the complete pipeline from graph creation to UI opening,
+        running for both Poetry and non-Poetry environments.
+        """
+        print(f"\nRunning E2E test scenario: {scenario}")
+        stop_flowfile_server_process()
+
+        flow_path = Path('supporting_files') / '_test_pipeline.yml'
+
+        df = ff.from_dict({
+            "id": [1, 2, 3, 4, 5],
+            "category": ["A", "B", "A", "C", "B"],
+            "value": [100, 200, 150, 300, 250]
+        })
+
+        with patch('flowfile.api.is_poetry_environment', return_value=poetry_env_mock):
+            with patch('flowfile.api.is_command_available', return_value=poetry_cmd_mock):
+                success = open_graph_in_editor(df.flow_graph,
+                                               storage_location=str(flow_path),
+                                               automatically_open_browser=False)
+        assert success is True, "open_graph_in_editor should return True on success"
+        assert flow_path.exists()
+
+        flow_id = _get_flow_id_on_flow_location()
+        assert flow_id is not None, "Could not find the active flow ID"
+
+        _trigger_flow_execution(flow_id)
+        execution_complete = _poll_for_execution_completion(flow_id)
+        assert execution_complete, "Flow execution did not complete successfully"
+        ensure_folder_empty("supporting_files")
+        stop_flowfile_server_process()
+
+    @pytest.mark.parametrize(
+        "poetry_env_mock, poetry_cmd_mock, scenario",
+        [
+            (True, True, "Poetry Available"),
+            (False, False, "Poetry Not Available (Fallback)"),
+        ]
+    )
+    def test_end_to_end_pipeline_integration_start_default_location(self, poetry_env_mock, poetry_cmd_mock, scenario):
+        """
+        Test the complete pipeline from graph creation to UI opening,
+        running for both Poetry and non-Poetry environments.
+        """
+        print(f"\nRunning E2E test scenario: {scenario}")
+        stop_flowfile_server_process()
+
+        df = ff.from_dict({
+            "id": [1, 2, 3, 4, 5],
+            "category": ["A", "B", "A", "C", "B"],
+            "value": [100, 200, 150, 300, 250]
+        })
+
+        with patch('flowfile.api.is_poetry_environment', return_value=poetry_env_mock):
+            with patch('flowfile.api.is_command_available', return_value=poetry_cmd_mock):
+                success = open_graph_in_editor(df.flow_graph,
+                                               automatically_open_browser=False)
+        assert success is True, "open_graph_in_editor should return True on success"
+        flow_id = _get_flow_id_on_flow_location(df.flow_graph.flow_settings.path)
+        assert flow_id is not None, "Could not find the active flow ID"
+
+        _trigger_flow_execution(flow_id)
+        execution_complete = _poll_for_execution_completion(flow_id)
+        assert execution_complete, "Flow execution did not complete successfully"
+        ensure_folder_empty("supporting_files")
+        stop_flowfile_server_process()
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "-s"])

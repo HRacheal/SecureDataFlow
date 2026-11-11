@@ -1,0 +1,142 @@
+flowfile_version: 0.24.0
+flowfile_id: 562512109
+flowfile_name: groundtruth_clean_batch
+flowfile_settings:
+  description: null
+  execution_mode: Performance
+  execution_location: local
+  auto_save: false
+  show_detailed_progress: true
+  validate_settings: true
+  max_parallel_workers: 4
+  source_registration_id: null
+  parameters: []
+nodes:
+- id: 1
+  type: read
+  is_start_node: true
+  description: Read groundtruth_clean_batch_summary_input.csv
+  node_reference: null
+  x_position: 0
+  y_position: 175
+  group_id: null
+  left_input_id: null
+  right_input_id: null
+  input_ids: null
+  outputs: [2, 4]
+  output_handles: [output-0, output-0]
+  input_connections: null
+  setting_input:
+    cache_results: false
+    execution_location: auto
+    output_field_config: null
+    received_file:
+      id: null
+      name: groundtruth_clean_batch_summary_input.csv
+      path: C:\Users\Admin\Downloads\SecureDataFlow\reports\work\groundtruth_clean_batch_summary_input.csv
+      directory: null
+      analysis_file_available: false
+      status: null
+      fields: []
+      abs_file_path: C:\Users\Admin\Downloads\SecureDataFlow\reports\work\groundtruth_clean_batch_summary_input.csv
+      scan_mode: single_file
+      include_file_paths: null
+      file_type: csv
+      table_settings:
+        file_type: csv
+        reference: ''
+        starting_from_line: 0
+        delimiter: ','
+        has_headers: true
+        encoding: utf8
+        parquet_ref: null
+        row_delimiter: '
+
+          '
+        quote_char: '"'
+        infer_schema_length: 100
+        infer_schema: true
+        truncate_ragged_lines: false
+        ignore_errors: false
+- id: 2
+  type: group_by
+  is_start_node: false
+  description: Revenue by category
+  node_reference: null
+  x_position: 200
+  y_position: 100
+  group_id: null
+  left_input_id: null
+  right_input_id: null
+  input_ids: [1]
+  outputs: [3]
+  output_handles: [output-0]
+  input_connections: null
+  setting_input:
+    cache_results: false
+    execution_location: auto
+    output_field_config: null
+    groupby_input:
+      agg_cols:
+      - old_name: category
+        agg: groupby
+        new_name: category
+        output_type: null
+      - old_name: amount
+        agg: sum
+        new_name: revenue
+        output_type: null
+      - old_name: record_id
+        agg: count
+        new_name: records
+        output_type: Int64
+      - old_name: amount
+        agg: mean
+        new_name: mean_amount
+        output_type: Float64
+- id: 3
+  type: sort
+  is_start_node: false
+  description: Sort by category
+  node_reference: null
+  x_position: 400
+  y_position: 100
+  group_id: null
+  left_input_id: null
+  right_input_id: null
+  input_ids: [2]
+  outputs: []
+  output_handles: []
+  input_connections: null
+  setting_input:
+    cache_results: false
+    execution_location: auto
+    output_field_config: null
+    sort_input:
+    - column: category
+      how: asc
+- id: 4
+  type: polars_code
+  is_start_node: false
+  description: Overall totals
+  node_reference: null
+  x_position: 200
+  y_position: 250
+  group_id: null
+  left_input_id: null
+  right_input_id: null
+  input_ids: [1]
+  outputs: []
+  output_handles: []
+  input_connections: null
+  setting_input:
+    cache_results: false
+    execution_location: auto
+    output_field_config: null
+    polars_code_input:
+      polars_code: input_df.select([pl.col('record_id').count().alias('records'),
+        pl.col('amount').sum().alias('total_revenue'), pl.col('amount').mean().alias('mean_amount'),
+        pl.col('amount').median().alias('median_amount'), pl.col('amount').max().alias('max_amount'),
+        pl.col('amount').null_count().alias('unparseable_amounts')])
+groups: []
+comments: []

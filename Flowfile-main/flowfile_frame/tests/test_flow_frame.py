@@ -1,0 +1,1054 @@
+import io
+import os
+from flowfile_frame.flow_frame_methods import (read_parquet, from_dict, concat,
+                                               read_ipc, read_ndjson, read_avro,
+                                               read_ipc_stream, read_csv,
+                                               scan_csv_from_cloud_storage,
+                                               scan_parquet_from_cloud_storage,
+                                               scan_json_from_cloud_storage,
+                                               scan_delta)
+import tempfile
+from uuid import uuid4
+
+import fastexcel
+import polars as pl
+import pytest
+from pl_fuzzy_frame_match.models import FuzzyMapping
+from polars.testing import assert_frame_equal
+
+from flowfile_frame import selectors as sc
+from flowfile_frame.expr import col, cum_count, lit
+from flowfile_frame.flow_frame import FlowFrame
+from flowfile_frame.flow_frame_methods import concat, from_dict, read_csv, read_parquet
+
+try:
+    # noinspection PyUnresolvedReferences
+    from tests.utils import is_docker_available
+except ModuleNotFoundError:
+    import os
+    import sys
+    sys.path.append(os.path.dirname(os.path.abspath("flowfile_frame/tests/utils.py")))
+    # noinspection PyUnresolvedReferences
+    from utils import is_docker_available
+
+
+@pytest.fixture
+def df():
+    data = {
+        "id": [1, 2, 3],
+        "name": ["Alice", "Bob", "Charlie"],
+        "age": [25, 30, 35],
+        "city": ["New York", "Los Angeles", "Chicago"]
+    }
+    return FlowFrame(data)
+
+
+def test_create_empty_flow_frame():
+    """Test creating an empty FlowFrame."""
+    df = FlowFrame()
+    assert isinstance(df, FlowFrame)
+    assert isinstance(df.data, pl.LazyFrame)
+    assert len(df.data.collect()) == 0
+
+
+def test_create_flow_frame_from_dict(df):
+    """Test creating a FlowFrame from a dictionary."""
+    assert isinstance(df, FlowFrame)
+    assert isinstance(df.data, pl.LazyFrame)
+
+    result = df.collect()
+    assert len(result) == 3
+    assert result.columns == ["id", "name", "age", "city"]
+    assert result["name"][1] == "Bob"
+
+
+def test_from_dict_factory():
+    """Test the from_dict factory method."""
+    data = {
+        "id": [1, 2, 3],
+        "name": ["Alice", "Bob", "Charlie"]
+    }
+    df = from_dict(data, description="Test data")
+    assert isinstance(df, FlowFrame)
+    assert isinstance(df.data, pl.LazyFrame)
+
+    result = df.collect()
+    assert len(result) == 3
+    assert result.columns == ["id", "name"]
+
+    assert "Test data" in df.get_node_settings().setting_input.description
+
+
+def test_select_columns_with_node_conversion(df):
+    """
+    Test selecting columns from a FlowFrame. All these select statements should result in a node select, so no custom
+    polars code."""
+    result = df.select("id", "name")
+    assert result.columns == ["id", "name"]
+    assert result.get_node_settings().node_type == 'select'
+
+    result = df.select(col("id"), col("name").alias("username"))
+    assert result.columns == ["id", "username"]
+    assert result.get_node_settings().node_type == 'select'
+
+    result = df.select("*")
+    assert result.columns  == df.columns
+    assert result.get_node_settings().node_type == 'select'
+
+
+def test_select_with_non_native_conversion(df):
+    result = df.select(sc.numeric())
+    assert result.get_node_settings().node_type != 'select'
+    assert result.columns == ["id", "age"]
+
+
+def test_filter():
+    """Test filtering rows in a FlowFrame."""
+    data = {
+        "id": [1, 2, 3, 4, 5],
+        "name": ["Alice", "Bob", "Charlie", "David", "Eve"],
+        "age": [25, 30, 35, 40, 45]
+    }
+    df = FlowFrame(data)
+    result = df.filter(col("age") > 30).collect()
+    assert len(result) == 3
+    assert result["name"].to_list() == ["Charlie", "David", "Eve"]
+
+    result = df.filter(flowfile_formula="[age] > 40").collect()
+    assert len(result) == 1
+    assert result["name"][0] == "Eve"
+
+
+def test_filter_split_predicate():
+    """filter_split returns (pass, fail) frames partitioned by the predicate."""
+    data = {
+        "id": [1, 2, 3, 4, 5],
+        "name": ["Alice", "Bob", "Charlie", "David", "Eve"],
+        "age": [25, 30, 35, 40, 45],
+    }
+    df = FlowFrame(data)
+    pass_df, fail_df = df.filter_split(col("age") > 30)
+
+    pass_result = pass_df.collect()
+    fail_result = fail_df.collect()
+    assert pass_result["name"].to_list() == ["Charlie", "David", "Eve"]
+    assert fail_result["name"].to_list() == ["Alice", "Bob"]
+    # Both frames wrap the same filter node but at different output handles.
+    assert pass_df.node_id == fail_df.node_id
+    assert pass_df.output_handle == "output-0"
+    assert fail_df.output_handle == "output-1"
+
+
+def test_filter_split_flowfile_formula():
+    """filter_split accepts flowfile_formula just like filter()."""
+    df = FlowFrame({"age": [25, 30, 35, 40, 45]})
+    pass_df, fail_df = df.filter_split(flowfile_formula="[age] > 40")
+    assert pass_df.collect()["age"].to_list() == [45]
+    assert fail_df.collect()["age"].to_list() == [25, 30, 35, 40]
+
+
+def test_filter_split_downstream_chain():
+    """Ops chained off pass/fail frames connect to the correct source handle."""
+    df = FlowFrame({"id": list(range(6)), "name": list("abcdef")})
+    pass_df, fail_df = df.filter_split(col("id") >= 3)
+
+    pass_chained = pass_df.select(col("name"))
+    fail_chained = fail_df.select(col("name"))
+
+    filter_node_id = pass_df.node_id
+    pass_node = pass_chained.flow_graph.get_node(pass_chained.node_id)
+    fail_node = fail_chained.flow_graph.get_node(fail_chained.node_id)
+    assert pass_node._input_output_handles[filter_node_id] == "output-0"
+    assert fail_node._input_output_handles[filter_node_id] == "output-1"
+
+    assert pass_chained.collect()["name"].to_list() == ["d", "e", "f"]
+    assert fail_chained.collect()["name"].to_list() == ["a", "b", "c"]
+
+
+def test_filter_split_requires_predicate():
+    """filter_split with no predicate/formula/constraint raises ValueError."""
+    df = FlowFrame({"id": [1, 2, 3]})
+    with pytest.raises(ValueError):
+        df.filter_split()
+
+
+def test_random_split_two_splits_seeded():
+    """random_split returns FlowFrames in declared order; with seed the partitioning is deterministic."""
+    df = FlowFrame({"id": list(range(10))})
+    train_df, test_df = df.random_split({"train": 70.0, "test": 30.0}, seed=42)
+
+    train_rows = train_df.collect()["id"].to_list()
+    test_rows = test_df.collect()["id"].to_list()
+    assert len(train_rows) + len(test_rows) == 10
+    assert set(train_rows).isdisjoint(set(test_rows))
+    assert set(train_rows) | set(test_rows) == set(range(10))
+    assert train_df.node_id == test_df.node_id
+    assert train_df.output_handle == "output-0"
+    assert test_df.output_handle == "output-1"
+
+
+def test_random_split_accepts_typed_groups():
+    """random_split also accepts a typed list[RandomSplitGroup] for fully-validated input."""
+    from flowfile_core.schemas.input_schema import RandomSplitGroup
+
+    df = FlowFrame({"id": list(range(10))})
+    train_df, test_df = df.random_split(
+        [RandomSplitGroup(name="train", percentage=70.0),
+         RandomSplitGroup(name="test", percentage=30.0)],
+        seed=42,
+    )
+    assert len(train_df.collect()) + len(test_df.collect()) == 10
+
+
+def test_random_split_three_splits_downstream_chain():
+    """Ops chained off each split connect to the correct source handle."""
+    df = FlowFrame({"id": list(range(20))})
+    train_df, val_df, test_df = df.random_split(
+        {"train": 60.0, "val": 30.0, "test": 10.0}, seed=11
+    )
+
+    chained = [s.select(col("id")) for s in (train_df, val_df, test_df)]
+    split_node_id = train_df.node_id
+    for i, c in enumerate(chained):
+        node = c.flow_graph.get_node(c.node_id)
+        assert node._input_output_handles[split_node_id] == f"output-{i}"
+
+    counts = [c.collect().shape[0] for c in chained]
+    assert sum(counts) == 20
+
+
+def test_sort():
+    """Test sorting a FlowFrame."""
+    from flowfile_core.schemas.input_schema import NodeSort
+    data = {
+        "id": [3, 1, 4, 5, 2],
+        "name": ["Charlie", "Alice", "David", "Eve", "Bob"],
+        "age": [35, 25, 40, 45, 30]
+    }
+    df = FlowFrame(data)
+
+    result = df.sort("id")
+    assert isinstance(result.get_node_settings().setting_input, NodeSort)
+    assert result.collect()["id"].to_list() == [1, 2, 3, 4, 5]
+
+    result = df.sort(by=["age", "name"], descending=[True, False])
+    assert isinstance(result.get_node_settings().setting_input, NodeSort)
+    assert result.collect()["name"].to_list() == ["Eve", "David", "Charlie", "Bob", "Alice"]
+
+    result = df.sort(by=col("name"), descending=True)
+    assert isinstance(result.get_node_settings().setting_input, NodeSort)
+    assert result.collect()["name"].to_list() == ["Eve", "David", "Charlie", "Bob", "Alice"]
+
+
+def test_with_columns():
+    """Test adding new columns to a FlowFrame."""
+    data = {
+        "id": [1, 2, 3],
+        "name": ["Alice", "Bob", "Charlie"],
+        "age": [25, 30, 35]
+    }
+    df = FlowFrame(data)
+    result = df.with_columns(lit(True).alias("is_active")).collect()
+    assert "is_active" in result.columns
+    assert result["is_active"].to_list() == [True, True, True]
+
+    result = df.with_columns(col("age").cast(pl.Float32).alias("age_float")).collect()
+    assert "age_float" in result.columns
+    result = df.with_columns([
+        col("id").alias("user_id"),
+        (col("age") * 2).alias("double_age")
+    ]).collect()
+    assert "user_id" in result.columns
+    assert "double_age" in result.columns
+    assert result["double_age"].to_list() == [50, 60, 70]
+
+    result = df.with_columns(
+        col("id").alias("user_id"),
+        (col("age") * 2).alias("double_age")
+    ).collect()
+
+    assert "user_id" in result.columns
+    assert "double_age" in result.columns
+    assert result["double_age"].to_list() == [50, 60, 70]
+    result = df.with_columns(
+        flowfile_formulas=["[age] * 2"],
+        output_column_names=["double_age"]
+    ).collect()
+    assert "double_age" in result.columns
+    assert result["double_age"].to_list() == [50, 60, 70]
+
+
+def test_with_row_index():
+    """Test adding row indices to a FlowFrame."""
+    data = {
+        "name": ["Alice", "Bob", "Charlie"],
+        "age": [25, 30, 35]
+    }
+    df = FlowFrame(data)
+    result = df.with_row_index().collect()
+    assert "index" in result.columns
+    assert result["index"].to_list() == [0, 1, 2]
+
+    result = df.with_row_index(name="row_num", offset=1).collect()
+    assert "row_num" in result.columns
+    assert result["row_num"].to_list() == [1, 2, 3]
+
+
+def group_by():
+    """Test grouping operations in a FlowFrame."""
+    data = {
+        "category": ["A", "B", "A", "B", "A"],
+        "value": [10, 20, 30, 40, 50]
+    }
+    df = FlowFrame(data)
+
+    result = df.group_by("category").count().collect()
+    assert len(result.collect()) == 2
+    assert set(result["category"].to_list()) == {"A", "B"}
+    assert result["count"].to_list() == [3, 2] if result["category"][0] == "A" else [2, 3]
+
+    result = df.group_by("category").agg(col("value").sum().alias("total_value")).collect()
+    assert len(result) == 2
+    expected_result = pl.DataFrame({'category': ['A', 'B'], 'total_value': [90, 60]})
+    assert expected_result.equals(result)
+
+    result = df.group_by("category").agg(
+        col("value").sum().alias("total_value"),
+        col("value").mean().alias("avg_value")
+    ).collect()
+    assert "total_value" in result.columns
+    assert "avg_value" in result.columns
+    expected_result = pl.DataFrame({'category': ['A', 'B'], 'total_value': [90, 60], 'avg_value': [30.0, 30.0]})
+    assert expected_result.equals(result)
+
+
+def test_join_not_in_graph():
+    df1 = FlowFrame({
+        "id": [1, 2, 3],
+        "name": ["Alice", "Bob", "Charlie"]
+    })
+
+    df2 = FlowFrame({
+        "id": [1, 2, 4],
+        "age": [25, 30, 40]
+    })
+    result = df1.join(df2, on="id").collect()
+    assert len(result) == 2  # Only matches for id 1 and 2
+    assert result.columns == ["id", "name", "age"]
+    assert_frame_equal(result, df1.data.join(df2.data, on="id").collect())
+
+
+def test_join():
+    """Test joining FlowFrames."""
+    df1 = FlowFrame({
+        "id": [1, 2, 3],
+        "name": ["Alice", "Bob", "Charlie"]
+    })
+
+    df2 = FlowFrame({
+        "id": [1, 2, 4],
+        "age": [25, 30, 40]
+    }, flow_graph=df1.flow_graph)
+
+    result = df1.join(df2, on="id").collect()
+    assert len(result) == 2  # Only matches for id 1 and 2
+    assert result.columns == ["id", "name", "age"]
+
+    result = df1.join(df2, on="id", how="left").collect()
+    assert len(result) == 3  # All rows from df1
+    assert result["name"].to_list() == ["Alice", "Bob", "Charlie"]
+
+    df3 = FlowFrame({
+        "user_id": [1, 2, 4],
+        "city": ["New York", "Los Angeles", "Chicago"]
+    }, flow_graph=df1.flow_graph)
+
+    result = df1.join(df3, left_on="id", right_on="user_id").collect()
+    assert len(result) == 2
+    assert "city" in result.columns
+
+
+def test_explode():
+    """Test exploding list columns."""
+    data = {
+        "id": [1, 2],
+        "values": [[10, 20], [30, 40, 50]]
+    }
+    df = FlowFrame(data)
+    result = df.explode("values").collect()
+    assert len(result) == 5  # 2 values for first row, 3 for second
+    assert result["values"].to_list() == [10, 20, 30, 40, 50]
+    assert result["id"].to_list() == [1, 1, 2, 2, 2]
+
+
+def test_explode_a_column_whose_name_holds_a_backslash_or_a_newline():
+    df = FlowFrame({"a\\b": [[1, 2]], "c\nd": [[3, 4]]})
+    assert df.explode("a\\b").collect()["a\\b"].to_list() == [1, 2]
+    assert df.explode(["a\\b", "c\nd"]).collect().to_dict(as_series=False) == {"a\\b": [1, 2], "c\nd": [3, 4]}
+
+
+def test_unique():
+    """Test getting unique rows from a FlowFrame."""
+    data = {
+        "category": ["A", "B", "A", "B", "A"],
+        "value": [10, 20, 10, 20, 30]
+    }
+    df = FlowFrame(data)
+
+    result = df.unique().collect()
+    assert len(result) == 3  # (A,10), (B,20), (A,30)
+
+    result = df.unique(subset="category").collect()
+    assert len(result) == 2  # A, B
+
+    result = df.unique(subset="category", keep="first").collect()
+    assert len(result) == 2
+    assert result["value"].to_list() == [10, 20] if result["category"][0] == "A" else [20, 10]
+
+
+def test_pivot():
+    """Test pivot operations."""
+    data = {
+        "id": [1, 1, 2, 2],
+        "metric": ["sales", "profit", "sales", "profit"],
+        "value": [100, 20, 150, 30]
+    }
+    df = FlowFrame(data)
+
+    result = df.pivot(
+        on="metric",
+        index="id",
+        values="value"
+    ).collect()
+
+    expected_data = pl.DataFrame({'id': [2, 1], 'profit': [30, 20], 'sales': [150, 100]})
+    assert_frame_equal(expected_data, result, check_row_order=False, check_exact=False, check_column_order=False)
+
+
+def test_unpivot():
+    """Test unpivot operations."""
+    data = {
+        "id": [1, 2],
+        "sales_2021": [100, 150],
+        "sales_2022": [120, 170]
+    }
+    df = FlowFrame(data)
+
+    result = df.unpivot(
+        on=["sales_2021", "sales_2022"],
+        index="id"
+    ).collect()
+    expected_data = pl.DataFrame({'id': [1, 2, 1, 2],
+                                  'variable': ['sales_2021', 'sales_2021', 'sales_2022', 'sales_2022'],
+                                  'value': [100, 150, 120, 170]})
+    assert_frame_equal(expected_data, result, check_row_order=False, check_exact=False)
+
+
+def test_concat():
+    """Test concatenating FlowFrames."""
+    df1 = FlowFrame({
+        "id": [1, 2],
+        "name": ["Alice", "Bob"]
+    })
+
+    df2 = FlowFrame({
+        "id": [3, 4],
+        "name": ["Charlie", "David"]
+    }, flow_graph=df1.flow_graph)
+
+    result = df1.concat(df2).collect()
+    assert len(result) == 4
+    assert result["id"].to_list() == [1, 2, 3, 4]
+    assert result["name"].to_list() == ["Alice", "Bob", "Charlie", "David"]
+
+    df3 = FlowFrame({
+        "id": [5],
+        "name": ["Eve"]
+    }, flow_graph=df1.flow_graph)
+
+    result = concat([df1, df2, df3]).collect()
+    assert len(result) == 5
+    assert result["id"].to_list() == [1, 2, 3, 4, 5]
+
+
+@pytest.mark.skip(reason="Parquet file not available in test environment")
+def test_write_read_parquet(tmpdir):
+    """Test writing and reading Parquet files."""
+    df = FlowFrame({
+        "id": [1, 2, 3],
+        "name": ["Alice", "Bob", "Charlie"]
+    })
+
+    temp_path = os.path.join(tmpdir, "test_data.parquet")
+
+    df.write_parquet(temp_path)
+
+    df2 = read_parquet(temp_path, flow_graph=df.flow_graph)
+
+    result = df2.collect()
+    assert len(result) == 3
+    assert result.columns == ["id", "name"]
+    assert result["name"].to_list() == ["Alice", "Bob", "Charlie"]
+
+
+@pytest.mark.parametrize("ext,writer,reader", [
+    ("arrow", "write_ipc", read_ipc),
+    ("ndjson", "write_ndjson", read_ndjson),
+    ("avro", "write_avro", read_avro),
+])
+def test_write_read_new_formats(tmpdir, ext, writer, reader):
+    """Round-trip the newly supported file connectors through the FlowFrame API."""
+    df = FlowFrame({"id": [1, 2, 3], "name": ["Alice", "Bob", "Charlie"]})
+    temp_path = os.path.join(tmpdir, f"test_data.{ext}")
+
+    getattr(df, writer)(temp_path)
+
+    result = reader(temp_path, flow_graph=df.flow_graph).collect()
+    assert len(result) == 3
+    assert result.columns == ["id", "name"]
+    assert result["name"].to_list() == ["Alice", "Bob", "Charlie"]
+
+
+def test_read_ipc_stream(tmpdir):
+    """The footer-less stream format reads through its own eager connector; scan_ipc rejects it."""
+    temp_path = os.path.join(tmpdir, "test_data.arrows")
+    pl.DataFrame({"id": [1, 2, 3], "name": ["Alice", "Bob", "Charlie"]}).write_ipc_stream(temp_path)
+
+    result = read_ipc_stream(temp_path).collect()
+    assert result["name"].to_list() == ["Alice", "Bob", "Charlie"]
+
+
+@pytest.mark.parametrize("ext,writer,reader", [
+    ("csv.gz", "write_csv", read_csv),
+    ("ndjson.gz", "write_ndjson", read_ndjson),
+])
+def test_read_gzipped_text_formats(tmpdir, ext, writer, reader):
+    """Polars decompresses gzip inside scan_csv/scan_ndjson, so a .gz path needs no extra options."""
+    import gzip
+    temp_path = os.path.join(tmpdir, f"test_data.{ext}")
+    with gzip.open(temp_path, "wb") as fh:
+        getattr(pl.DataFrame({"id": [1, 2, 3], "name": ["Alice", "Bob", "Charlie"]}), writer)(fh)
+
+    result = reader(temp_path).collect()
+    assert result["name"].to_list() == ["Alice", "Bob", "Charlie"]
+
+
+def test_read_gzipped_csv_non_utf8(tmpdir):
+    """A gzipped CSV in a non-utf8 encoding is gunzipped and transcoded before polars sees it."""
+    import gzip
+    temp_path = os.path.join(tmpdir, "test_data.csv.gz")
+    with gzip.open(temp_path, "wb") as fh:
+        fh.write("id,name\n1,café\n2,naïve\n".encode("latin1"))
+
+    result = read_csv(temp_path, encoding="latin1").collect()
+    assert result["name"].to_list() == ["café", "naïve"]
+
+
+@pytest.mark.parametrize("ext,writer,reader,compression", [
+    ("parquet", "write_parquet", read_parquet, "snappy"),
+    ("arrow", "write_ipc", read_ipc, "zstd"),
+    ("ndjson", "write_ndjson", read_ndjson, "gzip"),
+    ("avro", "write_avro", read_avro, "deflate"),
+])
+def test_write_read_with_compression(tmpdir, ext, writer, reader, compression):
+    """Writing with a non-default compression produces a readable file."""
+    df = FlowFrame({"id": [1, 2, 3], "name": ["Alice", "Bob", "Charlie"]})
+    temp_path = os.path.join(tmpdir, f"compressed.{ext}")
+
+    getattr(df, writer)(temp_path, compression=compression)
+
+    result = reader(temp_path, flow_graph=df.flow_graph).collect()
+    assert len(result) == 3
+    assert result["name"].to_list() == ["Alice", "Bob", "Charlie"]
+
+
+def test_write_excel_update_preserves_sheet(tmpdir):
+    """write_excel(write_mode='update') writes its own worksheet and keeps the pre-existing one."""
+    temp_path = os.path.join(tmpdir, "book.xlsx")
+    pl.DataFrame({"keep": ["a", "b"]}).write_excel(temp_path, worksheet="A")
+
+    FlowFrame({"id": [1, 2, 3]}).write_excel(temp_path, worksheet="B", write_mode="update")
+
+    assert fastexcel.read_excel(temp_path).sheet_names == ["A", "B"]
+    assert pl.read_excel(temp_path, sheet_name="A")["keep"].to_list() == ["a", "b"]
+    assert pl.read_excel(temp_path, sheet_name="B")["id"].to_list() == [1, 2, 3]
+
+
+def test_write_excel_update_rejects_polars_code_fallback(tmpdir):
+    """A non-overwrite write_mode is refused on the extra-kwargs Polars Code path instead of silently overwriting."""
+    temp_path = os.path.join(tmpdir, "book.xlsx")
+    pl.DataFrame({"keep": ["a"]}).write_excel(temp_path, worksheet="A")
+
+    with pytest.raises(TypeError):
+        FlowFrame({"id": [1]}).write_excel(temp_path, worksheet="B", write_mode="update", autofit=True)
+
+    assert fastexcel.read_excel(temp_path).sheet_names == ["A"]
+
+
+def test_save_flow_graph(tmpdir):
+    """Test saving the flow graph to a file."""
+    df = FlowFrame({
+        "id": [1, 2, 3],
+        "name": ["Alice", "Bob", "Charlie"]
+    })
+
+    df2 = df.select("id", "name").filter(col("id") > 1)
+
+    temp_path = os.path.join(tmpdir, "test_flow.yaml")
+
+    df2.save_graph(temp_path)
+
+    assert os.path.exists(temp_path)
+
+
+def test_head_limit():
+    """Test head/limit operations."""
+    data = {
+        "id": [1, 2, 3, 4, 5],
+        "name": ["Alice", "Bob", "Charlie", "David", "Eve"]
+    }
+    df = FlowFrame(data)
+
+    result = df.head(3).collect()
+    assert len(result) == 3
+    assert result["id"].to_list() == [1, 2, 3]
+
+    result = df.limit(2).collect()
+    assert len(result) == 2
+    assert result["id"].to_list() == [1, 2]
+
+
+def test_sample_random_rows():
+    """sample(n) takes a reproducible random subset without collecting early."""
+    df = FlowFrame({"id": list(range(100))})
+
+    result = df.sample(10, seed=42).collect()
+    assert len(result) == 10
+    assert len(set(result["id"].to_list())) == 10
+    assert result["id"].to_list() != list(range(10))
+    assert result["id"].to_list() == df.sample(10, seed=42).collect()["id"].to_list()
+
+
+def test_sample_fraction():
+    df = FlowFrame({"id": list(range(100))})
+
+    assert len(df.sample(fraction=0.25, seed=1).collect()) == 25
+
+
+def test_sample_emits_a_native_sample_node():
+    df = FlowFrame({"id": list(range(20))})
+    frame = df.sample(5, seed=3)
+
+    node = frame.flow_graph.get_node(frame.node_id)
+    assert node.node_type == "sample"
+    assert node.setting_input.sample_method == "random"
+    assert node.setting_input.sample_size == 5
+    assert node.setting_input.seed == 3
+
+
+def test_sample_rejects_ambiguous_or_invalid_sizes():
+    df = FlowFrame({"id": list(range(20))})
+
+    with pytest.raises(ValueError):
+        df.sample()
+    with pytest.raises(ValueError):
+        df.sample(5, fraction=0.5)
+    with pytest.raises(ValueError):
+        df.sample(fraction=1.5)
+
+
+def test_solve_graph():
+    edges = from_dict({"from": ["a", "b", "x"], "to": ["b", "c", "y"]})
+    grouped = edges.solve_graph("from", "to", output_column_name="group")
+
+    result = grouped.collect().sort("from")
+    assert result.columns == ["from", "to", "group"]
+    groups = result["group"].to_list()
+    assert groups[0] == groups[1] != groups[2]
+
+    node = grouped.flow_graph.get_node(grouped.node_id)
+    assert node.node_type == "graph_solver"
+    solver = node.setting_input.graph_solver_input
+    assert (solver.col_from, solver.col_to, solver.output_column_name) == ("from", "to", "group")
+
+
+def test_complex_workflow():
+    """Test a more complex workflow combining multiple operations."""
+    data = {
+        "id": [1, 2, 3, 4, 5],
+        "name": ["Alice", "Bob", "Charlie", "David", "Eve"],
+        "age": [25, 30, 35, 40, 45],
+        "department": ["Sales", "IT", "Sales", "HR", "IT"],
+        "salary": [50000, 60000, 55000, 65000, 70000]
+    }
+    df = FlowFrame(data)
+    result = (df
+              .filter(col("age") > 30)
+              .with_columns((col("salary") * 1.1).alias("new_salary"))
+              .group_by("department")
+              .agg([
+                    col("new_salary").mean().alias("avg_salary"),
+                    col("age").mean().alias("avg_age")
+                    ])
+              .sort("avg_salary", descending=True)
+              )
+
+    expected_result = (df.data.filter(pl.col("age") > 30)
+                       .with_columns((pl.col("salary") * 1.1).alias("new_salary"))
+                       .group_by("department")
+                       .agg([
+                            pl.col("new_salary").mean().alias("avg_salary"),
+                            pl.col("age").mean().alias("avg_age")
+                            ])
+                       .sort("avg_salary", descending=True)
+                       .collect())
+    assert_frame_equal(result.collect(), expected_result, check_row_order=False)
+
+
+def test_cache():
+    """Test caching a FlowFrame."""
+    df = FlowFrame({
+        "id": [1, 2, 3],
+        "name": ["Alice", "Bob", "Charlie"]
+    })
+
+    df_cached = df.cache()
+
+    assert df_cached is df
+
+    node_settings = df.get_node_settings()
+    assert node_settings.setting_input.cache_results is True
+
+
+def test_cum_count():
+    """Test cumulative count operations."""
+    data = {
+        "id": [1, 2, 3, 4, 5],
+        "category": ["A", "B", "A", "B", "A"]
+    }
+    df = FlowFrame(data)
+
+    result = df.with_columns(
+        cum_count("category").alias("count")
+    ).collect()
+    assert "count" in result.columns
+    assert result["count"].to_list() == [1, 2, 3, 4, 5]
+
+    result = df.with_columns(
+        cum_count("category").over("category").alias("group_count")
+    ).collect()
+    expected_result = df.data.with_columns(
+        pl.cum_count("category").over("category").alias("group_count")
+    ).collect()
+    assert "group_count" in result.columns
+    assert_frame_equal(expected_result, expected_result, check_row_order=True, check_dtypes=False)
+
+
+def test_schema():
+    """Test schema-related operations."""
+    df = FlowFrame({
+        "id": [1, 2, 3],
+        "name": ["Alice", "Bob", "Charlie"],
+        "active": [True, False, True]
+    })
+
+    schema = df.schema
+    assert isinstance(schema, dict)
+    assert set(schema.keys()) == {"id", "name", "active"}
+    assert str(schema["id"]) == "Int64"
+    assert str(schema["name"]) == "String"
+    assert str(schema["active"]) == "Boolean"
+
+
+FORMAT_CONFIGS = {
+    "parquet": {
+        "extension": ".parquet",
+        "write_method": "write_parquet_to_cloud_storage",
+        "scan_function": "scan_parquet_from_cloud_storage"
+    },
+    "csv": {
+        "extension": ".csv",
+        "write_method": "write_csv_to_cloud_storage",
+        "scan_function": "scan_csv_from_cloud_storage"
+    },
+    "json": {
+        "extension": ".json",
+        "write_method": "write_json_to_cloud_storage",
+        "scan_function": "scan_json_from_cloud_storage"
+    },
+    "delta": {
+        "extension": ".delta",
+        "write_method": "write_delta",
+        "scan_function": "scan_delta"
+    }
+}
+
+@pytest.mark.skipif(not is_docker_available(), reason="Docker is not available or not running")
+@pytest.mark.parametrize("file_format", ["delta"])
+def test_write_to_cloud_storage(df, file_format):
+    config = FORMAT_CONFIGS[file_format]
+    write_method = getattr(df, config['write_method'])
+    scan_function = globals()[config['scan_function']]
+    source = f"s3://flowfile-test/flow_frame_{file_format}_output_{uuid4()}{config['extension']}"
+
+    write_method(source, connection_name="minio-flowframe-test")
+    new_df = scan_function(source, connection_name="minio-flowframe-test")
+    assert_frame_equal(df.collect(), new_df.collect(), check_row_order=False)
+
+
+@pytest.mark.skipif(not is_docker_available(), reason="Docker is not available or not running")
+def test_write_delta_partitioned_to_cloud_storage(df):
+    from shared.delta_utils import get_delta_partition_columns
+
+    source = f"s3://flowfile-test/flow_frame_delta_partitioned_{uuid4()}.delta"
+    storage_options = {
+        "aws_access_key_id": "minioadmin",
+        "aws_secret_access_key": "minioadmin",
+        "aws_region": "us-east-1",
+        "endpoint_url": "http://localhost:9000",
+        "aws_allow_http": "true",
+    }
+
+    df.write_delta(source, connection_name="minio-flowframe-test", partition_by=["name"])
+    new_df = scan_delta(source, connection_name="minio-flowframe-test")
+    assert_frame_equal(df.collect(), new_df.collect(), check_row_order=False, check_column_order=False)
+    assert get_delta_partition_columns(source, storage_options=storage_options) == ["name"]
+
+
+def test_read_csv_basic():
+    """Test basic CSV reading functionality."""
+    with tempfile.NamedTemporaryFile(suffix='.csv', mode='w+', delete=False) as tmp:
+        tmp.write("id,name,age\n1,Alice,25\n2,Bob,30\n3,Charlie,35")
+        tmp_path = tmp.name
+    try:
+        df = read_csv(tmp_path)
+
+        assert isinstance(df, FlowFrame)
+        assert isinstance(df.data, pl.LazyFrame)
+
+        result = df.collect()
+        assert len(result) == 3
+        assert result.columns == ["id", "name", "age"]
+        assert result["name"][1] == "Bob"
+
+        assert result["id"].dtype == pl.Int64
+        assert result["name"].dtype == pl.Utf8
+        assert result["age"].dtype == pl.Int64
+    finally:
+        os.unlink(tmp_path)
+
+
+def test_read_csv_parameter_variations():
+    """Test CSV reading with different parameter combinations."""
+    with tempfile.NamedTemporaryFile(suffix='.csv', mode='w+', delete=False) as tmp:
+        tmp.write("id;first_name;last_name;salary;active\n")
+        tmp.write("1;Alice;Smith;50000.50;true\n")
+        tmp.write("2;Bob;Jones;60000.75;false\n")
+        tmp.write("3;Charlie;Brown;55000.25;true\n")
+        tmp_path = tmp.name
+    try:
+        df = read_csv(tmp_path, separator=";")
+        result = df.collect()
+        assert len(result) == 3
+        assert result.columns == ["id", "first_name", "last_name", "salary", "active"]
+        assert result["first_name"][0] == "Alice"
+
+        df = read_csv(tmp_path, separator=";",
+                      new_columns=["user_id", "first", "last"])
+        result = df.collect()
+        assert result.columns[:3] == ["user_id", "first", "last"]
+        df = read_csv(tmp_path, separator=";", has_header=False)
+
+        result = df.collect()
+        assert len(result) == 4  # Now includes the header row as data
+
+        df = read_csv(tmp_path, separator=";", skip_rows=1)
+
+        result = df.collect()
+        assert len(result) == 2
+
+        df = read_csv(tmp_path, separator=";", row_index_name="row_num", row_index_offset=10)
+        result = df.collect()
+        assert "row_num" in result.columns
+        assert result["row_num"].to_list() == [10, 11, 12]
+    finally:
+        os.unlink(tmp_path)
+
+
+def test_read_csv_schema_handling():
+    """Test CSV reading with schema handling."""
+    with tempfile.NamedTemporaryFile(suffix='.csv', mode='w+', delete=False) as tmp:
+        tmp.write("id,name,value\n")
+        tmp.write("1,Alice,10.5\n")
+        tmp.write("2,Bob,20.0\n")
+        tmp.write("3,Charlie,N/A\n")  # Missing value
+        tmp_path = tmp.name
+
+    try:
+        df = read_csv(tmp_path)
+
+
+        schema = {"id": pl.Int32, "name": pl.Utf8, "value": pl.Float64}
+        df = read_csv(tmp_path, schema=schema, null_values=["N/A"])
+        result = df.collect()
+        assert result.schema["id"] == pl.Int32
+        assert result.schema["name"] == pl.Utf8
+        assert result.schema["value"] == pl.Float64
+
+        df = read_csv(tmp_path, schema_overrides={"id": pl.UInt8}, null_values=["N/A"])
+        result = df.collect()
+        assert result.schema["id"] == pl.UInt8
+
+        df = read_csv(tmp_path, null_values=["N/A"])
+        result = df.collect()
+        assert result["value"][2] is None  # The N/A should be converted to None
+    finally:
+        os.unlink(tmp_path)
+
+
+def test_read_csv_file_like_object():
+    """Test reading CSV from file-like objects."""
+    csv_data = "id,name,age\n1,Alice,25\n2,Bob,30\n3,Charlie,35"
+
+    bytes_io = io.BytesIO(csv_data.encode('utf-8'))
+    string_io = io.StringIO(csv_data)
+
+    df = read_csv(bytes_io)
+    result = df.collect()
+    assert len(result) == 3
+    assert result["name"][0] == "Alice"
+    df = read_csv(string_io)
+    result = df.collect()
+    assert len(result) == 3
+    assert result["name"][0] == "Alice"
+
+
+def test_read_csv_with_flow_graph():
+    """Test reading CSV with an existing flow graph."""
+    base_df = FlowFrame({
+        "id": [1, 2, 3],
+        "name": ["Alice", "Bob", "Charlie"]
+    })
+
+    with tempfile.NamedTemporaryFile(suffix='.csv', mode='w+', delete=False) as tmp:
+        tmp.write("id,age\n1,25\n2,30\n3,35")
+        tmp_path = tmp.name
+
+    try:
+        df = read_csv(tmp_path, flow_graph=base_df.flow_graph)
+
+        assert df.flow_graph is base_df.flow_graph
+
+        result = base_df.join(df, on="id").collect()
+        assert len(result) == 3
+        assert result.columns == ["id", "name", "age"]
+    finally:
+        os.unlink(tmp_path)
+
+
+def test_read_csv_complex_operations():
+    """Test CSV reading followed by complex operations."""
+    with tempfile.NamedTemporaryFile(suffix='.csv', mode='w+', delete=False) as tmp:
+        tmp.write("id,name,department,salary\n")
+        tmp.write("1,Alice,Sales,50000\n")
+        tmp.write("2,Bob,IT,60000\n")
+        tmp.write("3,Charlie,Sales,55000\n")
+        tmp.write("4,David,HR,65000\n")
+        tmp.write("5,Eve,IT,70000\n")
+        tmp_path = tmp.name
+
+    try:
+        df = read_csv(tmp_path)
+
+        result = (df
+                  .filter(col("salary") > 55000)
+                  .with_columns((col("salary") * 1.1).alias("new_salary"))
+                  .group_by("department")
+                  .agg([
+            col("new_salary").mean().alias("avg_salary"),
+            col("id").count().alias("employee_count")
+        ])
+                  .sort("avg_salary", descending=True)
+                  .collect())
+
+        assert len(result) == 2  # IT and HR departments
+        assert "avg_salary" in result.columns
+        assert "employee_count" in result.columns
+    finally:
+        os.unlink(tmp_path)
+
+
+def test_unique_integration(df):
+    df = df.concat(df)
+    from flowfile_core.schemas.input_schema import NodeUnique, NodePolarsCode
+
+    result = df.unique()
+    assert isinstance(result.get_node_settings().setting_input, NodeUnique)
+    assert result.get_node_settings().setting_input.unique_input.columns == df.columns
+
+    specific_result = df.unique("age")
+    assert isinstance(specific_result.get_node_settings().setting_input, NodeUnique)
+    assert specific_result.get_node_settings().setting_input.unique_input.columns == ["age"]
+    assert specific_result.get_node_settings().setting_input.unique_input.strategy == "any"
+
+    strategic_result = df.unique(["age", "city"], keep="last")
+    assert isinstance(strategic_result.get_node_settings().setting_input, NodeUnique)
+    assert strategic_result.get_node_settings().setting_input.unique_input.columns == ["age", "city"]
+    assert strategic_result.get_node_settings().setting_input.unique_input.strategy == "last"
+
+    sorted_df = df.sort(by=["age"], descending=True)
+
+    custom_result = sorted_df.unique(["age"], keep="first", maintain_order=True)
+    assert isinstance(custom_result.get_node_settings().setting_input, NodePolarsCode)
+    assert custom_result.collect()["age"].to_list() == sorted(list(set(df.collect()["age"].to_list())), reverse=True)
+
+
+def test_read_csv_integration():
+    """Test CSV reading integration with other FlowFrame operations."""
+    with tempfile.NamedTemporaryFile(suffix='.csv', mode='w+', delete=False) as tmp1:
+        tmp1.write("id,name\n1,Alice\n2,Bob\n3,Charlie")
+        tmp1_path = tmp1.name
+
+    with tempfile.NamedTemporaryFile(suffix='.csv', mode='w+', delete=False) as tmp2:
+        tmp2.write("id,age\n1,25\n2,30\n4,40")
+        tmp2_path = tmp2.name
+
+    try:
+        df1 = read_csv(tmp1_path)
+        df2 = read_csv(tmp2_path, flow_graph=df1.flow_graph)
+
+        joined = df1.join(df2, on="id", how="left")
+        result = joined.collect()
+
+        assert len(result) == 3  # All rows from df1
+        assert result["id"].to_list() == [1, 2, 3]
+        assert result["age"][2] is None  # No match for id=3
+
+        filtered = joined.filter(col("age").is_not_null())
+        result = filtered.collect()
+        assert len(result) == 2  # Only rows with matching ages
+    finally:
+        os.unlink(tmp1_path)
+        os.unlink(tmp2_path)
+
+
+def test_fuzzy_match():
+    """Test fuzzy matching operations."""
+    left_data = FlowFrame({"id": [1, 2, 3, 4, 5], "street": ["123 Main St", "456 Elm St", "789 Maple Ave", "101 Oak St", "202 Pine St"]})
+    right_data = FlowFrame({"id": [1, 2, 3], "street": ["123 Main Street", "456 Elm Street", "789 Maple Avenue"]})
+
+    fuzzy_match_input = FuzzyMapping("street", threshold_score=40)
+
+    result = left_data.fuzzy_join(right_data, [fuzzy_match_input]).collect()
+
+    expected_df = pl.DataFrame({
+        'id': [1, 4, 3, 2],
+        'street': ['123 Main St', '101 Oak St', '789 Maple Ave', '456 Elm St'],
+        'id_right': [1, 1, 3, 2], 'street_right': ['123 Main Street', '123 Main Street', '789 Maple Avenue', '456 Elm Street'],
+        'street_vs_street_right_levenshtein': [0.7333333333333334, 0.4, 0.8125, 0.7142857142857143]}
+    )
+    assert_frame_equal(result, expected_df, check_row_order=False, check_exact=False)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__])

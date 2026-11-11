@@ -1,0 +1,577 @@
+"""
+Compatibility enhancements for opening old flowfile versions.
+Migrates old schema structures to new ones during file load.
+"""
+
+import pickle
+from dataclasses import asdict, fields
+from pathlib import Path
+from typing import Any
+
+from flowfile_core.schemas import input_schema, schemas, transform_schema
+from tools.migrate.legacy_schemas import LEGACY_CLASS_MAP
+
+# LEGACY PICKLE LOADING
+
+
+class LegacyUnpickler(pickle.Unpickler):
+    """
+    Custom unpickler that redirects class lookups to legacy dataclass definitions.
+
+    When loading old .flowfile pickles, transform_schema classes were dataclasses.
+    Now they're Pydantic BaseModels. This unpickler intercepts those classes and
+    loads them as the legacy dataclass versions, which can then be migrated.
+    """
+
+    def find_class(self, module: str, name: str):
+        """Override to redirect transform_schema dataclasses to legacy definitions."""
+        if name in LEGACY_CLASS_MAP:
+            return LEGACY_CLASS_MAP[name]
+        return super().find_class(module, name)
+
+
+def load_flowfile_pickle(path: str) -> Any:
+    """
+    Load a flowfile pickle using legacy-compatible unpickling.
+
+    This handles old flowfiles where transform_schema classes were dataclasses
+    by loading them as legacy dataclass instances, which can then be migrated
+    to the new Pydantic BaseModel versions.
+
+    Args:
+        path: Path to the .flowfile pickle
+
+    Returns:
+        The deserialized FlowInformation object
+    """
+    resolved_path = Path(path).resolve()
+    with open(resolved_path, "rb") as f:
+        return LegacyUnpickler(f).load()
+
+
+# DATACLASS DETECTION AND MIGRATION
+
+
+def _is_dataclass_instance(obj: Any) -> bool:
+    """Check if an object is a dataclass instance (not a Pydantic model)."""
+    return hasattr(obj, "__dataclass_fields__") and not hasattr(obj, "model_dump")
+
+
+def _migrate_dataclass_to_basemodel(obj: Any, model_class: type) -> Any:
+    """Convert a dataclass instance to a Pydantic BaseModel instance."""
+    if obj is None:
+        return None
+
+    if not _is_dataclass_instance(obj):
+        return obj  # Already a BaseModel or dict
+
+    try:
+        data = asdict(obj)
+    except Exception:
+        # Fallback: manually extract attributes
+        data = {f.name: getattr(obj, f.name, None) for f in fields(obj)}
+
+    return model_class.model_validate(data)
+
+
+# NODE-SPECIFIC COMPATIBILITY FUNCTIONS
+
+
+def ensure_compatibility_node_read(node_read: input_schema.NodeRead):
+    """Migrate old NodeRead/ReceivedTable structure to new table_settings format."""
+    if not hasattr(node_read, "received_file") or node_read.received_file is None:
+        return
+
+    received_file = node_read.received_file
+
+    if not hasattr(received_file, "fields"):
+        received_file.fields = []
+
+    # Check if already migrated (has table_settings as proper object, not dict)
+    if hasattr(received_file, "table_settings") and received_file.table_settings is not None:
+        if not isinstance(received_file.table_settings, dict):
+            return
+
+    file_type = getattr(received_file, "file_type", None)
+    if file_type is None:
+        path = getattr(received_file, "path", "") or ""
+        if path.endswith(".parquet"):
+            file_type = "parquet"
+        elif path.endswith((".xlsx", ".xls")):
+            file_type = "excel"
+        elif path.endswith(".json"):
+            file_type = "json"
+        else:
+            file_type = "csv"
+
+    table_settings_dict = _build_input_table_settings(received_file, file_type)
+
+    received_file_dict = received_file.model_dump()
+    received_file_dict["file_type"] = file_type
+    received_file_dict["table_settings"] = table_settings_dict
+
+    new_received_file = input_schema.ReceivedTable.model_validate(received_file_dict)
+    node_read.received_file = new_received_file
+
+
+def _build_input_table_settings(received_file: Any, file_type: str) -> dict:
+    """Build appropriate table_settings dict from old flat attributes."""
+
+    if file_type == "csv":
+        return {
+            "file_type": "csv",
+            "reference": getattr(received_file, "reference", ""),
+            "starting_from_line": getattr(received_file, "starting_from_line", 0),
+            "delimiter": getattr(received_file, "delimiter", ","),
+            "has_headers": getattr(received_file, "has_headers", True),
+            "encoding": getattr(received_file, "encoding", "utf-8"),
+            "parquet_ref": getattr(received_file, "parquet_ref", None),
+            "row_delimiter": getattr(received_file, "row_delimiter", "\n"),
+            "quote_char": getattr(received_file, "quote_char", '"'),
+            "infer_schema_length": getattr(received_file, "infer_schema_length", 10_000),
+            "infer_schema": getattr(received_file, "infer_schema", True),
+            "truncate_ragged_lines": getattr(received_file, "truncate_ragged_lines", False),
+            "ignore_errors": getattr(received_file, "ignore_errors", False),
+        }
+
+    elif file_type == "json":
+        return {
+            "file_type": "json",
+            "reference": getattr(received_file, "reference", ""),
+            "starting_from_line": getattr(received_file, "starting_from_line", 0),
+            "delimiter": getattr(received_file, "delimiter", ","),
+            "has_headers": getattr(received_file, "has_headers", True),
+            "encoding": getattr(received_file, "encoding", "utf-8"),
+            "parquet_ref": getattr(received_file, "parquet_ref", None),
+            "row_delimiter": getattr(received_file, "row_delimiter", "\n"),
+            "quote_char": getattr(received_file, "quote_char", '"'),
+            "infer_schema_length": getattr(received_file, "infer_schema_length", 10_000),
+            "infer_schema": getattr(received_file, "infer_schema", True),
+            "truncate_ragged_lines": getattr(received_file, "truncate_ragged_lines", False),
+            "ignore_errors": getattr(received_file, "ignore_errors", False),
+        }
+
+    elif file_type == "parquet":
+        return {"file_type": "parquet"}
+
+    elif file_type == "excel":
+        return {
+            "file_type": "excel",
+            "sheet_name": getattr(received_file, "sheet_name", None),
+            "start_row": getattr(received_file, "start_row", 0),
+            "start_column": getattr(received_file, "start_column", 0),
+            "end_row": getattr(received_file, "end_row", 0),
+            "end_column": getattr(received_file, "end_column", 0),
+            "has_headers": getattr(received_file, "has_headers", True),
+            "type_inference": getattr(received_file, "type_inference", False),
+        }
+
+    return {"file_type": "csv", "delimiter": ",", "encoding": "utf-8", "has_headers": True}
+
+
+def ensure_compatibility_node_output(node_output: input_schema.NodeOutput):
+    """Migrate old OutputSettings structure to new table_settings format."""
+    if not hasattr(node_output, "output_settings") or node_output.output_settings is None:
+        return
+
+    output_settings = node_output.output_settings
+
+    # Check if already migrated (has table_settings as proper object, not dict)
+    if hasattr(output_settings, "table_settings") and output_settings.table_settings is not None:
+        if not isinstance(output_settings.table_settings, dict):
+            return
+
+    file_type = getattr(output_settings, "file_type", "csv")
+    table_settings_dict = _build_output_table_settings(output_settings, file_type)
+
+    output_settings_dict = output_settings.model_dump()
+    output_settings_dict["table_settings"] = table_settings_dict
+
+    for old_field in ["output_csv_table", "output_parquet_table", "output_excel_table"]:
+        output_settings_dict.pop(old_field, None)
+
+    new_output_settings = input_schema.OutputSettings.model_validate(output_settings_dict)
+    node_output.output_settings = new_output_settings
+
+
+def _build_output_table_settings(output_settings: Any, file_type: str) -> dict:
+    """Build appropriate output table_settings from old separate table fields."""
+
+    if file_type == "csv":
+        old_csv = getattr(output_settings, "output_csv_table", None)
+        if old_csv is not None:
+            return {
+                "file_type": "csv",
+                "delimiter": getattr(old_csv, "delimiter", ","),
+                "encoding": getattr(old_csv, "encoding", "utf-8"),
+            }
+        return {"file_type": "csv", "delimiter": ",", "encoding": "utf-8"}
+
+    elif file_type == "parquet":
+        return {"file_type": "parquet"}
+
+    elif file_type == "excel":
+        old_excel = getattr(output_settings, "output_excel_table", None)
+        if old_excel is not None:
+            return {
+                "file_type": "excel",
+                "sheet_name": getattr(old_excel, "sheet_name", "Sheet1"),
+            }
+        return {"file_type": "excel", "sheet_name": "Sheet1"}
+
+    return {"file_type": "csv", "delimiter": ",", "encoding": "utf-8"}
+
+
+def ensure_compatibility_node_groupby(node_groupby: input_schema.NodeGroupBy):
+    """Migrate old NodeGroupBy structure:
+    - GroupByInput dataclass -> BaseModel
+    - AggColl dataclass -> BaseModel
+    """
+    if not hasattr(node_groupby, "groupby_input") or node_groupby.groupby_input is None:
+        return
+
+    groupby_input = node_groupby.groupby_input
+
+    # Check if already migrated (is a Pydantic model)
+    if not _is_dataclass_instance(groupby_input):
+        return
+
+    agg_cols = getattr(groupby_input, "agg_cols", []) or []
+    new_agg_cols = []
+    for agg_col in agg_cols:
+        if _is_dataclass_instance(agg_col):
+            new_agg_col = _migrate_dataclass_to_basemodel(agg_col, transform_schema.AggColl)
+            new_agg_cols.append(new_agg_col)
+        else:
+            new_agg_cols.append(agg_col)
+
+    new_groupby_input = transform_schema.GroupByInput(agg_cols=new_agg_cols)
+    node_groupby.groupby_input = new_groupby_input
+
+
+def ensure_compatibility_node_filter(node_filter: input_schema.NodeFilter):
+    """Migrate old NodeFilter structure:
+    - FilterInput dataclass -> BaseModel
+    - filter_type -> mode
+    - BasicFilter.filter_type -> BasicFilter.operator
+    - BasicFilter.filter_value -> BasicFilter.value
+    """
+    if not hasattr(node_filter, "filter_input") or node_filter.filter_input is None:
+        return
+
+    filter_input = node_filter.filter_input
+
+    # Check if already migrated (is a Pydantic model)
+    if not _is_dataclass_instance(filter_input):
+        return
+
+    filter_data = {
+        # filter_type -> mode
+        "mode": getattr(filter_input, "filter_type", "basic"),
+        "advanced_filter": getattr(filter_input, "advanced_filter", ""),
+    }
+
+    basic_filter = getattr(filter_input, "basic_filter", None)
+    if basic_filter is not None:
+        if _is_dataclass_instance(basic_filter):
+            basic_filter_data = {
+                "field": getattr(basic_filter, "field", ""),
+                # filter_type -> operator
+                "operator": getattr(basic_filter, "filter_type", "equals"),
+                # filter_value -> value
+                "value": getattr(basic_filter, "filter_value", ""),
+            }
+            filter_data["basic_filter"] = transform_schema.BasicFilter.model_validate(basic_filter_data)
+        else:
+            filter_data["basic_filter"] = basic_filter
+
+    new_filter_input = transform_schema.FilterInput.model_validate(filter_data)
+    node_filter.filter_input = new_filter_input
+
+
+def ensure_compatibility_node_select(node_select: input_schema.NodeSelect):
+    """Ensure NodeSelect has position attributes, sorted_by field, and handle dataclass migrations."""
+    if not hasattr(node_select, "select_input"):
+        return
+
+    if node_select.select_input:
+        new_select_input = []
+        needs_migration = any(_is_dataclass_instance(si) for si in node_select.select_input)
+
+        if needs_migration:
+            for si in node_select.select_input:
+                if _is_dataclass_instance(si):
+                    new_si = _migrate_dataclass_to_basemodel(si, transform_schema.SelectInput)
+                    new_select_input.append(new_si)
+                else:
+                    new_select_input.append(si)
+            node_select.select_input = new_select_input
+
+    if any(not hasattr(select_input, "position") for select_input in node_select.select_input):
+        for _index, select_input in enumerate(node_select.select_input):
+            select_input.position = _index
+
+    if not hasattr(node_select, "sorted_by"):
+        node_select.sorted_by = "none"
+
+
+def ensure_compatibility_node_joins(node_settings: input_schema.NodeFuzzyMatch | input_schema.NodeJoin):
+    """Ensure join nodes have position attributes on renames and handle dataclass migrations."""
+    if not hasattr(node_settings, "join_input") or node_settings.join_input is None:
+        return
+
+    join_input = node_settings.join_input
+
+    # Check if right_select and left_select exist
+    if not hasattr(join_input, "right_select") or not hasattr(join_input, "left_select"):
+        return
+
+    if hasattr(join_input, "join_mapping") and join_input.join_mapping:
+        new_mapping = []
+        for jm in join_input.join_mapping:
+            if _is_dataclass_instance(jm):
+                new_jm = _migrate_dataclass_to_basemodel(jm, transform_schema.JoinMap)
+                new_mapping.append(new_jm)
+            else:
+                new_mapping.append(jm)
+        join_input.join_mapping = new_mapping
+
+    for select_attr in ["right_select", "left_select"]:
+        select = getattr(join_input, select_attr, None)
+        if select is None:
+            continue
+
+        renames = getattr(select, "renames", []) or []
+        if renames and any(_is_dataclass_instance(r) for r in renames):
+            new_renames = []
+            for r in renames:
+                if _is_dataclass_instance(r):
+                    new_r = _migrate_dataclass_to_basemodel(r, transform_schema.SelectInput)
+                    new_renames.append(new_r)
+                else:
+                    new_renames.append(r)
+            select.renames = new_renames
+
+    right_renames = getattr(join_input.right_select, "renames", []) or []
+    left_renames = getattr(join_input.left_select, "renames", []) or []
+
+    if any(not hasattr(r, "position") for r in right_renames + left_renames):
+        for _index, select_input in enumerate(right_renames + left_renames):
+            select_input.position = _index
+
+
+def ensure_description(node: input_schema.NodeBase):
+    """Ensure node has description field."""
+    if not hasattr(node, "description"):
+        node.description = ""
+
+
+def ensure_execution_location(node: input_schema.NodeBase):
+    """Open a node pickled before nodes carried an execution location on "auto", the NodeBase default.
+
+    Written straight into __dict__ because a legacy settings class has no such field for normal setattr to accept.
+    """
+    if "execution_location" not in node.__dict__:
+        object.__setattr__(node, "__dict__", {**node.__dict__, "execution_location": "auto"})
+
+
+def ensure_compatibility_node_sample(node_sample: input_schema.NodeSample):
+    """Add the sampling fields to nodes pickled before random sampling existed.
+
+    Unpickling restores __dict__ verbatim, so pydantic never applies the
+    defaults and reading these raises AttributeError. Written straight into
+    __dict__ because these pickles resolve to the frozen legacy NodeSample,
+    which has no such fields for normal setattr to accept.
+    """
+    defaults = {"sample_method": "first", "fraction": 10.0, "seed": None}
+    missing = {k: v for k, v in defaults.items() if k not in node_sample.__dict__}
+    if missing:
+        object.__setattr__(node_sample, "__dict__", {**node_sample.__dict__, **missing})
+
+
+def ensure_compatibility_node_manual_input(node_manual_input: input_schema.NodeManualInput):
+    """Migrate old NodeManualInput structure:
+    - raw_data (list of dicts) -> raw_data_format (RawData)
+    """
+    if hasattr(node_manual_input, "raw_data_format") and node_manual_input.raw_data_format is not None:
+        return
+
+    raw_data = getattr(node_manual_input, "raw_data", None)
+    if raw_data is not None and isinstance(raw_data, list) and len(raw_data) > 0:
+        raw_data_format = input_schema.RawData.from_pylist(raw_data)
+        object.__setattr__(
+            node_manual_input, "__dict__", {**node_manual_input.__dict__, "raw_data_format": raw_data_format}
+        )
+
+
+def ensure_compatibility_node_polars(node_polars: input_schema.NodePolarsCode):
+    """Migrate old NodePolarsCode structure:
+    - depending_on_id (single) -> depending_on_ids (list)
+    - PolarsCodeInput from dataclass to BaseModel
+    """
+    if hasattr(node_polars, "depending_on_id"):
+        old_id = getattr(node_polars, "depending_on_id", None)
+        if not hasattr(node_polars, "depending_on_ids") or node_polars.depending_on_ids is None:
+            if old_id is not None:
+                node_polars.depending_on_ids = [old_id]
+            else:
+                node_polars.depending_on_ids = []
+
+    if hasattr(node_polars, "polars_code_input") and node_polars.polars_code_input is not None:
+        polars_code_input = node_polars.polars_code_input
+
+        if _is_dataclass_instance(polars_code_input):
+            new_polars_code_input = _migrate_dataclass_to_basemodel(polars_code_input, transform_schema.PolarsCodeInput)
+            node_polars.polars_code_input = new_polars_code_input
+
+
+def ensure_compatibility_node_cloud_storage_writer(node_writer: input_schema.NodeCloudStorageWriter):
+    """Ensure CloudStorageWriteSettings pickled before partition_by and the Delta merge fields existed has them."""
+    settings = getattr(node_writer, "cloud_storage_settings", None)
+    if settings is None:
+        return
+    defaults = {"partition_by": None, "merge_keys": [], "track_changes": False}
+    missing = {k: v for k, v in defaults.items() if k not in settings.__dict__}
+    if missing:
+        object.__setattr__(settings, "__dict__", {**settings.__dict__, **missing})
+
+
+def ensure_compatibility_node_cloud_storage_reader(node_reader: input_schema.NodeCloudStorageReader):
+    """Ensure CloudStorageReadSettings pickled before the change-feed fields existed has them."""
+    settings = getattr(node_reader, "cloud_storage_settings", None)
+    if settings is None:
+        return
+    defaults = {"cdc_mode": "off", "cdc_from_version": None, "cdc_from_timestamp": None, "cdc_include_preimage": False}
+    missing = {k: v for k, v in defaults.items() if k not in settings.__dict__}
+    if missing:
+        object.__setattr__(settings, "__dict__", {**settings.__dict__, **missing})
+
+
+def ensure_compatibility_node_catalog_writer(node_writer: input_schema.NodeCatalogWriter):
+    """Ensure CatalogWriteSettings pickled before the scd2 block existed has the field."""
+    settings = getattr(node_writer, "catalog_write_settings", None)
+    if settings is None:
+        return
+    if "scd2" not in settings.__dict__:
+        object.__setattr__(settings, "__dict__", {**settings.__dict__, "scd2": None})
+
+
+def ensure_compatibility_node_catalog_reader(node_reader: input_schema.NodeCatalogReader):
+    """Ensure a NodeCatalogReader pickled before the SCD2 history view existed has both fields.
+
+    ``_add_catalog_table_reader`` reads them on every wiring, including a plain flow-open, so a
+    legacy flow would raise ``AttributeError`` before it ever ran.
+    """
+    for name in ("scd2_view", "scd2_as_of"):
+        if name not in node_reader.__dict__:
+            object.__setattr__(node_reader, "__dict__", {**node_reader.__dict__, name: None})
+
+
+def ensure_flow_settings(flow_storage_obj: schemas.FlowInformation, flow_path: str):
+    """Ensure flow_settings exists and has all required fields."""
+    if not hasattr(flow_storage_obj, "flow_settings") or flow_storage_obj.flow_settings is None:
+        flow_settings = schemas.FlowSettings(
+            flow_id=flow_storage_obj.flow_id, path=flow_path, name=flow_storage_obj.flow_name
+        )
+        flow_storage_obj.flow_settings = flow_settings
+        flow_storage_obj = schemas.FlowInformation.model_validate(flow_storage_obj)
+        return flow_storage_obj
+    fs = flow_storage_obj.flow_settings
+    if not hasattr(fs, "execution_location"):
+        fs.execution_location = "remote"
+    elif fs.execution_location == "auto":
+        fs.execution_location = "remote"
+    if not hasattr(fs, "is_running"):
+        fs.is_running = False
+
+    if not hasattr(fs, "is_canceled"):
+        fs.is_canceled = False
+
+    if not hasattr(fs, "show_detailed_progress"):
+        fs.show_detailed_progress = True
+
+    if "track_history" not in fs.__dict__:
+        object.__setattr__(fs, "__dict__", {**fs.__dict__, "track_history": True})
+
+    if "max_parallel_workers" not in fs.__dict__ or fs.max_parallel_workers is None:
+        object.__setattr__(fs, "__dict__", {**fs.__dict__, "max_parallel_workers": 4})
+
+    if "source_registration_id" not in fs.__dict__:
+        object.__setattr__(fs, "__dict__", {**fs.__dict__, "source_registration_id": None})
+
+    if "parameters" not in fs.__dict__:
+        object.__setattr__(fs, "__dict__", {**fs.__dict__, "parameters": []})
+
+    if "validate_settings" not in fs.__dict__:
+        object.__setattr__(fs, "__dict__", {**fs.__dict__, "validate_settings": True})
+
+    return flow_storage_obj
+
+
+def ensure_compatibility(flow_storage_obj: schemas.FlowInformation, flow_path: str):
+    """
+    Main compatibility function - migrates old flowfile schemas to current version.
+
+    Handles migrations for:
+    - FlowSettings structure
+    - NodeManualInput (raw_data list of dicts -> raw_data_format RawData)
+    - NodeRead (ReceivedTable with table_settings)
+    - NodeOutput (OutputSettings with table_settings)
+    - NodeSelect (position attributes, dataclass -> BaseModel)
+    - NodeJoin/NodeFuzzyMatch (join input positions, dataclass -> BaseModel)
+    - NodePolarsCode (depending_on_ids, dataclass -> BaseModel)
+    - Node descriptions
+    - Node execution locations ("auto")
+    """
+    flow_storage_obj = ensure_flow_settings(flow_storage_obj, flow_path)
+    for _id, node_information in flow_storage_obj.data.items():
+        if not hasattr(node_information, "setting_input") or node_information.setting_input is None:
+            continue
+
+        setting_input = node_information.setting_input
+        class_name = setting_input.__class__.__name__
+
+        if class_name == "NodeRead":
+            ensure_compatibility_node_read(setting_input)
+        elif class_name == "NodeSelect":
+            ensure_compatibility_node_select(setting_input)
+        elif class_name == "NodeOutput":
+            ensure_compatibility_node_output(setting_input)
+        elif class_name in ("NodeJoin", "NodeFuzzyMatch"):
+            ensure_compatibility_node_joins(setting_input)
+        elif class_name == "NodeManualInput":
+            ensure_compatibility_node_manual_input(setting_input)
+        elif class_name == "NodePolarsCode":
+            ensure_compatibility_node_polars(setting_input)
+        elif class_name == "NodeFilter":
+            ensure_compatibility_node_filter(setting_input)
+        elif class_name == "NodeGroupBy":
+            ensure_compatibility_node_groupby(setting_input)
+        elif class_name == "NodeCloudStorageWriter":
+            ensure_compatibility_node_cloud_storage_writer(setting_input)
+        elif class_name == "NodeCloudStorageReader":
+            ensure_compatibility_node_cloud_storage_reader(setting_input)
+        elif class_name == "NodeCatalogWriter":
+            ensure_compatibility_node_catalog_writer(setting_input)
+        elif class_name == "NodeCatalogReader":
+            ensure_compatibility_node_catalog_reader(setting_input)
+        elif class_name == "NodeSample":
+            ensure_compatibility_node_sample(setting_input)
+        ensure_description(setting_input)
+        ensure_execution_location(setting_input)
+
+    return flow_storage_obj
+
+
+def load_and_migrate_flowfile(flow_path: str) -> schemas.FlowInformation:
+    """
+    Convenience function: Load a flowfile and apply all compatibility migrations.
+
+    Args:
+        flow_path: Path to the .flowfile pickle
+
+    Returns:
+        Fully migrated FlowInformation object
+    """
+    flow_storage_obj = load_flowfile_pickle(flow_path)
+    return ensure_compatibility(flow_storage_obj, flow_path)

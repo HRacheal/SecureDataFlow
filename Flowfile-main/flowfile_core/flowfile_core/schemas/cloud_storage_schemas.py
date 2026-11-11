@@ -1,0 +1,329 @@
+"""Cloud storage connection schemas for S3, ADLS, and other cloud providers."""
+
+import base64
+from typing import Literal
+
+import polars as pl
+from pydantic import BaseModel, Field, SecretStr, model_validator
+
+from flowfile_core.schemas.change_feed import ChangeFeedReadSettings
+from flowfile_core.schemas.delta_write import MERGE_MODES, validate_delta_write_rules
+from flowfile_core.schemas.sharing_schema import AccessInfo
+from flowfile_core.secret_manager.secret_manager import encrypt_secret
+
+CloudStorageType = Literal["s3", "adls", "gcs"]
+AuthMethod = Literal[
+    "access_key",
+    "iam_role",
+    "service_principal",
+    "managed_identity",
+    "sas_token",
+    "aws-cli",
+    "env_vars",
+    "service_account",
+]
+
+# Node-level auth mode: every connection AuthMethod plus "auto" (auto-detect from
+# environment/aws-cli when no saved connection is referenced). Distinct from AuthMethod,
+# which types a stored connection and must always be a concrete method.
+CloudStorageAuthMode = Literal[
+    "access_key",
+    "iam_role",
+    "service_principal",
+    "managed_identity",
+    "sas_token",
+    "aws-cli",
+    "env_vars",
+    "service_account",
+    "auto",
+]
+
+
+def encrypt_for_worker(secret_value: SecretStr | None, user_id: int) -> str | None:
+    """
+    Encrypts a secret value for use in worker contexts using per-user key derivation.
+
+    Args:
+        secret_value: The secret value to encrypt
+        user_id: The user ID for key derivation
+
+    Returns:
+        Encrypted secret with embedded user_id, or None if secret_value is None
+    """
+    if secret_value is not None:
+        return encrypt_secret(secret_value.get_secret_value(), user_id)
+    return None
+
+
+class AuthSettingsInput(BaseModel):
+    """
+    The information needed for the user to provide the details that are needed to provide how to connect to the
+     Cloud provider
+    """
+
+    storage_type: CloudStorageType
+    auth_method: AuthMethod
+    connection_name: str | None = "None"  # This is the reference to the item we will fetch that contains the data
+
+
+class FullCloudStorageConnectionWorkerInterface(AuthSettingsInput):
+    """Internal model with decrypted secrets"""
+
+    # AWS S3
+    aws_region: str | None = None
+    aws_access_key_id: str | None = None
+    aws_secret_access_key: str | None = None
+    aws_role_arn: str | None = None
+    aws_allow_unsafe_html: bool | None = None
+    aws_session_token: str | None = None
+    aws_profile: str | None = None
+
+    # Azure ADLS
+    azure_account_name: str | None = None
+    azure_account_key: str | None = None
+    azure_tenant_id: str | None = None
+    azure_client_id: str | None = None
+    azure_client_secret: str | None = None
+    azure_sas_token: str | None = None
+
+    # Google Cloud Storage
+    gcs_service_account_key: str | None = None
+    gcs_project_id: str | None = None
+
+    # Common
+    endpoint_url: str | None = None
+    verify_ssl: bool = True
+
+
+class FullCloudStorageConnection(AuthSettingsInput):
+    """Internal model with decrypted secrets"""
+
+    # AWS S3
+    aws_region: str | None = None
+    aws_access_key_id: str | None = None
+    aws_secret_access_key: SecretStr | None = None
+    aws_role_arn: str | None = None
+    aws_allow_unsafe_html: bool | None = None
+    aws_session_token: SecretStr | None = None
+    # aws-cli only: the local AWS profile; blank uses boto3's default credential chain
+    aws_profile: str | None = None
+
+    # Azure ADLS
+    azure_account_name: str | None = None
+    azure_account_key: SecretStr | None = None
+    azure_tenant_id: str | None = None
+    azure_client_id: str | None = None
+    azure_client_secret: SecretStr | None = None
+    azure_sas_token: SecretStr | None = None
+
+    # Google Cloud Storage
+    gcs_service_account_key: SecretStr | None = None
+    gcs_project_id: str | None = None
+
+    # Common
+    endpoint_url: str | None = None
+    verify_ssl: bool = True
+
+    def get_worker_interface(self, user_id: int) -> "FullCloudStorageConnectionWorkerInterface":
+        """
+        Convert to a worker interface model with encrypted secrets.
+
+        Args:
+            user_id: The user ID for per-user key derivation
+
+        Returns:
+            FullCloudStorageConnectionWorkerInterface with encrypted secrets
+        """
+        return FullCloudStorageConnectionWorkerInterface(
+            storage_type=self.storage_type,
+            auth_method=self.auth_method,
+            connection_name=self.connection_name,
+            aws_allow_unsafe_html=self.aws_allow_unsafe_html,
+            aws_secret_access_key=encrypt_for_worker(self.aws_secret_access_key, user_id),
+            aws_region=self.aws_region,
+            aws_access_key_id=self.aws_access_key_id,
+            aws_role_arn=self.aws_role_arn,
+            aws_session_token=encrypt_for_worker(self.aws_session_token, user_id),
+            aws_profile=self.aws_profile,
+            azure_account_name=self.azure_account_name,
+            azure_tenant_id=self.azure_tenant_id,
+            azure_account_key=encrypt_for_worker(self.azure_account_key, user_id),
+            azure_client_id=self.azure_client_id,
+            azure_client_secret=encrypt_for_worker(self.azure_client_secret, user_id),
+            azure_sas_token=encrypt_for_worker(self.azure_sas_token, user_id),
+            gcs_service_account_key=encrypt_for_worker(self.gcs_service_account_key, user_id),
+            gcs_project_id=self.gcs_project_id,
+            endpoint_url=self.endpoint_url,
+            verify_ssl=self.verify_ssl,
+        )
+
+
+class FullCloudStorageConnectionInterface(AuthSettingsInput):
+    """API response model - no secrets exposed"""
+
+    # Public fields only
+    aws_allow_unsafe_html: bool | None = None
+    aws_region: str | None = None
+    aws_access_key_id: str | None = None
+    aws_role_arn: str | None = None
+    aws_profile: str | None = None
+    azure_account_name: str | None = None
+    azure_tenant_id: str | None = None
+    azure_client_id: str | None = None
+    gcs_project_id: str | None = None
+    endpoint_url: str | None = None
+    verify_ssl: bool = True
+    id: int | None = None
+    access: AccessInfo | None = None
+
+
+class CloudStorageSettings(BaseModel):
+    """Settings for cloud storage nodes in the visual designer"""
+
+    auth_mode: CloudStorageAuthMode = "auto"
+    connection_name: str | None = None
+    resource_path: str  # s3://bucket/path/to/file.csv
+
+
+class CloudStorageReadSettings(ChangeFeedReadSettings, CloudStorageSettings):
+    """Settings for reading from cloud storage.
+
+    The change-feed fields read a Delta table's change data feed instead of the table. A bare path
+    has no cursor store, so ``cdc_mode`` omits the catalog's ``since_last_run``.
+    """
+
+    scan_mode: Literal["single_file", "directory"] = "single_file"
+    file_format: Literal["csv", "parquet", "json", "delta", "iceberg"] = "parquet"
+    csv_has_header: bool | None = True
+    csv_delimiter: str | None = ","
+    csv_encoding: str | None = "utf8"
+    delta_version: int | None = None
+    cdc_mode: Literal["off", "since_version", "since_timestamp"] = "off"
+
+    @model_validator(mode="after")
+    def _validate_change_feed_source(self) -> "CloudStorageReadSettings":
+        if self.cdc_mode == "off":
+            return self
+        if self.file_format != "delta":
+            raise ValueError("Change modes are only available for the 'delta' file format")
+        if self.delta_version is not None:
+            raise ValueError("Change modes cannot be combined with a pinned table version")
+        return self
+
+    def with_csv_defaults(self) -> "CloudStorageReadSettings":
+        """A copy with the drawer's defaults for unset CSV options; the engine and the FlowFrame export share it."""
+        return self.model_copy(
+            update={
+                "csv_has_header": True if self.csv_has_header is None else self.csv_has_header,
+                "csv_delimiter": self.csv_delimiter or ",",
+                "csv_encoding": self.csv_encoding or "utf8",
+            }
+        )
+
+
+class CloudStorageReadSettingsInternal(BaseModel):
+    read_settings: CloudStorageReadSettings
+    connection: FullCloudStorageConnection
+
+
+class WriteSettingsWorkerInterface(BaseModel):
+    """Settings for writing to cloud storage"""
+
+    resource_path: str  # s3://bucket/path/to/file.csv
+
+    write_mode: Literal["overwrite", "append", "error", "upsert", "update", "delete"] = "overwrite"
+    file_format: Literal["csv", "parquet", "json", "delta"] = "parquet"
+
+    parquet_compression: Literal["snappy", "gzip", "brotli", "lz4", "zstd"] = "snappy"
+
+    csv_delimiter: str = ","
+    csv_encoding: str = "utf8"
+
+    # Delta only: partition columns, applied at table creation
+    partition_by: list[str] | None = None
+    # Delta only: the key columns an upsert/update/delete matches on
+    merge_keys: list[str] = Field(default_factory=list)
+    # Delta only, enable-only: True turns the change data feed on; False never turns it off
+    track_changes: bool = False
+
+
+class CloudStorageWriteSettings(CloudStorageSettings, WriteSettingsWorkerInterface):
+    """Settings for writing to cloud storage.
+
+    Shares the key-column and change-tracking rules with ``CatalogWriteSettings``
+    (``validate_delta_write_rules``); on top of them every mode beyond overwrite/append, and
+    ``track_changes``, is Delta-only.
+    """
+
+    @model_validator(mode="after")
+    def _validate_delta_write(self) -> "CloudStorageWriteSettings":
+        if self.file_format != "delta" and (self.write_mode in MERGE_MODES or self.write_mode == "error"):
+            raise ValueError(f"write_mode '{self.write_mode}' is only supported for the 'delta' file format")
+        if self.file_format != "delta" and self.track_changes:
+            raise ValueError("track_changes is only supported for the 'delta' file format")
+        validate_delta_write_rules(self.write_mode, self.merge_keys, self.track_changes)
+        return self
+
+    def get_write_setting_worker_interface(self) -> WriteSettingsWorkerInterface:
+        """
+        Convert to a worker interface model without secrets.
+        """
+        return WriteSettingsWorkerInterface(
+            resource_path=self.resource_path,
+            write_mode=self.write_mode,
+            file_format=self.file_format,
+            parquet_compression=self.parquet_compression,
+            csv_delimiter=self.csv_delimiter,
+            csv_encoding=self.csv_encoding,
+            partition_by=self.partition_by,
+            merge_keys=self.merge_keys,
+            track_changes=self.track_changes,
+        )
+
+
+class CloudStorageWriteSettingsInternal(BaseModel):
+    write_settings: CloudStorageWriteSettings
+    connection: FullCloudStorageConnection
+
+
+class CloudStorageWriteSettingsWorkerInterface(BaseModel):
+    """Settings for writing to cloud storage in worker context"""
+
+    operation: str
+    write_settings: WriteSettingsWorkerInterface
+    connection: FullCloudStorageConnectionWorkerInterface
+    flowfile_flow_id: int = 1
+    flowfile_node_id: int | str = -1
+
+
+def get_cloud_storage_write_settings_worker_interface(
+    write_settings: CloudStorageWriteSettings,
+    connection: FullCloudStorageConnection,
+    lf: pl.LazyFrame,
+    user_id: int,
+    flowfile_flow_id: int = 1,
+    flowfile_node_id: int | str = -1,
+) -> CloudStorageWriteSettingsWorkerInterface:
+    """
+    Convert to a worker interface model with encrypted secrets.
+
+    Args:
+        write_settings: Cloud storage write settings
+        connection: Full cloud storage connection with secrets
+        lf: LazyFrame to serialize
+        user_id: User ID for per-user key derivation
+        flowfile_flow_id: Flow ID for tracking
+        flowfile_node_id: Node ID for tracking
+
+    Returns:
+        CloudStorageWriteSettingsWorkerInterface ready for worker
+    """
+    operation = base64.b64encode(lf.serialize()).decode()
+
+    return CloudStorageWriteSettingsWorkerInterface(
+        operation=operation,
+        write_settings=write_settings.get_write_setting_worker_interface(),
+        connection=connection.get_worker_interface(user_id),
+        flowfile_flow_id=flowfile_flow_id,
+        flowfile_node_id=flowfile_node_id,
+    )

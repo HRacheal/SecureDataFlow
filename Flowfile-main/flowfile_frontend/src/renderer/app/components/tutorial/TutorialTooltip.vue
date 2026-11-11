@@ -1,0 +1,560 @@
+<script setup lang="ts">
+import { computed, ref, onMounted, onUnmounted, watch } from "vue";
+import type { TutorialStep } from "../../stores/tutorial-store";
+
+const props = defineProps<{
+  step: TutorialStep;
+  position: { x: number; y: number };
+  placement?:
+    | "top"
+    | "bottom"
+    | "left"
+    | "right"
+    | "center"
+    | "beside-right-top"
+    | "beside-right-bottom"
+    | "beside-left-top"
+    | "beside-left-bottom";
+  isCenterMode: boolean;
+  currentStepIndex: number;
+  totalSteps: number;
+  progress: number;
+  satisfied?: boolean;
+  prereqMissing?: boolean;
+  wrongActionHint?: string | null;
+}>();
+
+const emit = defineEmits<{
+  (e: "next"): void;
+  (e: "prev"): void;
+  (e: "skip"): void;
+  (e: "complete"): void;
+}>();
+
+const tooltipRef = ref<HTMLElement | null>(null);
+const tooltipRect = ref<DOMRect | null>(null);
+
+function updateTooltipRect() {
+  if (tooltipRef.value) {
+    tooltipRect.value = tooltipRef.value.getBoundingClientRect();
+  }
+}
+
+watch(
+  () => props.step,
+  () => {
+    setTimeout(updateTooltipRect, 50);
+  },
+  { immediate: true },
+);
+
+onMounted(() => {
+  setTimeout(updateTooltipRect, 50);
+  window.addEventListener("resize", updateTooltipRect);
+});
+
+onUnmounted(() => {
+  window.removeEventListener("resize", updateTooltipRect);
+});
+
+const tooltipStyle = computed(() => {
+  // placement "center" also arrives when a positioned step's target unmounts
+  // mid-step — fall back to corner/center instead of a stale anchor point.
+  if (props.isCenterMode || props.placement === "center") {
+    if (props.step.centerInScreen) {
+      return {
+        position: "fixed" as const,
+        left: "50%",
+        top: "50%",
+        right: "auto",
+        bottom: "auto",
+        transform: "translate(-50%, -50%)",
+      };
+    }
+    const corner = props.step.corner ?? "bottom-right";
+    const [vertical, horizontal] = corner.split("-") as ["top" | "bottom", "left" | "right"];
+    return {
+      position: "fixed" as const,
+      [horizontal]: "24px",
+      [vertical]: "24px",
+      [horizontal === "left" ? "right" : "left"]: "auto",
+      [vertical === "top" ? "bottom" : "top"]: "auto",
+      transform: "none",
+    };
+  }
+
+  const tooltipWidth = tooltipRect.value?.width || 350;
+  const tooltipHeight = tooltipRect.value?.height || 200;
+  const padding = 20;
+  const position = props.placement ?? props.step.position ?? "bottom";
+
+  let x = props.position.x;
+  let y = props.position.y;
+  let transform = "";
+
+  switch (position) {
+    case "top":
+      transform = "translate(-50%, -100%)";
+      break;
+    case "beside-right-top":
+      transform = "translate(0, 0)";
+      break;
+    case "beside-right-bottom":
+      transform = "translate(0, -100%)";
+      break;
+    case "beside-left-top":
+      transform = "translate(-100%, 0)";
+      break;
+    case "beside-left-bottom":
+      transform = "translate(-100%, -100%)";
+      break;
+    case "bottom":
+      transform = "translate(-50%, 0)";
+      break;
+    case "left":
+      transform = "translate(-100%, -50%)";
+      break;
+    case "right":
+      transform = "translate(0, -50%)";
+      break;
+  }
+
+  let finalX = x;
+  let finalY = y;
+
+  let effectiveX = x;
+  let effectiveY = y;
+
+  if (transform.includes("-50%, 0")) {
+    effectiveX = x - tooltipWidth / 2;
+  } else if (transform.includes("-50%, -100%)")) {
+    effectiveX = x - tooltipWidth / 2;
+    effectiveY = y - tooltipHeight;
+  } else if (transform.includes("-100%, -100%")) {
+    effectiveX = x - tooltipWidth;
+    effectiveY = y - tooltipHeight;
+  } else if (transform.includes("(-100%, 0")) {
+    effectiveX = x - tooltipWidth;
+  } else if (transform.includes("(0, -100%")) {
+    effectiveY = y - tooltipHeight;
+  } else if (transform.includes("-100%, -50%")) {
+    effectiveX = x - tooltipWidth;
+    effectiveY = y - tooltipHeight / 2;
+  } else if (transform.includes("0, -50%")) {
+    effectiveY = y - tooltipHeight / 2;
+  }
+
+  if (effectiveX < padding) {
+    finalX = x + (padding - effectiveX);
+  }
+  if (effectiveX + tooltipWidth > window.innerWidth - padding) {
+    finalX = x - (effectiveX + tooltipWidth - window.innerWidth + padding);
+  }
+  if (effectiveY < padding) {
+    finalY = y + (padding - effectiveY);
+  }
+  if (effectiveY + tooltipHeight > window.innerHeight - padding) {
+    finalY = y - (effectiveY + tooltipHeight - window.innerHeight + padding);
+  }
+
+  return {
+    position: "fixed" as const,
+    left: `${finalX}px`,
+    top: `${finalY}px`,
+    transform,
+  };
+});
+
+const isLastStep = computed(() => props.currentStepIndex === props.totalSteps - 1);
+const hasAdvanceCondition = computed(() => !!props.step.advanceWhen);
+// Event-advance steps wait for the action; Next appears only once the action
+// is done (satisfied) or the step can't be performed yet (prereqMissing).
+const isWaiting = computed(
+  () => hasAdvanceCondition.value && !props.satisfied && !props.prereqMissing,
+);
+const showNextButton = computed(() => {
+  if (isWaiting.value) return false;
+  return props.step.showNextButton !== false || props.satisfied || props.prereqMissing;
+});
+const showPrevButton = computed(
+  () => props.step.showPrevButton !== false && props.currentStepIndex > 0,
+);
+const canSkip = computed(() => props.step.canSkip !== false);
+const nextLabel = computed(() => props.step.nextLabel ?? (isLastStep.value ? "Finish" : "Next"));
+
+function handleNext() {
+  if (isLastStep.value) {
+    emit("complete");
+  } else {
+    emit("next");
+  }
+}
+
+// Step content is rendered HTML, so copy buttons are wired by delegation:
+// any [data-copy] element copies its (URI-encoded) payload to the clipboard.
+async function handleContentClick(event: MouseEvent) {
+  const button = (event.target as HTMLElement).closest?.("[data-copy]") as HTMLElement | null;
+  if (!button) return;
+  const payload = decodeURIComponent(button.getAttribute("data-copy") ?? "");
+  if (!payload) return;
+  const copied = await copyToClipboard(payload);
+  if (copied) {
+    flashCopyFeedback(button, "check", "Copied!");
+  } else {
+    flashCopyFeedback(button, "error_outline", "Copy failed — select the text instead");
+  }
+}
+
+// navigator.clipboard needs a secure context (breaks on plain-http LAN
+// deployments); fall back to the legacy textarea + execCommand path.
+async function copyToClipboard(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    /* fall through to the legacy path */
+  }
+  try {
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.style.position = "fixed";
+    area.style.opacity = "0";
+    document.body.appendChild(area);
+    area.select();
+    const copied = document.execCommand("copy");
+    area.remove();
+    return copied;
+  } catch {
+    return false;
+  }
+}
+
+function flashCopyFeedback(button: HTMLElement, icon: string, label: string) {
+  if (button.dataset.flashing === "1") return;
+  button.dataset.flashing = "1";
+  const original = button.innerHTML;
+  button.innerHTML = `<span class="material-icons">${icon}</span> ${label}`;
+  setTimeout(() => {
+    button.innerHTML = original;
+    delete button.dataset.flashing;
+  }, 1500);
+}
+</script>
+
+<template>
+  <div
+    ref="tooltipRef"
+    class="tutorial-tooltip"
+    :class="{ 'tutorial-tooltip--compact': step.compact }"
+    :style="tooltipStyle"
+  >
+    <div class="tooltip-progress">
+      <div class="progress-bar">
+        <div class="progress-fill" :style="{ width: `${progress}%` }"></div>
+      </div>
+      <span class="progress-text">{{ currentStepIndex + 1 }} / {{ totalSteps }}</span>
+    </div>
+
+    <div class="tooltip-content">
+      <h3 class="tooltip-title">{{ step.title }}</h3>
+      <p class="tooltip-description" @click="handleContentClick" v-html="step.content"></p>
+
+      <p v-if="prereqMissing" class="tooltip-notice tooltip-notice--warn">
+        <span class="notice-icon material-icons">info</span>
+        This step needs something from an earlier step. Use Back to do it, or continue reading.
+      </p>
+      <p v-else-if="satisfied && hasAdvanceCondition" class="tooltip-notice tooltip-notice--done">
+        <span class="notice-icon material-icons">check_circle</span>
+        Done — you can continue.
+      </p>
+      <template v-else-if="isWaiting">
+        <p v-if="wrongActionHint" class="tooltip-notice tooltip-notice--warn">
+          <span class="notice-icon material-icons">info</span>
+          {{ wrongActionHint }}
+        </p>
+        <p v-if="step.hint" class="tooltip-action-hint">
+          <span class="action-icon material-icons">touch_app</span>
+          {{ step.hint }}
+        </p>
+      </template>
+    </div>
+
+    <div class="tooltip-navigation">
+      <button v-if="canSkip" class="nav-btn skip-btn" @click="emit('skip')">Exit tutorial</button>
+
+      <div class="nav-main">
+        <button v-if="showPrevButton" class="nav-btn prev-btn" @click="emit('prev')">
+          <span class="material-icons">arrow_back</span>
+          Back
+        </button>
+
+        <button v-if="isWaiting" class="nav-btn skip-step-btn" @click="handleNext">
+          Skip this step
+        </button>
+
+        <button v-if="showNextButton" class="nav-btn next-btn" @click="handleNext">
+          {{ nextLabel }}
+          <span v-if="!isLastStep" class="material-icons">arrow_forward</span>
+          <span v-else class="material-icons">check</span>
+        </button>
+      </div>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.tutorial-tooltip {
+  width: 380px;
+  max-width: calc(100vw - 40px);
+  /* Content scrolls internally on short viewports so the navigation row
+     (the only escape on blocking steps) is always reachable. */
+  max-height: calc(100vh - 48px);
+  display: flex;
+  flex-direction: column;
+  background: var(--color-background-primary, #ffffff);
+  border-radius: 12px;
+  box-shadow:
+    0 20px 40px rgba(0, 0, 0, 0.2),
+    0 0 0 1px rgba(0, 0, 0, 0.05);
+  z-index: 100000;
+  overflow: hidden;
+  animation: tooltip-appear 0.3s ease-out;
+  pointer-events: auto;
+}
+
+@keyframes tooltip-appear {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.tutorial-tooltip--compact {
+  width: 300px;
+}
+
+.tooltip-progress {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  background: var(--color-background-muted, #f5f5f5);
+  border-bottom: 1px solid var(--color-border-light, #e0e0e0);
+}
+
+.progress-bar {
+  flex: 1;
+  height: 4px;
+  background: var(--color-border-light, #e0e0e0);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background: var(--color-accent, #3b82f6);
+  border-radius: 2px;
+  transition: width 0.3s ease;
+}
+
+.progress-text {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--color-text-secondary, #666);
+  white-space: nowrap;
+}
+
+.tooltip-content {
+  padding: 20px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.tooltip-progress,
+.tooltip-navigation {
+  flex-shrink: 0;
+}
+
+.tooltip-title {
+  margin: 0 0 12px;
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--color-text-primary, #1a1a1a);
+  line-height: 1.3;
+}
+
+.tooltip-description {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--color-text-secondary, #666);
+}
+
+.tooltip-description :deep(strong) {
+  color: var(--color-text-primary, #1a1a1a);
+  font-weight: 600;
+}
+
+.tooltip-description :deep(code) {
+  background: var(--color-background-muted, #f5f5f5);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-family: var(--font-family-mono, monospace);
+  font-size: 13px;
+}
+
+.tooltip-description :deep(.tutorial-copy-btn) {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border: 1px solid var(--color-border-primary, #ddd);
+  border-radius: 6px;
+  background: var(--color-background-primary, #fff);
+  color: var(--color-text-primary, #1a1a1a);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.tooltip-description :deep(.tutorial-copy-btn:hover) {
+  background: var(--color-background-tertiary, #eee);
+}
+
+.tooltip-description :deep(.tutorial-copy-btn .material-icons) {
+  font-size: 14px;
+}
+
+.tooltip-action-hint {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 16px 0 0;
+  padding: 10px 12px;
+  background: var(--color-accent-subtle, rgba(59, 130, 246, 0.1));
+  border-radius: 8px;
+  font-size: 13px;
+  color: var(--color-accent, #3b82f6);
+  font-weight: 500;
+}
+
+.tooltip-action-hint .action-icon {
+  animation: hint-pulse 2s ease-in-out infinite;
+}
+
+@keyframes hint-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.4;
+  }
+}
+
+.tooltip-notice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 16px 0 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.tooltip-notice--warn {
+  background: rgba(245, 158, 11, 0.12);
+  color: var(--color-warning-dark);
+}
+
+.tooltip-notice--done {
+  background: rgba(34, 197, 94, 0.12);
+  color: var(--color-success-dark);
+}
+
+.notice-icon {
+  font-size: 18px;
+}
+
+.action-icon {
+  font-size: 18px;
+}
+
+.tooltip-navigation {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  background: var(--color-background-muted, #f5f5f5);
+  border-top: 1px solid var(--color-border-light, #e0e0e0);
+}
+
+.nav-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 16px;
+  border: none;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.skip-btn {
+  background: transparent;
+  color: var(--color-text-secondary, #666);
+}
+
+.skip-btn:hover {
+  background: var(--color-background-tertiary, #eee);
+  color: var(--color-text-primary, #1a1a1a);
+}
+
+.skip-step-btn {
+  background: transparent;
+  color: var(--color-text-secondary, #666);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.skip-step-btn:hover {
+  color: var(--color-text-primary, #1a1a1a);
+}
+
+.nav-main {
+  display: flex;
+  gap: 8px;
+}
+
+.prev-btn {
+  background: var(--color-background-primary, #fff);
+  color: var(--color-text-primary, #1a1a1a);
+  border: 1px solid var(--color-border-primary, #ddd);
+}
+
+.prev-btn:hover {
+  background: var(--color-background-tertiary, #eee);
+}
+
+.next-btn {
+  background: var(--color-accent, #3b82f6);
+  color: white;
+}
+
+.next-btn:hover {
+  background: var(--color-accent-hover, #2563eb);
+}
+
+.nav-btn .material-icons {
+  font-size: 18px;
+}
+</style>

@@ -1,0 +1,2220 @@
+from __future__ import annotations
+
+import base64
+import contextvars
+import datetime
+import io
+import json
+import math
+import os
+import re
+import sys
+import weakref
+from dataclasses import dataclass, field, replace
+from decimal import Decimal
+from pathlib import Path
+from typing import Any, Literal
+
+import httpx
+import polars as pl
+
+from kernel_runtime.artifact_store import ArtifactStore
+from kernel_runtime.schemas import ArtifactInfo, GlobalArtifactInfo
+
+
+def _rebase(path: str, host_prefix: str, container_prefix: str) -> str | None:
+    """Rebase *path* under *host_prefix* onto *container_prefix* as a POSIX path.
+
+    Normalizes backslashes so Windows host paths (the kernel always runs on
+    Linux, but the host may be Windows) produce pure-POSIX container paths.
+    Returns None when *path* is not under *host_prefix*.
+    """
+    p = path.replace("\\", "/").rstrip("/")
+    base = host_prefix.replace("\\", "/").rstrip("/")
+    if p == base:
+        return container_prefix
+    if p.startswith(base + "/"):
+        return container_prefix + "/" + p[len(base) + 1 :]
+    return None
+
+
+def _translate_host_path_to_container(host_path: str) -> str:
+    """Translate a host filesystem path to the kernel container's mount.
+
+    Two prefixes are recognized (in priority order):
+      * ``FLOWFILE_HOST_CATALOG_TABLES_DIR`` → ``/catalog_tables`` (catalog Delta dirs)
+      * ``FLOWFILE_HOST_SHARED_DIR`` → ``/shared`` (parquet exchange, artifacts)
+
+    When running locally the kernel container bind-mounts both of these host
+    directories. Core API returns paths using the host's perspective, so we
+    swap the longest matching prefix. In Docker-in-Docker mode neither env
+    var is set (the same volume is mounted at the same path everywhere) so
+    the input path is returned unchanged.
+    """
+    host_catalog_dir = os.environ.get("FLOWFILE_HOST_CATALOG_TABLES_DIR")
+    if host_catalog_dir:
+        rebased = _rebase(host_path, host_catalog_dir, "/catalog_tables")
+        if rebased is not None:
+            return rebased
+
+    host_shared_dir = os.environ.get("FLOWFILE_HOST_SHARED_DIR")
+    if host_shared_dir:
+        rebased = _rebase(host_path, host_shared_dir, "/shared")
+        if rebased is not None:
+            return rebased
+
+    return host_path
+
+
+_context: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar("flowfile_context")
+
+# Reusable HTTP client for log callbacks (created per execution context)
+_log_client: contextvars.ContextVar[httpx.Client | None] = contextvars.ContextVar("flowfile_log_client", default=None)
+
+# Display outputs collector (reset at start of each execution)
+_displays: contextvars.ContextVar[list[dict[str, str]]] = contextvars.ContextVar("flowfile_displays", default=None)
+
+# Artifact previews collected during execution (name -> {mime_type, data, title}).
+# Lives only in-process; only tiny flags ride inside ExecuteResponse.
+_artifact_previews: contextvars.ContextVar[dict[str, dict[str, str]] | None] = contextvars.ContextVar(
+    "flowfile_artifact_previews", default=None
+)
+
+# Names deleted via delete_artifact() during this execution. Per-execution so
+# deletion attribution is node-scoped rather than a racy store-wide diff.
+_deleted_artifacts: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
+    "flowfile_deleted_artifacts", default=None
+)
+
+# Matplotlib figures already rendered this execution (displayed, auto-displayed,
+# or handed to publish_artifact); the end-of-cell sweep skips these so a figure
+# never shows up twice. WeakSet so a closed-and-collected figure can't shadow a
+# new one allocated at the same address.
+_rendered_figures: contextvars.ContextVar[weakref.WeakSet | None] = contextvars.ContextVar(
+    "flowfile_rendered_figures", default=None
+)
+
+# Dry-run global artifacts, kept in-process so a Test press writes no catalog row.
+_dry_run_globals: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "flowfile_dry_run_globals", default=None
+)
+
+# Monotonic, so a publish after a delete cannot reuse a live artifact's id.
+_dry_run_next_id: contextvars.ContextVar[list[int]] = contextvars.ContextVar("flowfile_dry_run_next_id", default=None)
+
+
+def _set_context(
+    node_id: int,
+    input_paths: dict[str, list[str]],
+    output_dir: str,
+    artifact_store: ArtifactStore,
+    flow_id: int = 0,
+    source_registration_id: int | None = None,
+    log_callback_url: str = "",
+    internal_token: str | None = None,
+    interactive: bool = False,
+    available_artifacts: dict[str, int] | None = None,
+    dry_run: bool = False,
+) -> None:
+    _context.set(
+        {
+            "node_id": node_id,
+            "input_paths": input_paths,
+            "output_dir": output_dir,
+            "artifact_store": artifact_store,
+            "flow_id": flow_id,
+            "source_registration_id": source_registration_id,
+            "log_callback_url": log_callback_url,
+            "internal_token": internal_token,
+            "interactive": interactive,
+            "available_artifacts": available_artifacts,
+            "dry_run": dry_run,
+            # Warn-once tracking per /execute; _set_context runs once per request.
+            "_lineage_warned": set(),
+        }
+    )
+    _dry_run_globals.set({} if dry_run else None)
+    _dry_run_next_id.set([1])
+    if log_callback_url:
+        # Core refuses unsigned /raw_logs posts; sign them like every other core callback.
+        _log_client.set(httpx.Client(timeout=httpx.Timeout(5.0), headers=_get_internal_auth_headers()))
+    else:
+        _log_client.set(None)
+
+
+def _clear_context() -> None:
+    client = _log_client.get(None)
+    if client is not None:
+        try:
+            client.close()
+        except Exception:
+            pass
+        _log_client.set(None)
+    _context.set({})
+    _displays.set([])
+    _artifact_previews.set({})
+    _deleted_artifacts.set([])
+    _rendered_figures.set(None)
+    _dry_run_globals.set(None)
+    _dry_run_next_id.set(None)
+
+
+def _get_context_value(key: str) -> Any:
+    ctx = _context.get({})
+    if key not in ctx:
+        raise RuntimeError(
+            f"flowfile context not initialized (missing '{key}'). This API is only available during /execute."
+        )
+    return ctx[key]
+
+
+def _check_input_available(input_paths: dict[str, list[str]], name: str) -> list[str]:
+    if name not in input_paths or not input_paths[name]:
+        available = [k for k, v in input_paths.items() if v]
+        if not available:
+            raise RuntimeError(
+                "Upstream nodes did not run yet. Make sure you run the flow before calling read_input()."
+            )
+        raise KeyError(f"Input '{name}' not found. Available inputs: {available}")
+    return input_paths[name]
+
+
+def is_dry_run() -> bool:
+    """True when this execution is a Flowfile dry run against example data.
+
+    Dry runs (the Node Designer Test panel, the community-node CI harness) run
+    real code but sandbox its side effects: ``publish_global`` writes to an
+    in-process store instead of the catalog, and ``example_artifacts()`` is
+    seeded before ``process()``. Branch on this to skip work that only makes
+    sense against real data — an expensive refit, a downstream notification.
+
+    Always ``False`` outside a dry run, including in notebook/interactive cells
+    and when no execution context is set.
+    """
+    return bool(_context.get({}).get("dry_run", False))
+
+
+def read_input(name: str = "main") -> pl.LazyFrame:
+    """Read all input files for *name* and return them as a single LazyFrame.
+
+    When multiple paths are registered under the same name (e.g. a union
+    of several upstream nodes), all files are scanned and concatenated
+    automatically by Polars.
+    """
+    input_paths: dict[str, list[str]] = _get_context_value("input_paths")
+    paths = _check_input_available(input_paths, name)
+    if len(paths) == 1:
+        return pl.scan_parquet(paths[0])
+    return pl.scan_parquet(paths)
+
+
+def read_first(name: str = "main") -> pl.LazyFrame:
+    """Read only the first input file for *name*.
+
+    This is a convenience shortcut equivalent to scanning
+    ``input_paths[name][0]``.
+    """
+    input_paths: dict[str, list[str]] = _get_context_value("input_paths")
+    paths = _check_input_available(input_paths, name)
+    return pl.scan_parquet(paths[0])
+
+
+def read_inputs() -> dict[str, list[pl.LazyFrame]]:
+    """Read all named inputs, returning a dict of LazyFrame lists.
+
+    Each entry contains a list of LazyFrames, one for each connected input.
+    This allows distinguishing between multiple upstream nodes.
+    """
+    input_paths: dict[str, list[str]] = _get_context_value("input_paths")
+    result: dict[str, list[pl.LazyFrame]] = {}
+    for name, paths in input_paths.items():
+        result[name] = [pl.scan_parquet(path) for path in paths]
+    return result
+
+
+def publish_output(df: pl.LazyFrame | pl.DataFrame, name: str = "main") -> None:
+    output_dir = _get_context_value("output_dir")
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = Path(output_dir) / f"{name}.parquet"
+    if isinstance(df, pl.LazyFrame):
+        df.sink_parquet(str(output_path))
+    else:
+        df.write_parquet(str(output_path))
+    # Ensure the file is fully flushed to disk before the host reads it
+    # This prevents "File must end with PAR1" errors from race conditions.
+    # "rb+" — os.fsync needs a writable fd on Windows (EBADF on read-only handles)
+    with open(output_path, "rb+") as f:
+        os.fsync(f.fileno())
+
+
+def publish_artifact(name: str, obj: Any, preview: bool = False) -> None:
+    """Publish an in-memory artifact for downstream nodes in the same flow.
+
+    When *preview* is true and *obj* is a matplotlib/plotly/PIL figure or an
+    HTML string, a viewable preview is rendered and kept only in the kernel
+    process; only a tiny flag rides in the execute response and Core fetches
+    the blob on demand.
+    """
+    store: ArtifactStore = _get_context_value("artifact_store")
+    node_id: int = _get_context_value("node_id")
+    flow_id: int = _get_context_value("flow_id")
+    store.publish(name, obj, node_id, flow_id=flow_id)
+    # A node reading back what it just published is always in-lineage; add it to
+    # the allowlist so read_artifact doesn't warn about the node's own artifact.
+    allow: dict[str, int] | None = _get_context_value("available_artifacts")
+    if allow is not None:
+        allow[name] = node_id
+    # Publishing consumes the figure: the end-of-cell sweep must not also
+    # render it inline (the preview stays reachable from the Artifacts tab).
+    if _is_matplotlib_figure(obj):
+        _mark_figure_rendered(obj)
+    if not preview:
+        return
+    try:
+        payload = _render_display_payload(obj)
+        if payload is None and _is_html_string(obj):
+            payload = {"mime_type": "text/html", "data": obj}
+        if payload is not None and payload["mime_type"] in ("image/png", "text/html"):
+            previews = _artifact_previews.get({})
+            previews[name] = {**payload, "title": name}
+            _artifact_previews.set(previews)
+        else:
+            log(f"publish_artifact: no viewable preview for '{name}' (unsupported type)", "WARNING")
+    except Exception as exc:  # noqa: BLE001 - preview rendering is best-effort
+        log(f"publish_artifact: failed to render preview for '{name}': {exc}", "WARNING")
+
+
+def read_artifact(name: str) -> Any:
+    store: ArtifactStore = _get_context_value("artifact_store")
+    flow_id: int = _get_context_value("flow_id")
+    obj = store.get(name, flow_id=flow_id)  # missing artifact raises KeyError, as before
+
+    allow: dict[str, int] | None = _get_context_value("available_artifacts")
+    if allow is not None and name not in allow:
+        warned: set[str] = _get_context_value("_lineage_warned")
+        if name not in warned:
+            warned.add(name)
+            node_id: int = _get_context_value("node_id")
+            publisher_id = store.list_all(flow_id=flow_id).get(name, {}).get("node_id", -1)
+            publisher = f"node {publisher_id}" if publisher_id is not None and publisher_id >= 0 else "another node"
+            log(
+                f"Artifact '{name}' was published by {publisher}, which is not an upstream "
+                f"input of node {node_id}. Reading artifacts from outside a node's input "
+                f"lineage is deprecated and will raise an error in a future Flowfile version. "
+                f"Connect the publishing node upstream, or publish the artifact globally and "
+                f"use get_global().",
+                "WARNING",
+            )
+    return obj
+
+
+def delete_artifact(name: str) -> None:
+    store: ArtifactStore = _get_context_value("artifact_store")
+    flow_id: int = _get_context_value("flow_id")
+    store.delete(name, flow_id=flow_id)
+    deleted = _deleted_artifacts.get([]) or []
+    deleted.append(name)
+    _deleted_artifacts.set(deleted)
+
+
+def list_artifacts() -> list[ArtifactInfo]:
+    store: ArtifactStore = _get_context_value("artifact_store")
+    flow_id: int = _get_context_value("flow_id")
+    raw = store.list_all(flow_id=flow_id)
+    return [ArtifactInfo.model_validate(v) for v in raw.values()]
+
+
+# ===== Global Artifacts APIs =====
+
+_CORE_URL = os.environ.get("FLOWFILE_CORE_URL", "http://host.docker.internal:63578")
+
+_SHARED_PATH = os.environ.get("FLOWFILE_SHARED_PATH", "/shared")
+
+
+def _get_internal_auth_headers() -> dict[str, str]:
+    """Get authentication headers for Core API calls.
+
+    Prefers the token passed via ExecuteRequest context (always fresh),
+    falls back to FLOWFILE_INTERNAL_TOKEN env var for backwards compatibility.
+    X-Kernel-Id is included so Core can attribute ownership to the kernel's
+    actual owner rather than the synthetic internal-service user.
+    """
+    headers: dict[str, str] = {}
+    # Prefer token from execution context (set per-request by Core)
+    try:
+        ctx = _context.get({})
+        token = ctx.get("internal_token")
+        if token:
+            headers["X-Internal-Token"] = token
+    except LookupError:
+        pass
+    # Fall back to env var (set at container creation time)
+    if "X-Internal-Token" not in headers:
+        token = os.environ.get("FLOWFILE_INTERNAL_TOKEN")
+        if token:
+            headers["X-Internal-Token"] = token
+    if not headers:
+        return headers
+    kernel_id = os.environ.get("FLOWFILE_KERNEL_ID")
+    if kernel_id:
+        headers["X-Kernel-Id"] = kernel_id
+    return headers
+
+
+def _dry_run_publish_global(
+    sandbox: dict[str, Any],
+    name: str,
+    obj: Any,
+    tags: list[str] | None,
+    namespace_id: int | None,
+    serialization_format: str,
+    python_type: str,
+) -> int:
+    """Store *obj* in the per-execution dry-run sandbox and return a positive id.
+
+    Returning a real-looking id matters: nodes commonly treat ``-1``/``None`` as
+    "the store rejected this" and raise, so a dry run that returned a sentinel
+    would fail every publishing node it was meant to test.
+
+    ``description`` is not carried: ``GlobalArtifactInfo`` has no field for it.
+    """
+    existing = sandbox.get(name)
+    version = existing["info"].version + 1 if existing else 1
+    counter = _dry_run_next_id.get(None) or [1]
+    artifact_id = counter[0]
+    counter[0] += 1
+    _dry_run_next_id.set(counter)
+    try:
+        source_registration_id = _get_context_value("source_registration_id") or -1
+    except RuntimeError:
+        source_registration_id = -1
+    sandbox[name] = {
+        "obj": obj,
+        "info": GlobalArtifactInfo(
+            id=artifact_id,
+            name=name,
+            namespace_id=namespace_id,
+            version=version,
+            status="ready",
+            source_registration_id=source_registration_id,
+            python_type=python_type,
+            serialization_format=serialization_format,
+            size_bytes=None,
+            created_at=datetime.datetime.now(datetime.timezone.utc),
+            tags=list(tags or []),
+            owner_id=-1,
+        ),
+    }
+    log(f"Dry run: '{name}' was kept in memory instead of being written to the artifact store.", "INFO")
+    return artifact_id
+
+
+def publish_global(
+    name: str,
+    obj: Any,
+    description: str | None = None,
+    tags: list[str] | None = None,
+    namespace_id: int | None = None,
+    fmt: str | None = None,
+) -> int:
+    """Persist a Python object to the global artifact store.
+
+    Global artifacts are persisted beyond the current flow execution and can be
+    retrieved later in the same flow, a different flow, or a different session.
+
+    Args:
+        name: Artifact name (required). Used to retrieve the artifact later.
+        obj: Python object to persist (required). Supported types include:
+             - Polars/Pandas DataFrames (serialized as parquet)
+             - scikit-learn models (serialized with joblib)
+             - Any picklable Python object (serialized with pickle)
+        description: Human-readable description of the artifact.
+        tags: List of tags for categorization and search.
+        namespace_id: Namespace (schema) ID. Defaults to user's default namespace.
+        fmt: Serialization format override ("parquet", "joblib", or "pickle").
+             Auto-detected from object type if not specified.
+
+    Returns:
+        The artifact ID (database ID).
+
+    Raises:
+        UnpickleableObjectError: If the object cannot be serialized. Common causes:
+            - Lambda functions or nested functions
+            - Classes defined inside functions (local classes)
+            - Objects with open file handles or network connections
+        httpx.HTTPStatusError: If API calls fail.
+
+    Example:
+        >>> from sklearn.ensemble import RandomForestClassifier
+        >>> model = RandomForestClassifier().fit(X, y)
+        >>> artifact_id = flowfile_ctx.publish_global(
+        ...     "my_model",
+        ...     model,
+        ...     description="Random Forest trained on Q4 data",
+        ...     tags=["ml", "classification"],
+        ... )
+    """
+    from kernel_runtime.serialization import (
+        check_pickleable,
+        detect_format,
+        serialize_to_bytes,
+        serialize_to_file,
+    )
+
+    serialization_format = fmt or detect_format(obj)
+    python_type = f"{type(obj).__module__}.{type(obj).__name__}"
+    python_module = type(obj).__module__
+
+    # Validate that the object can be serialized before making API calls
+    # This provides a clear error message upfront rather than failing during serialization
+    if serialization_format in ("pickle", "joblib"):
+        check_pickleable(obj)
+
+    # Sandboxed after the check above, so an unpicklable model still fails the Test panel.
+    sandbox = _dry_run_globals.get(None)
+    if sandbox is not None:
+        return _dry_run_publish_global(sandbox, name, obj, tags, namespace_id, serialization_format, python_type)
+
+    try:
+        flow_id = _get_context_value("flow_id")
+        node_id = _get_context_value("node_id")
+        source_registration_id = _get_context_value("source_registration_id")
+    except RuntimeError:
+        # Context not available - allow publish without lineage
+        flow_id = None
+        node_id = None
+        source_registration_id = None
+
+    if source_registration_id is None:
+        # Core's KernelManager.execute now injects a per-kernel scratch
+        # FlowRegistration id whenever the caller didn't supply one, so this
+        # branch should be unreachable in normal operation. We keep it as a
+        # safety net for older Core versions or kernels that started before
+        # the scratch-flow feature shipped.
+        print(  # noqa: T201
+            "[flowfile_ctx] publish_global ran without a source_registration_id. "
+            "This usually means the kernel is talking to an older Core that does "
+            "not auto-provision a scratch FlowRegistration. The artifact will not "
+            "be persisted; returning -1."
+        )
+        return -1
+
+    kernel_id = os.environ.get("FLOWFILE_KERNEL_ID")
+
+    # 1. Request upload target from Core
+    auth_headers = _get_internal_auth_headers()
+    with httpx.Client(timeout=30.0, headers=auth_headers) as client:
+        resp = client.post(
+            f"{_CORE_URL}/artifacts/prepare-upload",
+            json={
+                "name": name,
+                "source_registration_id": source_registration_id,
+                "serialization_format": serialization_format,
+                "description": description,
+                "tags": tags or [],
+                "namespace_id": namespace_id,
+                "source_flow_id": flow_id,
+                "source_node_id": node_id,
+                "source_kernel_id": kernel_id,
+                "python_type": python_type,
+                "python_module": python_module,
+            },
+        )
+        resp.raise_for_status()
+        target = resp.json()
+
+        # 2. Serialize and write directly to storage
+        if target["method"] == "file":
+            # Shared filesystem - translate host path for local Docker mode
+            staging_path = _translate_host_path_to_container(target["path"])
+            Path(staging_path).parent.mkdir(parents=True, exist_ok=True)
+            sha256 = serialize_to_file(obj, staging_path, serialization_format)
+            size_bytes = os.path.getsize(staging_path)
+        else:
+            # S3 presigned URL - upload directly
+            blob, sha256 = serialize_to_bytes(obj, serialization_format)
+            size_bytes = len(blob)
+            upload_resp = client.put(
+                target["path"],
+                content=blob,
+                headers={"Content-Type": "application/octet-stream"},
+                timeout=600.0,  # 10 min for large uploads
+            )
+            upload_resp.raise_for_status()
+
+        # 3. Finalize with Core
+        finalize_body = {
+            "artifact_id": target["artifact_id"],
+            "storage_key": target["storage_key"],
+            "sha256": sha256,
+            "size_bytes": size_bytes,
+        }
+        resp = client.post(
+            f"{_CORE_URL}/artifacts/finalize",
+            json=finalize_body,
+        )
+        if resp.status_code >= 400:
+            detail = resp.text
+            raise RuntimeError(
+                f"Artifact finalize failed ({resp.status_code}): {detail}. " f"Request body: {finalize_body}"
+            )
+
+    return target["artifact_id"]
+
+
+def get_global(
+    name: str,
+    version: int | None = None,
+    namespace_id: int | None = None,
+    namespace: str | None = None,
+) -> Any:
+    """Retrieve a Python object from the global artifact store.
+
+    Args:
+        name: Artifact name to retrieve.
+        version: Specific version to retrieve. Returns latest version if not specified.
+        namespace_id: Namespace (schema) filter by id.
+        namespace: Namespace (schema) filter by name; resolved to an id server-side.
+            Raises if the name is unknown or matches more than one namespace.
+
+    Returns:
+        The deserialized Python object.
+
+    Raises:
+        KeyError: If artifact is not found or the lookup is ambiguous.
+        httpx.HTTPStatusError: If API calls fail.
+
+    Example:
+        >>> model = flowfile_ctx.get_global("my_model")
+        >>> model_v1 = flowfile_ctx.get_global("my_model", version=1)
+        >>> model = flowfile_ctx.get_global("my_model", namespace="my_schema")
+    """
+    from kernel_runtime.serialization import deserialize_from_bytes, deserialize_from_file
+
+    # Sandbox first, then the real catalog, so a consumer node can be tested against
+    # a genuinely stored model.
+    sandbox = _dry_run_globals.get(None)
+    if sandbox is not None and name in sandbox:
+        return sandbox[name]["obj"]
+
+    # 1. Get metadata and download source from Core
+    params = {}
+    if version is not None:
+        params["version"] = version
+    if namespace_id is not None:
+        params["namespace_id"] = namespace_id
+    if namespace is not None:
+        params["namespace"] = namespace
+
+    auth_headers = _get_internal_auth_headers()
+    with httpx.Client(timeout=30.0, headers=auth_headers) as client:
+        resp = client.get(
+            f"{_CORE_URL}/artifacts/by-name/{name}",
+            params=params,
+        )
+        if resp.status_code == 404:
+            raise KeyError(f"Artifact '{name}' not found")
+        if resp.status_code == 409:
+            try:
+                detail = resp.json().get("detail", "")
+            except Exception:
+                detail = ""
+            raise KeyError(detail or f"Artifact '{name}' is ambiguous; specify a namespace_id")
+        resp.raise_for_status()
+
+        meta = resp.json()
+        download = meta["download_source"]
+        format = meta["serialization_format"]
+
+        # 2. Read directly from storage
+        if download["method"] == "file":
+            # Shared filesystem - translate host path to container path if in Docker
+            file_path = _translate_host_path_to_container(download["path"])
+            if not os.path.exists(file_path):
+                raise FileNotFoundError(
+                    f"Artifact '{name}' v{meta['version']} data not found at {file_path}. "
+                    "If running in Docker, the shared artifacts volume may not be mounted "
+                    "into the kernel container."
+                )
+            obj = deserialize_from_file(file_path, format)
+        else:
+            # S3 presigned URL
+            download_resp = client.get(download["path"], timeout=600.0)
+            download_resp.raise_for_status()
+            obj = deserialize_from_bytes(download_resp.content, format)
+
+    return obj
+
+
+def list_global_artifacts(
+    namespace_id: int | None = None,
+    tags: list[str] | None = None,
+) -> list[GlobalArtifactInfo]:
+    """List available global artifacts.
+
+    Args:
+        namespace_id: Filter by namespace.
+        tags: Filter by tags (AND logic - all tags must match).
+
+    Returns:
+        List of :class:`GlobalArtifactInfo` objects.
+
+    Example:
+        >>> artifacts = flowfile_ctx.list_global_artifacts(tags=["ml"])
+        >>> for a in artifacts:
+        ...     print(f"{a.name} v{a.version} - {a.python_type}")
+    """
+    params = {}
+    if namespace_id is not None:
+        params["namespace_id"] = namespace_id
+    if tags:
+        params["tags"] = tags
+
+    sandbox = _dry_run_globals.get(None)
+    sandboxed = [entry["info"] for entry in (sandbox or {}).values()]
+    if namespace_id is not None:
+        sandboxed = [info for info in sandboxed if info.namespace_id == namespace_id]
+    if tags:
+        sandboxed = [info for info in sandboxed if set(tags).issubset(set(info.tags))]
+
+    auth_headers = _get_internal_auth_headers()
+    with httpx.Client(timeout=30.0, headers=auth_headers) as client:
+        resp = client.get(f"{_CORE_URL}/artifacts/", params=params)
+        resp.raise_for_status()
+        published = [GlobalArtifactInfo.model_validate(item) for item in resp.json()]
+    sandboxed_names = {info.name for info in sandboxed}
+    return sandboxed + [info for info in published if info.name not in sandboxed_names]
+
+
+def delete_global_artifact(
+    name: str,
+    version: int | None = None,
+    namespace_id: int | None = None,
+    namespace: str | None = None,
+) -> None:
+    """Delete a global artifact.
+
+    Args:
+        name: Artifact name to delete.
+        version: Specific version to delete. Deletes all versions if not specified.
+        namespace_id: Namespace (schema) filter by id.
+        namespace: Namespace (schema) filter by name; resolved to an id server-side.
+            Raises if the name is unknown or matches more than one namespace.
+
+    In a dry run this only deletes from the run's own sandbox; a name the run did
+    not publish raises ``KeyError`` rather than touching the stored artifact.
+
+    Raises:
+        KeyError: If artifact is not found.
+        httpx.HTTPStatusError: If API calls fail.
+
+    Example:
+        >>> flowfile_ctx.delete_global_artifact("my_model")  # delete all versions
+        >>> flowfile_ctx.delete_global_artifact("my_model", version=1)  # delete v1 only
+        >>> flowfile_ctx.delete_global_artifact("my_model", namespace="my_schema")
+    """
+    # A dry run deletes only from its own sandbox. Unlike get_global, this never falls
+    # through to the catalog: a read of real data is harmless, a delete is not.
+    sandbox = _dry_run_globals.get(None)
+    if sandbox is not None:
+        if name not in sandbox:
+            raise KeyError(
+                f"Artifact '{name}' was not published in this dry run. "
+                "A dry run cannot delete artifacts from the artifact store."
+            )
+        del sandbox[name]
+        return
+
+    auth_headers = _get_internal_auth_headers()
+    with httpx.Client(timeout=30.0, headers=auth_headers) as client:
+        if version is not None:
+            # Delete specific version - need to get artifact ID first
+            params = {"version": version}
+            if namespace_id is not None:
+                params["namespace_id"] = namespace_id
+            if namespace is not None:
+                params["namespace"] = namespace
+
+            resp = client.get(
+                f"{_CORE_URL}/artifacts/by-name/{name}",
+                params=params,
+            )
+            if resp.status_code == 404:
+                raise KeyError(f"Artifact '{name}' version {version} not found")
+            resp.raise_for_status()
+
+            artifact_id = resp.json()["id"]
+            resp = client.delete(f"{_CORE_URL}/artifacts/{artifact_id}")
+            resp.raise_for_status()
+        else:
+            # Delete all versions by name
+            params = {}
+            if namespace_id is not None:
+                params["namespace_id"] = namespace_id
+            if namespace is not None:
+                params["namespace"] = namespace
+
+            resp = client.delete(
+                f"{_CORE_URL}/artifacts/by-name/{name}",
+                params=params,
+            )
+            if resp.status_code == 404:
+                raise KeyError(f"Artifact '{name}' not found")
+            resp.raise_for_status()
+
+
+# ===== File Utilities =====
+
+
+def get_shared_location(filename: str) -> str:
+    """Return the absolute path for a file in the shared directory.
+
+    The shared directory is accessible from all FlowFile services (core,
+    worker, kernel) and persists across kernel executions.  Use this to
+    write files that should be readable by other services or that should
+    survive container restarts.
+
+    Parent directories are created automatically.
+
+    Args:
+        filename: Relative filename or path, e.g. ``"test_file.csv"`` or
+                  ``"other_dir/test_file.csv"``.
+
+    Returns:
+        Absolute path as a string, ready to pass to file-writing functions.
+
+    Examples::
+
+        df.write_csv(flowfile_ctx.get_shared_location("test_file.csv"))
+        df.write_csv(flowfile_ctx.get_shared_location("reports/monthly.csv"))
+    """
+    base = os.environ.get("FLOWFILE_KERNEL_SHARED_DIR", "/shared")
+    full_path = os.path.join(base, "user_files", filename)
+    parent = os.path.dirname(full_path)
+    os.makedirs(parent, exist_ok=True)
+    return full_path
+
+
+# ===== Logging APIs =====
+
+
+def log(message: str, level: Literal["INFO", "WARNING", "ERROR"] = "INFO") -> None:
+    """Send a log message to the FlowFile log viewer.
+
+    The message appears in the frontend log stream in real time.
+
+    Args:
+        message: The log message text.
+        level: Log severity — ``"INFO"`` (default), ``"WARNING"``, or ``"ERROR"``.
+    """
+    flow_id: int = _get_context_value("flow_id")
+    node_id: int = _get_context_value("node_id")
+    callback_url: str = _get_context_value("log_callback_url")
+    if not callback_url:
+        # No callback configured — fall back to printing so the message
+        # still shows up in captured stdout.
+        print(f"[{level}] {message}")  # noqa: T201
+        return
+
+    client = _log_client.get(None)
+    if client is None:
+        print(f"[{level}] {message}")  # noqa: T201
+        return
+
+    payload = {
+        "flowfile_flow_id": flow_id,
+        "node_id": node_id,
+        "log_message": message,
+        "log_type": level,
+    }
+    try:
+        resp = client.post(callback_url, json=payload)
+        if resp.status_code >= 400:
+            print(f"[{level}] {message}")  # noqa: T201
+    except Exception:
+        # Delivery is best-effort; surface via captured stdout instead so
+        # the message is never silently lost.
+        print(f"[{level}] {message}")  # noqa: T201
+
+
+def log_info(message: str) -> None:
+    """Convenience wrapper: ``flowfile_ctx.log(message, level="INFO")``."""
+    log(message, level="INFO")
+
+
+def log_warning(message: str) -> None:
+    """Convenience wrapper: ``flowfile_ctx.log(message, level="WARNING")``."""
+    log(message, level="WARNING")
+
+
+def log_error(message: str) -> None:
+    """Convenience wrapper: ``flowfile_ctx.log(message, level="ERROR")``."""
+    log(message, level="ERROR")
+
+
+# ===== Display APIs =====
+
+
+def _class_from_loaded_module(module_name: str, class_name: str) -> type | None:
+    """Look up ``module_name.class_name`` via ``sys.modules``, never importing.
+
+    An object can only be an instance of a class whose defining module has
+    already been imported by someone, so checking ``sys.modules`` is both
+    sufficient and side-effect free: a broken half-installed package (which can
+    raise non-ImportError exceptions at import time) can never fail a cell that
+    merely displays an unrelated object.
+    """
+    mod = sys.modules.get(module_name)
+    cls = getattr(mod, class_name, None) if mod is not None else None
+    return cls if isinstance(cls, type) else None
+
+
+def _is_matplotlib_figure(obj: Any) -> bool:
+    """Check if obj is a matplotlib Figure (without importing matplotlib)."""
+    cls = _class_from_loaded_module("matplotlib.figure", "Figure")
+    return cls is not None and isinstance(obj, cls)
+
+
+def _is_plotly_figure(obj: Any) -> bool:
+    """Check if obj is a plotly Figure (without importing plotly)."""
+    # Figure is defined in plotly.graph_objs; plotly.graph_objects re-exports it.
+    cls = _class_from_loaded_module("plotly.graph_objs", "Figure") or _class_from_loaded_module(
+        "plotly.graph_objects", "Figure"
+    )
+    return cls is not None and isinstance(obj, cls)
+
+
+def _is_pil_image(obj: Any) -> bool:
+    """Check if obj is a PIL Image (without importing PIL)."""
+    cls = _class_from_loaded_module("PIL.Image", "Image")
+    return cls is not None and isinstance(obj, cls)
+
+
+# Regex to detect HTML tags: <tag>, </tag>, <tag attr="val">, <br/>, etc.
+_HTML_TAG_RE = re.compile(r"<[a-zA-Z/][^>]*>")
+
+
+def _is_html_string(obj: Any) -> bool:
+    """Check if obj is a string that looks like HTML.
+
+    Uses a regex to detect actual HTML tags like <b>, </div>, <br/>, etc.
+    This avoids false positives from strings like "x < 10 and y > 5".
+    """
+    if not isinstance(obj, str):
+        return False
+    return bool(_HTML_TAG_RE.search(obj))
+
+
+# DataFrame display payload: dtype->field mapping mirrors flowfile_wasm nodes_explore
+
+_GW_TABLE_MAX_ROWS = 10_000
+_GW_TABLE_MIME = "application/vnd.flowfile.table+json"
+_GW_EXPLORE_MIME = "application/vnd.flowfile.gwalker+json"
+
+_GW_QUANTITATIVE = {
+    "Int8",
+    "Int16",
+    "Int32",
+    "Int64",
+    "Int128",
+    "UInt8",
+    "UInt16",
+    "UInt32",
+    "UInt64",
+    "Float32",
+    "Float64",
+    "Decimal",
+}
+_GW_TEMPORAL = {"Date", "Datetime", "Time", "Duration"}
+
+
+def _gw_semantic_type(pl_dtype: Any) -> str:
+    """Map a Polars DataType to a Graphic Walker semanticType."""
+    try:
+        base = pl_dtype.base_type().__name__
+    except Exception:
+        base = str(pl_dtype)
+    if base in _GW_QUANTITATIVE:
+        return "quantitative"
+    if base in _GW_TEMPORAL:
+        return "temporal"
+    return "nominal"
+
+
+def _gw_analytic_type(semantic_type: str) -> str:
+    return "measure" if semantic_type == "quantitative" else "dimension"
+
+
+def _gw_build_fields(schema: Any) -> list[dict[str, Any]]:
+    """Build a Graphic Walker IMutField list from a Polars schema."""
+    fields: list[dict[str, Any]] = []
+    for name, dtype in schema.items():
+        sem = _gw_semantic_type(dtype)
+        fields.append(
+            {
+                "fid": name,
+                "key": name,
+                "name": name,
+                "basename": name,
+                "semanticType": sem,
+                "analyticType": _gw_analytic_type(sem),
+                "disable": False,
+            }
+        )
+    return fields
+
+
+def _is_polars_frame(obj: Any) -> bool:
+    """Check if obj is a Polars DataFrame or LazyFrame."""
+    return isinstance(obj, pl.DataFrame | pl.LazyFrame)
+
+
+def _json_default(value: Any) -> Any:
+    """json.dumps fallback for non-serializable Polars cells (temporal/decimal/bytes)."""
+    if isinstance(value, datetime.datetime | datetime.date | datetime.time):
+        return value.isoformat()
+    if isinstance(value, datetime.timedelta):
+        return value.total_seconds()
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, bytes | bytearray):
+        try:
+            return bytes(value).decode("utf-8", errors="replace")
+        except Exception:
+            return str(value)
+    return str(value)
+
+
+def _sanitize_non_finite(value: Any) -> Any:
+    """Replace NaN/Inf floats with None (recurses) so the JSON parses in JS."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, list):
+        return [_sanitize_non_finite(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _sanitize_non_finite(v) for k, v in value.items()}
+    return value
+
+
+def _build_table_payload(obj: Any, max_rows: int) -> dict[str, Any]:
+    """Materialize up to ``max_rows`` rows of a Polars frame as a GW payload."""
+    if isinstance(obj, pl.LazyFrame):
+        try:
+            total_rows = obj.select(pl.len()).collect().item()
+        except Exception:
+            total_rows = None
+        df = obj.head(max_rows).collect()
+    else:
+        total_rows = obj.height
+        df = obj.head(max_rows)
+
+    loaded_rows = df.height
+    if total_rows is None:
+        total_rows = loaded_rows
+    return {
+        "columns": df.columns,
+        "fields": _gw_build_fields(df.schema),
+        "data": df.to_dicts(),
+        "total_rows": total_rows,
+        "loaded_rows": loaded_rows,
+        "truncated": bool(total_rows > loaded_rows),
+        "max_rows": max_rows,
+    }
+
+
+def _dump_table_payload(payload: dict[str, Any]) -> str:
+    """Serialize a GW payload to a JSON string the frontend can ``JSON.parse``."""
+    try:
+        return json.dumps(payload, default=_json_default, allow_nan=False)
+    except ValueError:
+        payload["data"] = [_sanitize_non_finite(row) for row in payload["data"]]
+        return json.dumps(payload, default=_json_default, allow_nan=False)
+
+
+def _reset_displays() -> None:
+    """Clear the display outputs list. Called at start of each execution."""
+    _displays.set([])
+
+
+def _get_displays() -> list[dict[str, str]]:
+    """Return the current list of display outputs."""
+    return _displays.get([])
+
+
+def _reset_artifact_previews() -> None:
+    """Clear collected artifact previews. Called at start of each execution."""
+    _artifact_previews.set({})
+
+
+def _get_artifact_previews() -> dict[str, dict[str, str]]:
+    """Return the current mapping of artifact name -> preview payload."""
+    return _artifact_previews.get({})
+
+
+def _reset_deleted_artifacts() -> None:
+    """Clear the per-execution deleted-artifact tracker. Called at start of each execution."""
+    _deleted_artifacts.set([])
+
+
+def _mark_figure_rendered(fig: Any) -> None:
+    """Record that *fig* was rendered or published during this execution."""
+    rendered = _rendered_figures.get()
+    if rendered is None:
+        rendered = weakref.WeakSet()
+        _rendered_figures.set(rendered)
+    rendered.add(fig)
+
+
+def _get_rendered_figures() -> weakref.WeakSet:
+    """Figures the end-of-cell sweep must not render again."""
+    return _rendered_figures.get() or weakref.WeakSet()
+
+
+def _reset_rendered_figures() -> None:
+    """Clear the rendered-figure tracker. Called at start of each execution."""
+    _rendered_figures.set(None)
+
+
+def _get_deleted_artifacts() -> list[str]:
+    """Return names deleted via delete_artifact() during this execution."""
+    return _deleted_artifacts.get([]) or []
+
+
+def _render_display_payload(obj: Any) -> dict[str, str] | None:
+    """Render *obj* to a ``{mime_type, data}`` payload, or None if unsupported.
+
+    Handles matplotlib figures (PNG base64), plotly figures (text/html), and
+    PIL images (PNG base64). Polars frames, HTML strings, and plain text are
+    left to ``display`` so its fallbacks stay in one place.
+    """
+    if _is_matplotlib_figure(obj):
+        _mark_figure_rendered(obj)
+        buf = io.BytesIO()
+        obj.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+        buf.seek(0)
+        return {"mime_type": "image/png", "data": base64.b64encode(buf.read()).decode("ascii")}
+    if _is_plotly_figure(obj):
+        return {"mime_type": "text/html", "data": obj.to_html(include_plotlyjs="cdn", full_html=False)}
+    if _is_pil_image(obj):
+        buf = io.BytesIO()
+        obj.save(buf, format="PNG")
+        buf.seek(0)
+        return {"mime_type": "image/png", "data": base64.b64encode(buf.read()).decode("ascii")}
+    return None
+
+
+def display(obj: Any, title: str = "", max_rows: int = _GW_TABLE_MAX_ROWS) -> None:
+    """Display a rich object in the output panel.
+
+    Supported object types:
+    - polars.DataFrame / polars.LazyFrame: Rendered as an interactive table
+      (LazyFrames are head-collected). Use ``explore`` for the full
+      drag-to-chart Graphic Walker explorer instead.
+    - matplotlib.figure.Figure: Rendered as PNG image
+    - plotly.graph_objects.Figure: Rendered as interactive HTML
+    - PIL.Image.Image: Rendered as PNG image
+    - str containing HTML tags: Rendered as HTML
+    - Anything else: Converted to string and displayed as plain text
+
+    Args:
+        obj: The object to display.
+        title: Optional title for the display output.
+        max_rows: Row cap materialized for table rendering (default 10,000).
+    """
+    displays = _displays.get([])
+
+    payload = _render_display_payload(obj)
+    if payload is not None:
+        displays.append({**payload, "title": title})
+    elif _is_polars_frame(obj):
+        try:
+            displays.append(
+                {
+                    "mime_type": _GW_TABLE_MIME,
+                    "data": _dump_table_payload(_build_table_payload(obj, max_rows)),
+                    "title": title,
+                }
+            )
+        except Exception:
+            displays.append({"mime_type": "text/plain", "data": str(obj), "title": title})
+    elif _is_html_string(obj):
+        displays.append(
+            {
+                "mime_type": "text/html",
+                "data": obj,
+                "title": title,
+            }
+        )
+    else:
+        displays.append(
+            {
+                "mime_type": "text/plain",
+                "data": str(obj),
+                "title": title,
+            }
+        )
+
+    _displays.set(displays)
+
+
+def explore(obj: Any, title: str = "", max_rows: int = _GW_TABLE_MAX_ROWS) -> None:
+    """Open the full Graphic Walker explorer for a Polars DataFrame/LazyFrame.
+
+    Where ``display`` renders a lightweight interactive table, ``explore`` mounts
+    the full Tableau-style explorer — a Data tab plus a Visualization tab where
+    columns can be dragged onto shelves to build charts inline. LazyFrames are
+    head-collected. Non-Polars objects fall back to ``display``.
+
+    Args:
+        obj: The DataFrame/LazyFrame to explore.
+        title: Optional title for the display output.
+        max_rows: Row cap materialized for the explorer (default 10,000).
+    """
+    if not _is_polars_frame(obj):
+        display(obj, title)
+        return
+
+    displays = _displays.get([])
+    try:
+        displays.append(
+            {
+                "mime_type": _GW_EXPLORE_MIME,
+                "data": _dump_table_payload(_build_table_payload(obj, max_rows)),
+                "title": title,
+            }
+        )
+    except Exception:
+        displays.append({"mime_type": "text/plain", "data": str(obj), "title": title})
+    _displays.set(displays)
+
+
+def _auto_display(obj: Any) -> None:
+    """Auto-display a cell's last expression.
+
+    Polars frames show their plain repr (use display()/explore() for the
+    interactive table); other rich types still render via display().
+    """
+    if _is_polars_frame(obj):
+        displays = _displays.get([])
+        displays.append({"mime_type": "text/plain", "data": str(obj), "title": ""})
+        _displays.set(displays)
+        return
+    display(obj)
+
+
+# ===== Catalog Tables APIs =====
+#
+# These wrap Core's ``/catalog/tables/*`` HTTP endpoints. The kernel writes
+# Delta directories locally (under the mounted ``/catalog_tables`` directory
+# or its DinD equivalent) and reports metadata to Core; Core never materializes
+# the dataset, matching the project rule that Core ships paths/JSON only.
+
+_CATALOG_VALID_WRITE_MODES = frozenset({"overwrite", "append", "upsert", "update", "delete", "error"})
+
+
+def _kernel_catalog_dir() -> str:
+    """Return the absolute path of ``/catalog_tables`` as the kernel sees it.
+
+    In Docker-in-Docker mode the env var holds the same path the host uses;
+    in local mode it holds the bind-mount target inside the container
+    (``/catalog_tables``). Falls back to ``/catalog_tables`` if unset.
+    """
+    return os.environ.get("FLOWFILE_KERNEL_CATALOG_TABLES_DIR", "/catalog_tables")
+
+
+def _host_catalog_dir() -> str | None:
+    """Return the host path of the catalog_tables directory (local mode only).
+
+    Used to translate kernel-visible paths back to host paths when registering
+    a new table with Core (Core stores host paths). Returns ``None`` in DinD
+    mode where no translation is needed.
+    """
+    return os.environ.get("FLOWFILE_HOST_CATALOG_TABLES_DIR")
+
+
+def _translate_container_path_to_host(container_path: str) -> str:
+    """Inverse of :func:`_translate_host_path_to_container` for catalog paths.
+
+    The kernel writes Delta directories using its in-container path
+    (``/catalog_tables/...``) but Core stores the host path. In local mode
+    we swap the prefix, emitting host-native separators (backslashes when the
+    host is Windows); in DinD mode the path passes through unchanged.
+    """
+    host_catalog_dir = _host_catalog_dir()
+    if not host_catalog_dir:
+        return container_path
+    kernel_dir = _kernel_catalog_dir().replace("\\", "/").rstrip("/")
+    p = container_path.replace("\\", "/").rstrip("/")
+    sep = "\\" if "\\" in host_catalog_dir else "/"
+    base = host_catalog_dir.rstrip("/\\")
+    if p == kernel_dir:
+        return host_catalog_dir
+    if p.startswith(kernel_dir + "/"):
+        rel = p[len(kernel_dir) + 1 :].replace("/", sep)
+        return base + sep + rel
+    return container_path
+
+
+def _new_catalog_table_dir(name: str) -> str:
+    """Generate a fresh kernel-visible directory path for a new catalog table.
+
+    Mirrors flowfile_frame's convention (``<name>_<8-char-uuid>``) so directory
+    names don't collide when the same table name is reused under different
+    namespaces.
+    """
+    import uuid
+
+    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_") or "table"
+    suffix = uuid.uuid4().hex[:8]
+    return os.path.join(_kernel_catalog_dir(), f"{safe_name}_{suffix}")
+
+
+def _friendly_dtype(t: Any) -> str:
+    # deltalake's PrimitiveType carries the short name on `.type`
+    # ("long" / "string" / "double" / "boolean" / …); complex types
+    # (StructType, ArrayType, MapType) fall back to str().
+    inner = getattr(t, "type", None)
+    if isinstance(inner, str):
+        return inner
+    return str(t)
+
+
+def _read_delta_metadata(table_path: str) -> dict[str, Any]:
+    """Read schema / row_count / size_bytes from a Delta directory.
+
+    Lightweight enough to run after every write; the kernel sends these
+    values to Core via the from-data / refresh endpoints so the catalog
+    record matches the on-disk state.
+    """
+    from deltalake import DeltaTable
+
+    dt = DeltaTable(table_path)
+    schema_fields = dt.schema().fields
+    schema_columns = [{"name": f.name, "dtype": _friendly_dtype(f.type)} for f in schema_fields]
+    row_count: int | None = None
+    size_bytes = 0
+    try:
+        add_actions = dt.get_add_actions(flatten=True)
+        size_bytes = sum(v for v in add_actions.column("size_bytes").to_pylist() if v is not None)
+        row_count = sum(v for v in add_actions.column("num_records").to_pylist() if v is not None)
+    except Exception:
+        # Fall back to file-walk for size; row_count stays None.
+        for f in Path(table_path).rglob("*.parquet"):
+            try:
+                size_bytes += f.stat().st_size
+            except OSError:
+                pass
+    return {
+        "schema_columns": schema_columns,
+        "row_count": row_count,
+        "column_count": len(schema_columns),
+        "size_bytes": size_bytes,
+    }
+
+
+def _catalog_get(client: httpx.Client, path: str, params: dict[str, Any] | None = None) -> httpx.Response:
+    # httpx serializes None as ``?key=`` which FastAPI's ``int | None`` parser
+    # rejects with 422. Strip None entries so the param is simply absent.
+    cleaned = {k: v for k, v in (params or {}).items() if v is not None}
+    resp = client.get(f"{_CORE_URL}{path}", params=cleaned or None)
+    resp.raise_for_status()
+    return resp
+
+
+def _catalog_post(client: httpx.Client, path: str, json: dict[str, Any]) -> httpx.Response:
+    resp = client.post(f"{_CORE_URL}{path}", json=json)
+    resp.raise_for_status()
+    return resp
+
+
+def _resolve_schema_namespace_id(client: httpx.Client, schema_name: str) -> int:
+    """Resolve a schema name to its namespace_id.
+
+    Accepts either a bare schema name or a qualified ``"catalog.schema"`` — the
+    qualified form is how you disambiguate a schema name reused across catalogs.
+    Raises :class:`LookupError` if no schema with that name exists.
+    """
+    catalog_name, _, bare_name = schema_name.rpartition(".")
+    catalogs = _catalog_get(client, "/catalog/namespaces", params={"parent_id": None}).json()
+    candidates: list[dict[str, Any]] = []
+    for cat in catalogs:
+        if catalog_name and cat["name"] != catalog_name:
+            continue
+        schemas = _catalog_get(client, "/catalog/namespaces", params={"parent_id": cat["id"]}).json()
+        for sch in schemas:
+            if sch["name"] == bare_name:
+                candidates.append(sch)
+    if not candidates:
+        raise LookupError(f"Schema '{schema_name}' not found in any catalog")
+    if len(candidates) > 1:
+        names = [f"{c.get('parent_name') or '?'}.{c['name']} (id={c['id']})" for c in candidates]
+        raise LookupError(
+            f"Schema '{schema_name}' is ambiguous — found in multiple catalogs: {names}. "
+            "Qualify it as 'catalog.schema', or pass namespace_id= directly."
+        )
+    return candidates[0]["id"]
+
+
+def _resolve_target_namespace_id(
+    client: httpx.Client,
+    schema: str | None,
+    namespace_id: int | None,
+) -> int:
+    """Pick the namespace_id for a read/write operation.
+
+    Precedence: explicit ``namespace_id`` > ``schema`` (name lookup) > default.
+    Raises :class:`ValueError` if both ``schema`` and ``namespace_id`` are passed.
+    """
+    if schema is not None and namespace_id is not None:
+        raise ValueError("Pass either 'schema' or 'namespace_id', not both")
+    if namespace_id is not None:
+        return namespace_id
+    if schema is not None:
+        return _resolve_schema_namespace_id(client, schema)
+    default = _catalog_get(client, "/catalog/default-namespace-id").json()
+    if isinstance(default, dict):
+        # Endpoint may return a wrapped result; tolerate either shape
+        return int(default.get("id") or default.get("namespace_id") or default["default"])
+    return int(default)
+
+
+def _resolve_catalog_table(
+    client: httpx.Client,
+    table_name: str,
+    namespace_id: int | None,
+    strict: bool = False,
+) -> dict[str, Any] | None:
+    """Resolve a catalog table by name; return ``None`` if not found.
+
+    Wraps Core's ``GET /catalog/tables/resolve``. Translates 404 (table missing)
+    into ``None`` so callers can distinguish "doesn't exist" from real errors.
+    """
+    params: dict[str, Any] = {"q": table_name, "strict": str(strict).lower()}
+    if namespace_id is not None:
+        params["namespace_id"] = namespace_id
+    resp = client.get(f"{_CORE_URL}/catalog/tables/resolve", params=params)
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+    return resp.json().get("table")
+
+
+# ----- Typed reference objects ------------------------------------------------
+#
+# Mirror the ergonomics of ``flowfile_frame.catalog_reference.CatalogReference``
+# / ``SchemaReference`` on the kernel side. The kernel can't import
+# flowfile_core (no DB access), so these wrap the same Core HTTP endpoints
+# the procedural API already calls. Frozen + slots makes them immutable,
+# hashable, and cheap; ``__repr__`` comes for free via ``@dataclass``.
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogRef:
+    """Validated handle to a top-level catalog namespace.
+
+    Use :func:`get_catalog` or :func:`list_catalogs` to obtain one; direct
+    construction is permitted but won't validate the id against Core.
+
+    Equivalent to ``flowfile_frame.CatalogReference`` on the editor side.
+    """
+
+    id: int
+    name: str
+
+    def get_schema(self, name: str) -> SchemaRef:
+        """Return the named child schema. Raises ``LookupError`` if missing."""
+        for schema in self.list_schemas():
+            if schema.name == name:
+                return schema
+        raise LookupError(f"Schema '{name}' not found in catalog '{self.name}'")
+
+    def list_schemas(self) -> list[SchemaRef]:
+        """Return every schema (level-1 namespace) under this catalog."""
+        auth_headers = _get_internal_auth_headers()
+        with httpx.Client(timeout=30.0, headers=auth_headers) as client:
+            rows = _catalog_get(client, "/catalog/namespaces", params={"parent_id": self.id}).json()
+        return [SchemaRef(id=row["id"], name=row["name"], catalog=self) for row in rows]
+
+    def list_tables(self) -> list[TableRef]:
+        """Return every table across every schema in this catalog (flat list)."""
+        result: list[TableRef] = []
+        for schema in self.list_schemas():
+            result.extend(schema.list_tables())
+        return result
+
+    def get_table_ref(self, *, schema_name: str, table_name: str) -> TableRef:
+        """Convenience shortcut for ``self.get_schema(schema_name).get_table_ref(table_name)``."""
+        return self.get_schema(schema_name).get_table_ref(table_name)
+
+
+@dataclass(frozen=True, slots=True)
+class SchemaRef:
+    """Validated handle to a level-1 schema namespace.
+
+    Equivalent to ``flowfile_frame.SchemaReference`` on the editor side.
+    """
+
+    id: int
+    name: str
+    catalog: CatalogRef
+
+    def list_tables(self) -> list[TableRef]:
+        """Return every table registered in this schema."""
+        auth_headers = _get_internal_auth_headers()
+        with httpx.Client(timeout=30.0, headers=auth_headers) as client:
+            rows = _catalog_get(client, "/catalog/tables", params={"namespace_id": self.id}).json()
+        return [_table_ref_from_row(row, self) for row in rows]
+
+    def get_table_ref(self, name: str) -> TableRef:
+        """Return a :class:`TableRef` for *name*.
+
+        Returns a ref with ``id=None`` if the table does not exist yet —
+        use :meth:`TableRef.exists` to check, or call :meth:`TableRef.write`
+        to create it.
+        """
+        auth_headers = _get_internal_auth_headers()
+        with httpx.Client(timeout=30.0, headers=auth_headers) as client:
+            row = _resolve_catalog_table(client, name, self.id, strict=False)
+        if row is None:
+            return TableRef(name=name, schema=self)
+        return _table_ref_from_row(row, self)
+
+    def read_table(
+        self,
+        name: str,
+        *,
+        delta_version: int | None = None,
+        ignore_warning: bool = False,
+    ) -> pl.LazyFrame:
+        """Read a table from this schema as a Polars ``LazyFrame``.
+
+        Equivalent to ``flowfile_ctx.read_catalog_table(name, namespace_id=self.id, ...)``.
+        Views are supported (materialised to a snapshot — re-call for fresh
+        data); ``delta_version`` time travel is physical-only. Pass
+        ``ignore_warning=True`` to silence the view snapshot warning.
+        """
+        return read_catalog_table(
+            name, namespace_id=self.id, delta_version=delta_version, ignore_warning=ignore_warning
+        )
+
+    def write_table(
+        self,
+        df: pl.DataFrame | pl.LazyFrame,
+        name: str,
+        *,
+        write_mode: str = "overwrite",
+        merge_keys: list[str] | None = None,
+        description: str | None = None,
+    ) -> TableRef:
+        """Write *df* into this schema as ``name``."""
+        return write_catalog_table(
+            df,
+            name,
+            namespace_id=self.id,
+            write_mode=write_mode,
+            merge_keys=merge_keys,
+            description=description,
+        )
+
+    # Convenience aliases whose names match the top-level
+    # ``flowfile_ctx.read_catalog_table`` / ``write_catalog_table`` functions.
+    # The ``read_table`` / ``write_table`` names above match flowfile_frame's
+    # ``SchemaReference`` API; these aliases match the kernel's procedural API.
+    # Both call the same code paths.
+
+    def read_catalog_table(
+        self,
+        name: str,
+        *,
+        delta_version: int | None = None,
+        ignore_warning: bool = False,
+    ) -> pl.LazyFrame:
+        """Alias for :meth:`read_table` — same name as ``flowfile_ctx.read_catalog_table``."""
+        return self.read_table(name, delta_version=delta_version, ignore_warning=ignore_warning)
+
+    def write_catalog_table(
+        self,
+        df: pl.DataFrame | pl.LazyFrame,
+        name: str,
+        *,
+        write_mode: str = "overwrite",
+        merge_keys: list[str] | None = None,
+        description: str | None = None,
+    ) -> TableRef:
+        """Alias for :meth:`write_table` — same name as ``flowfile_ctx.write_catalog_table``."""
+        return self.write_table(
+            df,
+            name,
+            write_mode=write_mode,
+            merge_keys=merge_keys,
+            description=description,
+        )
+
+    # ----- Global artifacts scoped to this schema -----------------------------
+    #
+    # These delegate to the top-level ``publish_global`` / ``get_global`` /
+    # ``list_global_artifacts`` / ``delete_global_artifact`` functions with
+    # ``namespace_id=self.id`` baked in. The shorter ``publish_artifact`` /
+    # ``read_artifact`` names are reused here even though they collide with the
+    # kernel-local in-memory store at the module level — the receiver
+    # (``schema.foo`` vs ``flowfile_ctx.foo``) disambiguates which store is
+    # involved.
+    #
+    # Limitation inherited from ``publish_global``: requires a registered
+    # catalog flow (``source_registration_id``). In interactive cell mode the
+    # underlying ``publish_global`` no-ops with a printed warning and returns
+    # ``-1``.
+
+    def publish_artifact(
+        self,
+        name: str,
+        obj: Any,
+        *,
+        description: str | None = None,
+        tags: list[str] | None = None,
+        fmt: str | None = None,
+    ) -> int:
+        """Persist *obj* to the global artifact store under this schema's namespace.
+
+        Convenience wrapper around :func:`publish_global` with
+        ``namespace_id=self.id``.
+        """
+        return publish_global(
+            name,
+            obj,
+            description=description,
+            tags=tags,
+            namespace_id=self.id,
+            fmt=fmt,
+        )
+
+    def read_artifact(
+        self,
+        name: str,
+        *,
+        version: int | None = None,
+    ) -> Any:
+        """Retrieve an artifact from this schema's namespace.
+
+        Convenience wrapper around :func:`get_global`.
+        """
+        return get_global(name, version=version, namespace_id=self.id)
+
+    def list_artifacts(
+        self,
+        *,
+        tags: list[str] | None = None,
+    ) -> list[GlobalArtifactInfo]:
+        """List artifacts in this schema's namespace.
+
+        Convenience wrapper around :func:`list_global_artifacts`.
+        """
+        return list_global_artifacts(namespace_id=self.id, tags=tags)
+
+    def delete_artifact(
+        self,
+        name: str,
+        *,
+        version: int | None = None,
+    ) -> None:
+        """Delete an artifact from this schema's namespace.
+
+        Convenience wrapper around :func:`delete_global_artifact`.
+        """
+        delete_global_artifact(name, version=version, namespace_id=self.id)
+
+
+@dataclass(frozen=True, slots=True)
+class TableRef:
+    """Handle to a catalog table (existing or potential).
+
+    ``id`` is ``None`` for refs that point at a name within a schema where
+    no table exists yet — :meth:`write` will create it; :meth:`read` will
+    raise ``KeyError``.
+    """
+
+    name: str
+    schema: SchemaRef
+    id: int | None = None
+    file_path: str | None = None
+    row_count: int | None = None
+    column_count: int | None = None
+    size_bytes: int | None = None
+    schema_columns: list[dict[str, str]] = field(default_factory=list)
+    table_type: str = "physical"
+
+    def exists(self) -> bool:
+        """``True`` if this ref points at a table that exists in the catalog."""
+        return self.id is not None
+
+    def read(self, *, delta_version: int | None = None, ignore_warning: bool = False) -> pl.LazyFrame:
+        """Read this table as a Polars ``LazyFrame``.
+
+        Works for views (``table_type="virtual"``) too: the view is
+        materialised to a snapshot file — re-call :meth:`read` for fresh
+        data. ``delta_version`` time travel is physical-only. Pass
+        ``ignore_warning=True`` to silence the view snapshot warning.
+        """
+        return read_catalog_table(self, delta_version=delta_version, ignore_warning=ignore_warning)
+
+    def write(
+        self,
+        df: pl.DataFrame | pl.LazyFrame,
+        *,
+        write_mode: str = "overwrite",
+        merge_keys: list[str] | None = None,
+        description: str | None = None,
+    ) -> TableRef:
+        """Write *df* into this table; creates it if it doesn't exist yet.
+
+        Returns a fresh ``TableRef`` with updated metadata (row_count,
+        size_bytes, etc.) — the original ref is unchanged.
+        """
+        return write_catalog_table(
+            df,
+            self,
+            write_mode=write_mode,
+            merge_keys=merge_keys,
+            description=description,
+        )
+
+    def refresh(self) -> TableRef:
+        """Re-fetch the table's metadata from Core.
+
+        Useful when another process may have written to the same table and
+        you want this ref's ``row_count`` / ``size_bytes`` / ``file_path``
+        to reflect the latest state.
+        """
+        auth_headers = _get_internal_auth_headers()
+        with httpx.Client(timeout=30.0, headers=auth_headers) as client:
+            row = _resolve_catalog_table(client, self.name, self.schema.id, strict=False)
+        if row is None:
+            return replace(
+                self,
+                id=None,
+                file_path=None,
+                row_count=None,
+                column_count=None,
+                size_bytes=None,
+                schema_columns=[],
+            )
+        return _table_ref_from_row(row, self.schema)
+
+
+def _table_ref_from_row(row: dict[str, Any], schema: SchemaRef) -> TableRef:
+    """Build a :class:`TableRef` from a ``CatalogTableOut`` JSON row.
+
+    Tolerant of the shape variations between Core endpoints — ``file_path``
+    is sometimes named ``table_path`` / ``path``, ``schema_columns`` may
+    be absent on list responses.
+    """
+    return TableRef(
+        name=row["name"],
+        schema=schema,
+        id=row.get("id"),
+        file_path=_table_file_path(row),
+        row_count=row.get("row_count"),
+        column_count=row.get("column_count"),
+        size_bytes=row.get("size_bytes"),
+        schema_columns=list(row.get("schema_columns") or []),
+        table_type=row.get("table_type") or "physical",
+    )
+
+
+# ----- Top-level entry points -------------------------------------------------
+
+
+def get_catalog(name: str) -> CatalogRef:
+    """Return a :class:`CatalogRef` for the named top-level catalog.
+
+    Raises ``LookupError`` if no catalog with that name exists.
+    """
+    for cat in list_catalogs():
+        if cat.name == name:
+            return cat
+    raise LookupError(f"Catalog '{name}' not found")
+
+
+def default_schema() -> SchemaRef:
+    """Return the seeded ``General/default`` schema (or whichever Core has marked as default).
+
+    Raises ``LookupError`` if the catalog hasn't been initialised.
+    """
+    auth_headers = _get_internal_auth_headers()
+    with httpx.Client(timeout=30.0, headers=auth_headers) as client:
+        default_id_raw = _catalog_get(client, "/catalog/default-namespace-id").json()
+    # Endpoint may return a bare int OR a wrapper dict — tolerate both.
+    if isinstance(default_id_raw, dict):
+        default_id = int(default_id_raw.get("id") or default_id_raw.get("namespace_id") or default_id_raw["default"])
+    elif default_id_raw is None:
+        raise LookupError(
+            "Default schema has not been initialised. Create one from the visual "
+            "editor or call flowfile_ctx.list_catalogs() to see what exists."
+        )
+    else:
+        default_id = int(default_id_raw)
+    # Walk catalogs to find the parent of the default schema so we can
+    # return a fully-populated SchemaRef.
+    for catalog in list_catalogs():
+        for schema in catalog.list_schemas():
+            if schema.id == default_id:
+                return schema
+    raise LookupError(f"Default schema id={default_id} returned by Core does not exist in any catalog.")
+
+
+def list_catalogs() -> list[CatalogRef]:
+    """List all top-level catalogs.
+
+    Returns:
+        Typed refs — navigate further via :meth:`CatalogRef.list_schemas` /
+        :meth:`CatalogRef.get_schema`.
+    """
+    auth_headers = _get_internal_auth_headers()
+    with httpx.Client(timeout=30.0, headers=auth_headers) as client:
+        rows = _catalog_get(client, "/catalog/namespaces").json()
+    return [CatalogRef(id=row["id"], name=row["name"]) for row in rows]
+
+
+def list_schemas(
+    catalog: str | None = None,
+    *,
+    catalog_id: int | None = None,
+) -> list[SchemaRef]:
+    """List schemas, optionally restricted to one catalog.
+
+    Args:
+        catalog: Catalog name; resolved client-side via :func:`list_catalogs`.
+            Mutually exclusive with ``catalog_id``.
+        catalog_id: Explicit catalog id.
+
+    Returns:
+        Typed refs. When neither argument is given, returns schemas from
+        every catalog in a single flat list.
+
+    Raises:
+        ValueError: Both ``catalog`` and ``catalog_id`` were passed.
+        LookupError: ``catalog`` name didn't match any known catalog.
+    """
+    if catalog is not None and catalog_id is not None:
+        raise ValueError("Pass either 'catalog' or 'catalog_id', not both")
+    if catalog_id is not None:
+        # We don't have the catalog name here without an extra round-trip;
+        # fetch from list_catalogs to get a fully-populated CatalogRef.
+        for cat in list_catalogs():
+            if cat.id == catalog_id:
+                return cat.list_schemas()
+        raise LookupError(f"Catalog id={catalog_id} not found")
+    if catalog is not None:
+        return get_catalog(catalog).list_schemas()
+    result: list[SchemaRef] = []
+    for cat in list_catalogs():
+        result.extend(cat.list_schemas())
+    return result
+
+
+def list_catalog_tables(
+    *,
+    schema: str | None = None,
+    namespace_id: int | None = None,
+) -> list[TableRef]:
+    """List catalog tables.
+
+    Args:
+        schema: Schema name; resolved to ``namespace_id`` via Core.
+            Mutually exclusive with ``namespace_id``.
+        namespace_id: Explicit namespace id to filter by.
+
+    Returns:
+        Typed refs. When neither argument is given, returns every table
+        visible to this kernel (across all schemas in all catalogs).
+
+    Raises:
+        ValueError: Both ``schema`` and ``namespace_id`` were passed.
+    """
+    if schema is not None and namespace_id is not None:
+        raise ValueError("Pass either 'schema' or 'namespace_id', not both")
+    if namespace_id is not None:
+        return _list_tables_under_namespace(namespace_id)
+    if schema is not None:
+        # Resolve schema name → fully populated SchemaRef so the refs carry
+        # the schema name (not just the id).
+        for cat in list_catalogs():
+            for sch in cat.list_schemas():
+                if sch.name == schema:
+                    return sch.list_tables()
+        raise LookupError(f"Schema '{schema}' not found in any catalog")
+    # Unfiltered: flatten across every schema in every catalog.
+    result: list[TableRef] = []
+    for cat in list_catalogs():
+        for sch in cat.list_schemas():
+            result.extend(sch.list_tables())
+    return result
+
+
+def _list_tables_under_namespace(namespace_id: int) -> list[TableRef]:
+    """Helper for the ``namespace_id=...`` path of :func:`list_catalog_tables`.
+
+    Resolves the schema/catalog metadata so the returned refs are fully
+    populated (one extra GET per distinct namespace — cheap; this function
+    is called interactively, not on a hot path).
+    """
+    for cat in list_catalogs():
+        for sch in cat.list_schemas():
+            if sch.id == namespace_id:
+                return sch.list_tables()
+    raise LookupError(f"Namespace id={namespace_id} not found")
+
+
+def read_catalog_table(
+    table: TableRef | str,
+    *,
+    schema: str | None = None,
+    namespace_id: int | None = None,
+    delta_version: int | None = None,
+    ignore_warning: bool = False,
+) -> pl.LazyFrame:
+    """Read a catalog table as a Polars ``LazyFrame``.
+
+    Physical tables: calls Core to resolve the table's path, then opens the
+    Delta directory locally via ``pl.scan_delta`` — Core never materialises
+    the dataset. Views (``table_type="virtual"``): every call has Core's
+    worker materialise a fresh Arrow IPC snapshot on the shared volume,
+    which is then scanned lazily. The snapshot file can be swept later —
+    collect promptly, or re-call this function instead of holding the
+    LazyFrame across long gaps.
+
+    Args:
+        table: Either a :class:`TableRef` (returned from :func:`list_catalog_tables`
+            or :meth:`SchemaRef.get_table_ref`) **or** a string reference —
+            ``"table"``, ``"schema.table"`` or ``"catalog.schema.table"``.
+            For a bare name, ``schema``/``namespace_id`` disambiguate.
+        schema: Only used when ``table`` is a string. Schema name, optionally
+            qualified as ``"catalog.schema"``; resolved via Core. Mutually
+            exclusive with ``namespace_id``.
+        namespace_id: Only used when ``table`` is a string. Explicit namespace ID.
+        delta_version: If provided, opens that specific Delta commit (time
+            travel). Physical tables only — views reject it.
+        ignore_warning: Silence the point-in-time-snapshot warning emitted when
+            reading a view. Ignored for physical tables (they never warn).
+
+    Returns:
+        A lazy ``pl.LazyFrame`` over the Delta directory (or IPC snapshot for views).
+
+    Raises:
+        KeyError: Table not found.
+        ValueError: Both ``schema`` and ``namespace_id`` were passed alongside a
+            string, or ``delta_version`` was passed for a view.
+        PermissionError: Not authorized to read the view.
+    """
+    if isinstance(table, TableRef):
+        if schema is not None or namespace_id is not None:
+            raise ValueError(
+                "When passing a TableRef, 'schema' and 'namespace_id' must be omitted "
+                "(the ref carries that information itself)."
+            )
+        target_ns = table.schema.id
+        table_name = table.name
+    else:
+        table_name = table
+    auth_headers = _get_internal_auth_headers()
+    with httpx.Client(timeout=30.0, headers=auth_headers) as client:
+        if not isinstance(table, TableRef):
+            target_ns = _resolve_target_namespace_id(client, schema, namespace_id)
+        row = _resolve_catalog_table(client, table_name, target_ns, strict=False)
+        if row is None:
+            raise KeyError(f"Catalog table '{table_name}' not found")
+        if row.get("table_type") == "virtual":
+            if delta_version is not None:
+                raise ValueError(
+                    f"Catalog table '{table_name}' is a view (virtual table); "
+                    "delta_version time travel only applies to physical tables."
+                )
+            return _read_virtual_table(client, row, table_name, ignore_warning=ignore_warning)
+        host_path = _table_file_path(row)
+        if host_path is None:
+            raise RuntimeError(f"Catalog table '{table_name}' has no file_path")
+        kernel_path = _translate_host_path_to_container(host_path)
+    if delta_version is not None:
+        return pl.scan_delta(kernel_path, version=delta_version)
+    return pl.scan_delta(kernel_path)
+
+
+def _read_virtual_table(
+    client: httpx.Client, row: dict[str, Any], table_name: str, ignore_warning: bool = False
+) -> pl.LazyFrame:
+    """Materialise a view via Core (worker-executed) and lazily scan the snapshot.
+
+    Each call produces a fresh snapshot (plan hashes don't track data changes,
+    so Core rebuilds rather than caching). The file rides the shared-volume TTL
+    sweep, so a long-held LazyFrame can go stale — re-calling ``.read()`` heals it.
+
+    Emits a one-line snapshot warning via :func:`log_warning` unless
+    *ignore_warning* is set. The warning is best-effort — a delivery failure
+    (e.g. no execute context) never breaks the read.
+    """
+    if not ignore_warning:
+        try:
+            log_warning(
+                f"Reading virtual table '{table_name}' returns a point-in-time snapshot. "
+                f"Flowfile recomputes the view and overwrites the same Arrow file on every "
+                f"read, so the scan path is identical each call but the contents are freshly "
+                f"recomputed (it won't auto-update on its own, and a LazyFrame you keep will "
+                f"reflect the most recent read). Collect promptly, or call read() again. "
+                f"Pass ignore_warning=True to silence."
+            )
+        except Exception:  # noqa: BLE001 - warning is best-effort, never break the read
+            pass
+    # Producer re-runs can be slow; override the client's default timeout.
+    resp = client.post(f"{_CORE_URL}/catalog/tables/{row['id']}/materialize", timeout=600.0)
+    if resp.status_code == 403:
+        raise PermissionError(f"Not authorized to read catalog view '{table_name}'")
+    if resp.status_code == 404:
+        raise KeyError(
+            f"Could not materialize catalog view '{table_name}' (404). If the table exists, "
+            "this Core version may predate view materialization — update flowfile_core."
+        )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Materializing catalog view '{table_name}' failed: {resp.text}")
+    body = resp.json()
+    kernel_path = _translate_host_path_to_container(body["path"])
+    fmt = body.get("format", "ipc")
+    if fmt == "ipc":
+        return pl.scan_ipc(kernel_path)
+    if fmt == "delta":
+        return pl.scan_delta(kernel_path)
+    raise RuntimeError(f"Unsupported materialization format '{fmt}' for catalog view '{table_name}'")
+
+
+def write_catalog_table(
+    df: pl.DataFrame | pl.LazyFrame,
+    table: TableRef | str,
+    *,
+    schema: str | None = None,
+    namespace_id: int | None = None,
+    write_mode: str = "overwrite",
+    merge_keys: list[str] | None = None,
+    description: str | None = None,
+) -> TableRef:
+    """Write a Polars DataFrame / LazyFrame to a catalog table.
+
+    The kernel performs the Delta write locally and reports metadata to Core;
+    Core never materialises the dataset.
+
+    Args:
+        df: Polars ``DataFrame`` or ``LazyFrame`` to write.
+        table: Either a :class:`TableRef` (skips the resolution dance) **or** a string
+            reference — ``"table"``, ``"schema.table"`` or ``"catalog.schema.table"``.
+            A qualified name names its own namespace, so ``schema``/``namespace_id``
+            must then be omitted.
+        schema: Only used when ``table`` is a string. Schema name, optionally qualified
+            as ``"catalog.schema"``; resolved via Core. Mutually exclusive with
+            ``namespace_id``.
+        namespace_id: Only used when ``table`` is a string. Explicit namespace ID.
+        write_mode: One of ``"overwrite"``, ``"append"``, ``"upsert"``,
+            ``"update"``, ``"delete"``, ``"error"``.
+        merge_keys: Column names used as merge predicates for
+            ``"upsert"``/``"update"``/``"delete"`` modes.
+        description: Optional description (only applied to newly-created
+            table records).
+
+    Returns:
+        A :class:`TableRef` for the table that was written — with populated
+        ``id``, ``row_count``, ``size_bytes``, ``schema_columns``, etc.
+
+    Raises:
+        ValueError: Unknown ``write_mode`` or missing ``merge_keys`` for merge modes,
+            ``schema``/``namespace_id`` were passed alongside a ``TableRef`` or a
+            qualified name, the target table is a view (virtual tables cannot be
+            written to), or an incremental mode was aimed at an SCD2-tracked table.
+        FileExistsError: ``write_mode="error"`` and the table already exists.
+    """
+    if write_mode not in _CATALOG_VALID_WRITE_MODES:
+        raise ValueError(
+            f"Unknown write_mode '{write_mode}'. Expected one of: " f"{sorted(_CATALOG_VALID_WRITE_MODES)}"
+        )
+    if write_mode in ("upsert", "update", "delete") and not merge_keys:
+        raise ValueError(f"write_mode='{write_mode}' requires merge_keys")
+
+    ref_input: TableRef | None
+    if isinstance(table, TableRef):
+        if schema is not None or namespace_id is not None:
+            raise ValueError(
+                "When passing a TableRef, 'schema' and 'namespace_id' must be omitted "
+                "(the ref carries that information itself)."
+            )
+        ref_input = table
+        table_name = table.name
+    else:
+        ref_input = None
+        table_name = table
+        if "." in table:
+            if schema is not None or namespace_id is not None:
+                raise ValueError(
+                    "When 'table' is a qualified name, 'schema' and 'namespace_id' must be omitted "
+                    "(the reference already names the namespace)."
+                )
+            schema, _, table_name = table.rpartition(".")
+
+    eager_df = df.collect() if isinstance(df, pl.LazyFrame) else df
+
+    auth_headers = _get_internal_auth_headers()
+    with httpx.Client(timeout=60.0, headers=auth_headers) as client:
+        if ref_input is not None:
+            target_ns = ref_input.schema.id
+            target_schema: SchemaRef = ref_input.schema
+        else:
+            target_ns = _resolve_target_namespace_id(client, schema, namespace_id)
+            target_schema = _schema_ref_for_namespace_id(client, target_ns)
+        existing = _resolve_catalog_table(client, table_name, target_ns, strict=False)
+
+        if existing is not None and existing.get("table_type") == "virtual":
+            raise ValueError(f"Catalog table '{table_name}' is a view (virtual table); views cannot be written to.")
+
+        if existing is not None and write_mode in ("append", "upsert", "update", "delete"):
+            # ``.get`` throughout: an older Core has no 'scd2' key and must keep working.
+            if existing.get("scd2"):
+                raise ValueError(
+                    f"Catalog table '{table_name}' is SCD2-tracked (managed by an SCD2 catalog writer). "
+                    f"Kernel writes would corrupt its history: use the catalog-writer node's scd2 mode, "
+                    f"or overwrite to rebuild it as a normal table."
+                )
+
+        if write_mode == "error" and existing is not None:
+            raise FileExistsError(
+                f"Catalog table '{table_name}' already exists in namespace {target_ns} " f"and write_mode='error'."
+            )
+
+        if existing is None:
+            # Fresh write: generate a new Delta directory, write, then register.
+            kernel_path = _new_catalog_table_dir(table_name)
+            _perform_delta_write(eager_df, kernel_path, write_mode, merge_keys, table_exists=False)
+            meta = _read_delta_metadata(kernel_path)
+            host_path = _translate_container_path_to_host(kernel_path)
+            body = {
+                "name": table_name,
+                "table_path": host_path,
+                "namespace_id": target_ns,
+                "description": description,
+                "storage_format": "delta",
+                "schema_columns": meta["schema_columns"],
+                "row_count": meta["row_count"],
+                "column_count": meta["column_count"],
+                "size_bytes": meta["size_bytes"],
+            }
+            row = _catalog_post(client, "/catalog/tables/from-data", body).json()
+            return _table_ref_from_row(row, target_schema)
+
+        # Existing table: write in-place to its current path, then refresh.
+        existing_host_path = _table_file_path(existing)
+        if existing_host_path is None:
+            raise RuntimeError(f"Existing catalog table '{table_name}' has no file_path; cannot write.")
+        kernel_path = _translate_host_path_to_container(existing_host_path)
+        _perform_delta_write(eager_df, kernel_path, write_mode, merge_keys, table_exists=True)
+        meta = _read_delta_metadata(kernel_path)
+        body = {
+            "table_path": existing_host_path,
+            "storage_format": "delta",
+            "schema_columns": meta["schema_columns"],
+            "row_count": meta["row_count"],
+            "column_count": meta["column_count"],
+            "size_bytes": meta["size_bytes"],
+        }
+        if description is not None:
+            body["description"] = description
+        row = _catalog_post(client, f"/catalog/tables/{existing['id']}/refresh", body).json()
+        return _table_ref_from_row(row, target_schema)
+
+
+def _schema_ref_for_namespace_id(client: httpx.Client, namespace_id: int) -> SchemaRef:
+    """Construct a fully-populated :class:`SchemaRef` from a namespace_id.
+
+    Walks the catalog tree once — only used by :func:`write_catalog_table`
+    when the caller passed a bare ``namespace_id`` / ``schema`` and we need
+    a typed schema ref to return inside the resulting ``TableRef``.
+    """
+    cats = _catalog_get(client, "/catalog/namespaces").json()
+    for cat in cats:
+        cat_ref = CatalogRef(id=cat["id"], name=cat["name"])
+        schemas = _catalog_get(client, "/catalog/namespaces", params={"parent_id": cat["id"]}).json()
+        for sch in schemas:
+            if sch["id"] == namespace_id:
+                return SchemaRef(id=sch["id"], name=sch["name"], catalog=cat_ref)
+    raise LookupError(f"Namespace id={namespace_id} not found in any catalog")
+
+
+def _table_file_path(table: dict[str, Any]) -> str | None:
+    """Pull the on-disk path out of a ``CatalogTableOut`` response.
+
+    Tolerant of multiple key names (``file_path``, ``table_path``,
+    ``path``) since different Core versions have used different names.
+    """
+    for key in ("file_path", "table_path", "path"):
+        value = table.get(key)
+        if value:
+            return value
+    return None
+
+
+def _perform_delta_write(
+    df: pl.DataFrame,
+    kernel_path: str,
+    write_mode: str,
+    merge_keys: list[str] | None,
+    table_exists: bool,
+) -> None:
+    """Run the Delta write locally inside the kernel.
+
+    Mirrors the logic in ``shared/delta_utils.py``: simple overwrite/append
+    uses Polars' built-in ``write_delta``; merge modes use
+    ``deltalake.DeltaTable.merge`` directly so the kernel doesn't depend on
+    ``flowfile_core`` or ``flowfile_worker``.
+    """
+    if not table_exists and write_mode in ("update", "delete"):
+        raise FileNotFoundError(f"Cannot {write_mode} catalog table: table does not exist at {kernel_path!r}")
+    os.makedirs(kernel_path, exist_ok=True)
+
+    if write_mode in ("overwrite", "append"):
+        delta_write_options: dict[str, str] = {}
+        if write_mode == "overwrite":
+            delta_write_options["schema_mode"] = "overwrite"
+        elif write_mode == "append":
+            delta_write_options["schema_mode"] = "merge"
+        df.write_delta(kernel_path, mode=write_mode, delta_write_options=delta_write_options)
+        return
+
+    if write_mode == "error":
+        # Caller already verified the table didn't exist. Plain create.
+        df.write_delta(kernel_path, mode="error")
+        return
+
+    # Merge modes: upsert against a missing table is logically "insert all" — create it.
+    # update/delete were already rejected above.
+    if not table_exists:
+        df.write_delta(kernel_path, mode="error")
+        return
+
+    from deltalake import DeltaTable
+
+    dt = DeltaTable(kernel_path)
+    if write_mode in ("upsert", "update"):
+        target_col_names = {field.name for field in dt.schema().fields}
+        new_cols = [c for c in df.columns if c not in target_col_names]
+        if new_cols:
+            df.clear().write_delta(kernel_path, mode="append", delta_write_options={"schema_mode": "merge"})
+            dt = DeltaTable(kernel_path)
+
+    if not merge_keys:
+        raise ValueError(f"merge_keys is required for write_mode='{write_mode}'")
+    predicate = " AND ".join(f'target."{k}" = source."{k}"' for k in merge_keys)
+    merger = dt.merge(
+        source=df.to_arrow(),
+        predicate=predicate,
+        source_alias="source",
+        target_alias="target",
+    )
+    if write_mode == "upsert":
+        merger.when_matched_update_all().when_not_matched_insert_all().execute()
+    elif write_mode == "update":
+        merger.when_matched_update_all().execute()
+    elif write_mode == "delete":
+        merger.when_matched_delete().execute()

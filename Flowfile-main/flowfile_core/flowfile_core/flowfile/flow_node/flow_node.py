@@ -1,0 +1,2770 @@
+import hashlib
+import io
+import threading
+from collections.abc import Callable, Collection, Generator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import replace
+from time import sleep
+from typing import Any, Literal, Optional
+
+import polars as pl
+import pyarrow as pa
+
+from flowfile_core.configs import logger, node_store, settings
+from flowfile_core.configs.flow_logger import NodeLogger
+from flowfile_core.flowfile.execution import registry
+from flowfile_core.flowfile.execution.backends.worker import WorkerBackend
+from flowfile_core.flowfile.execution.context import (
+    DEFAULT_PREVIEW_ROWS,
+    ExecutionContext,
+    current_context,
+    use_context,
+)
+from flowfile_core.flowfile.execution.errors import ComputeError, ComputeUnavailable, TaskFailed
+from flowfile_core.flowfile.execution.protocol import (
+    ComputeBackend,
+    JobHandle,
+    OperationKind,
+    OpPayload,
+    OpResult,
+    ResultRef,
+    SubmitHints,
+    SubmitResult,
+)
+from flowfile_core.flowfile.flow_data_engine.bounded import head_rows
+from flowfile_core.flowfile.flow_data_engine.column_stats import ColumnStatsUnavailable, compute_column_stats
+from flowfile_core.flowfile.flow_data_engine.flow_data_engine import FlowDataEngine
+from flowfile_core.flowfile.flow_data_engine.flow_file_column.main import FlowfileColumn
+from flowfile_core.flowfile.flow_data_engine.subprocess_operations import (
+    ExternalCloudWriter,
+    ExternalDatabaseFetcher,
+    ExternalDatabaseWriter,
+    ExternalDfFetcher,
+    ExternalOutputWriter,
+)
+from flowfile_core.flowfile.flow_node.executor import NodeExecutor
+from flowfile_core.flowfile.flow_node.input_handles import (
+    PARAM_INPUT_HANDLE,
+    input_handle,
+    input_handle_index,
+)
+from flowfile_core.flowfile.flow_node.models import (
+    NodeResults,
+    NodeSchemaInformation,
+    NodeStepInputs,
+    NodeStepSettings,
+    NodeStepStats,
+    RemoteExecutionError,
+    recover_error_class,
+)
+from flowfile_core.flowfile.flow_node.multi_output import (
+    DEFAULT_OUTPUT_HANDLE,
+    NamedOutputs,
+    output_handle,
+    output_handle_index,
+)
+from flowfile_core.flowfile.flow_node.output_field_config_applier import apply_output_field_config
+from flowfile_core.flowfile.flow_node.schema_callback import SingleExecutionFuture
+from flowfile_core.flowfile.flow_node.schema_utils import create_schema_callback_with_output_config
+from flowfile_core.flowfile.flow_node.state import NodeExecutionState
+from flowfile_core.flowfile.param_types import ParamValue
+from flowfile_core.flowfile.parameter_resolver import apply_parameters_in_place, restore_parameters
+from flowfile_core.flowfile.setting_generator import setting_generator, setting_updator
+from flowfile_core.flowfile.utils import HASH_EXCLUDED_KEYS, get_hash
+from flowfile_core.schemas import input_schema, schemas
+from flowfile_core.schemas.output_model import FileColumn, NodeData, TableExample
+
+schema_prefetch_blocked: ContextVar[bool] = ContextVar("schema_prefetch_blocked", default=False)
+"""Set while the calling context must start no schema prefetch (notebook build mode); other contexts still do."""
+
+
+class DeferredNodeError(RuntimeError):
+    """Raised when a node marked ``deferred_until_run`` would be executed outside a flow run."""
+
+
+def _failed_class(error: BaseException) -> str | None:
+    """The exception class a failed job names: below a backend's typed error, else in the error's chain or message."""
+    cause = error.__cause__ if isinstance(error, ComputeError) else error
+    return recover_error_class(cause, str(error))
+
+
+def run_operation(backend: ComputeBackend, op: OperationKind, payload: OpPayload) -> OpResult:
+    """``backend.run_op(op, payload)`` under the failure rule a node's operations follow.
+
+    A ``TaskFailed`` naming the exception class its job failed with is re-raised as ``RemoteExecutionError`` with
+    that class, so the class reaches the node's error record. Every other error propagates as raised.
+    ``FlowNode.run_op`` adds the node's in-flight job. Use this for an operation run before the node is bound (a new
+    read node's schema prefetch).
+    """
+    try:
+        return backend.run_op(op, payload)
+    except TaskFailed as e:
+        failed_class = _failed_class(e)
+        if failed_class is None:
+            raise
+        raise RemoteExecutionError(str(e), failed_class) from e
+
+
+def _arrow_table(sample: bytes) -> pa.Table:
+    """A backend's sample, an Arrow IPC stream, as the table a node's preview serves."""
+    with pa.ipc.open_stream(io.BytesIO(sample)) as reader:
+        return reader.read_all()
+
+
+def _sample_on_read(backend: ComputeBackend, ref: ResultRef, n: int) -> Callable[[], pa.Table]:
+    """A preview of ``n`` rows of ``ref`` that ``backend`` samples the first time it is read, then kept."""
+    table: pa.Table | None = None
+
+    def read() -> pa.Table:
+        nonlocal table
+        if table is None:
+            table = _arrow_table(backend.sample(ref, n))
+        return table
+
+    return read
+
+
+def _result_file(backend: ComputeBackend, ref: ResultRef) -> str | None:
+    """The shared-disk file that backs first-row reads of ``ref``; only a worker on core's disk has one."""
+    return backend.result_file(ref) if isinstance(backend, WorkerBackend) else None
+
+
+ExternalTaskHandle = (
+    ExternalDfFetcher | ExternalDatabaseFetcher | ExternalDatabaseWriter | ExternalCloudWriter | ExternalOutputWriter
+)
+
+# Fields the layout and group routes own, plus the server-stamped owner: a settings drawer never edits them.
+SETTINGS_FINGERPRINT_EXCLUDE = frozenset({"pos_x", "pos_y", "group_id", "user_id"})
+
+
+def kernel_block_reason(node: "FlowNode", include_self: bool) -> str | None:
+    """Name the first un-run kernel node a data-needing prediction would execute.
+
+    Walks the not-yet-run upstream chain (nodes that already have data are
+    boundaries). None when the chain is kernel-free — materializing it in-core
+    during prediction is then acceptable, pivot-style.
+    """
+    stack = [node] if include_self else [n for n, _ in node._slot_input_pairs() if n is not None]
+    seen: set = set()
+    while stack:
+        current = stack.pop()
+        if current.node_id in seen:
+            continue
+        seen.add(current.node_id)
+        if current.node_stats.has_completed_last_run:
+            continue
+        if current._executes_on_kernel:
+            return kernel_not_run_reason(current)
+        stack.extend(n for n, _ in current._slot_input_pairs() if n is not None)
+    return None
+
+
+def kernel_not_run_reason(node: "FlowNode") -> str:
+    """A kernel node's columns are only known once it has run; prediction never executes it."""
+    return (
+        f"Columns can't be predicted yet: kernel node '{node.name}' (id {node.node_id}) "
+        f"has not run. Run it to resolve them."
+    )
+
+
+def data_needed_block_reason(node: "FlowNode") -> str:
+    """A hookless data-dependent custom node never predicts by executing;
+    the user must run it once to resolve its columns."""
+    return (
+        f"Columns can't be predicted yet: node '{node.name}' (id {node.node_id}) "
+        f"needs its data to determine them. Run it to resolve them."
+    )
+
+
+def first_upstream_prediction_warning(node: "FlowNode") -> str | None:
+    """Propagate a kernel-gate warning to every downstream node, not just the
+    direct neighbour. Walks this node plus its upstreams and returns the first
+    block reason found. A node with a resolved output schema (it ran, or its
+    columns were declared in the Schema Validator) is a boundary: downstream
+    columns come from it, so an un-run kernel further up no longer matters."""
+    stack = [node]
+    seen: set = set()
+    while stack:
+        current = stack.pop()
+        if current.node_id in seen:
+            continue
+        seen.add(current.node_id)
+        if current.node_stats.has_completed_last_run or current.node_schema.result_schema:
+            continue
+        if current.node_schema.predicted_schema:
+            continue
+        if current._schema_prediction_blocked:
+            return current._schema_prediction_blocked
+        stack.extend(n for n, _ in current._slot_input_pairs() if n is not None)
+    return None
+
+
+def _settings_for_hash(setting_input: Any) -> Any:
+    """Drop the fields a settings class declares in ``hash_excluded_fields`` before hashing.
+
+    Classes without exclusions pass through untouched, so their hashes stay byte-identical.
+    The dict mirrors what ``get_hash`` builds from ``__dict__`` minus the excluded keys, so
+    adding an excluded field to an existing settings class does not move any existing hash.
+    """
+    excluded = getattr(type(setting_input), "hash_excluded_fields", None)
+    if not excluded or not hasattr(setting_input, "__dict__"):
+        return setting_input
+    skip = HASH_EXCLUDED_KEYS | excluded
+    return {k: v for k, v in setting_input.__dict__.items() if k not in skip}
+
+
+class FlowNode:
+    """Represents a single node in a data flow graph.
+
+    This class manages the node's state, its data processing function,
+    and its connections to other nodes within the graph.
+    """
+
+    parent_uuid: str
+    node_type: str
+    active: bool
+    node_template: node_store.NodeTemplate
+    node_default: schemas.NodeDefault
+    node_information: schemas.NodeInformation | None
+
+    node_schema: NodeSchemaInformation
+    node_inputs: NodeStepInputs
+    node_stats: NodeStepStats
+    node_settings: NodeStepSettings
+    results: NodeResults
+    leads_to_nodes: list["FlowNode"]
+
+    _name: str | None
+    _function: Callable
+    _setting_input: Any
+    _executor: NodeExecutor | None
+    _execution_state: NodeExecutionState
+    _execution_lock: threading.RLock  # guards concurrent get_resulting_data
+    _state_needs_reset: bool
+    # invoked by run_graph() once all downstream dependents finish; e.g. Kafka commits offsets on success
+    _on_flow_complete: Callable[[bool], None] | None
+    # set per run on union nodes: (source id, source handle) pairs deliberately skipped, dropped at assembly
+    _skipped_input_ids_this_run: frozenset
+    # set per run: (source id, source handle) -> the BoundaryEdge an input crosses backends by
+    _boundary_inputs: dict[tuple[int, str], Any]
+    # handle -> an output stored beside the result after a boundary read (_store_other_outputs)
+    _stored_outputs: dict[str, ResultRef]
+    # output name -> a materialised result the node's operation minted (run_op), released with the node's result
+    _operation_refs: dict[str, ResultRef]
+    # stored results of a run_flow child's nodes taken over (adopt_results), released with this node's
+    _adopted_refs: list[ResultRef]
+    # the exception the last run failed with; a read raises it while results.errors is set
+    _last_run_error: BaseException | None
+
+    user_provided_schema_callback: Callable | None
+    _schema_callback: SingleExecutionFuture | None
+    _named_outputs: dict[str, FlowDataEngine]
+    _named_schemas: dict[str, list[FlowfileColumn]]
+    _input_output_handles: dict[int, str]
+
+    _hash: str | None
+    _cache_epoch: int  # bumped by invalidate_cache() to bust the hash
+    _fetch_cached_df: ExternalTaskHandle | None
+    _cache_progress: ExternalTaskHandle | None
+    _submit_in_flight: JobHandle | None  # the backend job of a submit or run_op this node is waiting on
+
+    _kernel_cancel_context: Any  # (kernel_id, manager, exec_token) of this node's in-flight cell
+    _kernel_cancel_event: threading.Event | None
+    _subflow_cancel_context: Any  # a running child FlowGraph of a run_flow node
+
+    # a live getter (not a snapshot) so ${...} refs resolve against current parameter edits
+    _params_getter: Callable[[], dict[str, ParamValue]] | None
+    # the graph's execution context (the run's during a run), read each time the node's function runs
+    _execution_context_getter: Callable[[], ExecutionContext] | None
+    # whether the node's flow's current run was cancelled; a node starting right after a cancel clears its own flag
+    _flow_canceled: Callable[[], bool] | None
+    # warning text when prediction would require executing an un-run kernel node
+    _schema_prediction_blocked: str | None
+    _prediction_requires_data: bool  # stamped at placement: prediction needs a collect
+    _executes_on_kernel: bool  # stamped at placement: function runs on a kernel container
+    deferred_until_run: bool  # seeded placeholder output; only a real run may execute the node
+    placed_deferred: bool  # placed with a seed; reset() re-arms deferred_until_run
+
+    def __init__(
+        self,
+        node_id: str | int,
+        function: Callable,
+        parent_uuid: str,
+        setting_input: Any,
+        name: str,
+        node_type: str,
+        input_columns: list[str] = None,
+        output_schema: list[FlowfileColumn] = None,
+        drop_columns: list[str] = None,
+        renew_schema: bool = True,
+        pos_x: float = 0,
+        pos_y: float = 0,
+        schema_callback: Callable = None,
+    ):
+        """Initializes a FlowNode instance.
+
+        Args:
+            node_id: Unique identifier for the node.
+            function: The core data processing function for the node.
+            parent_uuid: The UUID of the parent flow.
+            setting_input: The configuration/settings object for the node.
+            name: The name of the node.
+            node_type: The type identifier of the node (e.g., 'join', 'filter').
+            input_columns: List of column names expected as input.
+            output_schema: The schema of the columns to be added.
+            drop_columns: List of column names to be dropped.
+            renew_schema: Flag to indicate if the schema should be renewed.
+            pos_x: The x-coordinate on the canvas.
+            pos_y: The y-coordinate on the canvas.
+            schema_callback: A custom function to calculate the output schema.
+        """
+        self.parent_uuid = parent_uuid
+        self.post_init()
+        self.node_information.id = node_id
+        self.node_type = node_type
+        self.node_settings.renew_schema = renew_schema
+        self.update_node(
+            function=function,
+            input_columns=input_columns,
+            output_schema=output_schema,
+            drop_columns=drop_columns,
+            setting_input=setting_input,
+            name=name,
+            pos_x=pos_x,
+            pos_y=pos_y,
+            schema_callback=schema_callback,
+        )
+
+    def post_init(self):
+        """Reset every instance attribute to its default state."""
+        self.active = True
+        self.node_information = schemas.NodeInformation()
+        self.node_inputs = NodeStepInputs()
+        self.node_stats = NodeStepStats()
+        self.node_settings = NodeStepSettings()
+        self.node_schema = NodeSchemaInformation()
+        self.results = NodeResults()
+        self.leads_to_nodes = []
+
+        self._name = None
+        self._function = None
+        self._setting_input = None
+        self._executor = None
+        self._execution_state = NodeExecutionState()
+        self._execution_lock = threading.RLock()
+        self._state_needs_reset = False
+        self._on_flow_complete = None
+        self._skipped_input_ids_this_run = frozenset()
+        self._boundary_inputs = {}
+        self._stored_outputs = {}
+        self._operation_refs = {}
+        self._adopted_refs = []
+
+        self.user_provided_schema_callback = None
+        self._schema_callback = None
+        self._named_outputs = {}  # per-handle output engines, keyed by output handle
+        self._named_schemas = {}  # per-handle schemas, populated alongside _named_outputs
+        self._input_output_handles = {}  # source node id -> the output handle it connects through
+
+        self._hash = None
+        self._cache_epoch = 0
+        self._cache_progress = None
+        self._fetch_cached_df = None
+        self._submit_in_flight = None
+        self._last_run_error = None
+
+        self._kernel_cancel_context = None
+        self._kernel_cancel_event = None
+        self._subflow_cancel_context = None
+
+        self._params_getter = None
+        self._execution_context_getter = None
+        self._flow_canceled = None
+        self._schema_prediction_blocked = None
+        self._prediction_requires_data = False
+        self._executes_on_kernel = False
+        self.deferred_until_run = False
+        self.placed_deferred = False
+
+    @property
+    def state_needs_reset(self) -> bool:
+        """Checks if the node's state needs to be reset.
+
+        Returns:
+            True if a reset is required, False otherwise.
+        """
+        return self._state_needs_reset
+
+    @state_needs_reset.setter
+    def state_needs_reset(self, v: bool):
+        """Sets the flag indicating that the node's state needs to be reset.
+
+        Args:
+            v: The boolean value to set.
+        """
+        self._state_needs_reset = v
+
+    @staticmethod
+    def _as_default_output(fl: "FlowDataEngine | NamedOutputs") -> "FlowDataEngine":
+        """Return the default (first) output for a node-function result.
+
+        Downstream consumers that don't request a specific handle see this one.
+        """
+        if isinstance(fl, NamedOutputs):
+            return fl.default()
+        return fl
+
+    def schema_for_handle(self, handle: str) -> list[FlowfileColumn]:
+        """Return the cached schema for a specific output handle.
+
+        Falls back to the default ``schema`` property when the handle is unknown
+        or the node is single-output, so callers can always rely on this.
+        """
+        if handle in self._named_schemas:
+            return self._named_schemas[handle]
+        if handle in self._named_outputs:
+            return self._named_outputs[handle].schema
+        return self.schema
+
+    def create_schema_callback_from_function(self, f: Callable) -> Callable[[], list[FlowfileColumn]]:
+        """Wraps a node's function to create a schema callback that extracts the schema.
+
+        For multi-output functions, every handle's schema is captured in
+        ``_named_schemas`` on the single call; the callback itself still
+        returns the default handle's schema so the existing contract holds.
+
+        Thread-safe: uses _execution_lock to prevent concurrent execution with get_resulting_data.
+
+        Args:
+            f: The node's core function that returns a FlowDataEngine or NamedOutputs.
+
+        Returns:
+            A callable that, when executed, returns the default output's schema.
+        """
+
+        def schema_callback() -> list[FlowfileColumn]:
+            if self.deferred_until_run:
+                raise DeferredNodeError(f"node {self.node_id} is deferred until the flow runs")
+            try:
+                logger.info("Executing the schema callback function based on the node function")
+                with self._execution_lock:
+                    result = f()
+                    if isinstance(result, NamedOutputs):
+                        self._named_schemas = {
+                            output_handle(i): engine.schema for i, engine in enumerate(result.engines)
+                        }
+                        return self._named_schemas.get(DEFAULT_OUTPUT_HANDLE, [])
+                    return result.schema
+            except Exception as e:
+                logger.warning(f"Error with the schema callback: {e}")
+                return []
+
+        return schema_callback
+
+    @property
+    def schema_callback(self) -> SingleExecutionFuture:
+        """Gets the schema callback function, creating one if it doesn't exist.
+
+        The callback is used for predicting the output schema without full execution.
+
+        Returns:
+            A SingleExecutionFuture instance wrapping the schema function.
+        """
+        if self._schema_callback is None:
+            if self.user_provided_schema_callback is not None:
+                self.schema_callback = self.user_provided_schema_callback
+            elif self.is_start:
+                self.schema_callback = self.create_schema_callback_from_function(self._function)
+        return self._schema_callback
+
+    @schema_callback.setter
+    def schema_callback(self, f: Callable):
+        """Sets the schema callback function for the node.
+
+        If the node has an enabled output_field_config, the callback is automatically
+        wrapped to use the output_field_config schema for prediction.
+
+        Args:
+            f: The function to be used for schema calculation.
+        """
+        if f is None:
+            return
+
+        # Wrap callback with output_field_config support if present and enabled
+        output_field_config = getattr(self._setting_input, "output_field_config", None)
+        if output_field_config and output_field_config.enabled:
+            f = create_schema_callback_with_output_config(f, output_field_config)
+
+        def error_callback(e: Exception) -> list:
+            logger.warning(e)
+
+            self.node_settings.setup_errors = True
+            return []
+
+        self._schema_callback = SingleExecutionFuture(f, error_callback)
+
+    @property
+    def executor(self) -> NodeExecutor:
+        """Lazy-initialized executor instance.
+
+        Reusing the same executor avoids object creation overhead
+        when execute_node is called multiple times.
+        """
+        if self._executor is None:
+            self._executor = NodeExecutor(self)
+        return self._executor
+
+    @property
+    def is_start(self) -> bool:
+        """Determines if the node is a starting node in the flow.
+
+        A starting node requires no inputs.
+
+        Returns:
+            True if the node is a start node, False otherwise.
+        """
+        return not self.has_input and self.node_template.input == 0
+
+    def get_input_type(self, node_id: int) -> list:
+        """Gets the type of connection ('main', 'left', 'right') for a given input node ID.
+
+        Args:
+            node_id: The ID of the input node.
+
+        Returns:
+            A list of connection types for that node ID.
+        """
+        relation_type = []
+        if node_id in [n.node_id for n in self.node_inputs.main_inputs]:
+            relation_type.append("main")
+        if self.node_inputs.left_input is not None and node_id == self.node_inputs.left_input.node_id:
+            relation_type.append("left")
+        if self.node_inputs.right_input is not None and node_id == self.node_inputs.right_input.node_id:
+            relation_type.append("right")
+        return list(set(relation_type))
+
+    def update_node(
+        self,
+        function: Callable,
+        input_columns: list[str] = None,
+        output_schema: list[FlowfileColumn] = None,
+        drop_columns: list[str] = None,
+        name: str = None,
+        setting_input: Any = None,
+        pos_x: float = 0,
+        pos_y: float = 0,
+        schema_callback: Callable = None,
+    ):
+        """Updates the properties of the node.
+
+        This is called during initialization and when settings are changed.
+
+        Args:
+            function: The new core data processing function.
+            input_columns: The new list of input columns.
+            output_schema: The new schema of added columns.
+            drop_columns: The new list of dropped columns.
+            name: The new name for the node.
+            setting_input: The new settings object.
+            pos_x: The new x-coordinate.
+            pos_y: The new y-coordinate.
+            schema_callback: The new custom schema callback function.
+        """
+        self.user_provided_schema_callback = schema_callback
+        self.node_information.y_position = int(pos_y)
+        self.node_information.x_position = int(pos_x)
+        self.node_information.setting_input = setting_input
+        self.name = self.node_type if name is None else name
+        self._function = function
+
+        self.node_schema.input_columns = [] if input_columns is None else input_columns
+        self.node_schema.output_columns = [] if output_schema is None else output_schema
+        self.node_schema.drop_columns = [] if drop_columns is None else drop_columns
+        self.node_settings.renew_schema = True
+        if hasattr(setting_input, "cache_results"):
+            self.node_settings.cache_results = setting_input.cache_results
+
+        self.results.errors = None
+        self._last_run_error = None
+        self.add_lead_to_in_depend_source()
+        _ = self.hash
+        self.node_template = node_store.node_dict.get(self.node_type)
+        if self.node_template is None:
+            raise Exception(f"Node template {self.node_type} not found")
+        self.node_default = node_store.node_defaults.get(self.node_type)
+        self.setting_input = setting_input  # wait until the end so that the hash is calculated correctly
+
+    @property
+    def name(self) -> str:
+        """Gets the name of the node.
+
+        Returns:
+            The node's name.
+        """
+        return self._name
+
+    @name.setter
+    def name(self, name: str):
+        """Sets the name of the node.
+
+        Args:
+            name: The new name.
+        """
+        self._name = name
+        self.__name__ = name
+
+    @property
+    def setting_input(self) -> Any:
+        """Gets the node's specific configuration settings.
+
+        Returns:
+            The settings object.
+        """
+        return self._setting_input
+
+    @setting_input.setter
+    def setting_input(self, setting_input: Any):
+        """Sets the node's configuration and triggers a reset if necessary.
+
+        Args:
+            setting_input: The new settings object.
+        """
+        is_manual_input = (
+            self.node_type == "manual_input"
+            and isinstance(setting_input, input_schema.NodeManualInput)
+            and isinstance(self._setting_input, input_schema.NodeManualInput)
+        )
+        if is_manual_input:
+            _ = self.hash
+        self._setting_input = setting_input
+        if hasattr(setting_input, "cache_results"):
+            self.node_settings.cache_results = setting_input.cache_results
+        self.set_node_information()
+        if is_manual_input:
+            if self.hash != self.calculate_hash(setting_input) or not self.node_stats.has_run_with_current_setup:
+                self.function = FlowDataEngine(setting_input.raw_data_format)
+                self.reset()
+                self.get_predicted_schema()
+        elif self._setting_input is not None:
+            self.reset()
+
+    @property
+    def node_id(self) -> str | int:
+        """Gets the unique identifier of the node.
+
+        Returns:
+            The node's ID.
+        """
+        return self.node_information.id
+
+    @property
+    def left_input(self) -> Optional["FlowNode"]:
+        """Gets the node connected to the left input port.
+
+        Returns:
+            The left input FlowNode, or None.
+        """
+        return self.node_inputs.left_input
+
+    @property
+    def right_input(self) -> Optional["FlowNode"]:
+        """Gets the node connected to the right input port.
+
+        Returns:
+            The right input FlowNode, or None.
+        """
+        return self.node_inputs.right_input
+
+    @property
+    def main_input(self) -> list["FlowNode"]:
+        """Gets the list of nodes connected to the main input port(s).
+
+        Returns:
+            A list of main input FlowNodes.
+        """
+        return self.node_inputs.main_inputs
+
+    @property
+    def accepts_dynamic_inputs(self) -> bool:
+        """True when this node's connections are keyed by target handle (run_flow)."""
+        # node_template is assigned late in update_node; hash calculation runs before it.
+        template = getattr(self, "node_template", None)
+        return template is not None and bool(getattr(template, "dynamic_inputs", False))
+
+    @property
+    def is_correct(self) -> bool:
+        """Checks if the node's input connections satisfy its template requirements.
+
+        Returns:
+            True if connections are valid, False otherwise.
+        """
+        if isinstance(self.setting_input, input_schema.NodePromise):
+            return False
+        connected = len(self.node_inputs.get_all_inputs())
+        min_inputs = self.node_template.min_inputs
+        # Trailing inputs are optional, but the data input must be wired or a gate's control frame passes as data.
+        min_inputs_satisfied = (
+            min_inputs is not None
+            and min_inputs <= connected <= self.node_template.input
+            and bool(self.node_inputs.main_inputs)
+        )
+        return (
+            self.node_template.input == connected
+            or min_inputs_satisfied
+            or (self.node_template.multi and connected > 0)
+            or (self.node_template.multi and self.node_template.can_be_start)
+            or self.accepts_dynamic_inputs
+        )
+
+    def set_node_information(self):
+        """Populates the `node_information` attribute with the current state.
+
+        This includes the node's connections, settings, and position.
+        """
+        node_information = self.node_information
+        node_information.left_input_id = self.node_inputs.left_input.node_id if self.left_input else None
+        node_information.right_input_id = self.node_inputs.right_input.node_id if self.right_input else None
+        node_information.input_ids = (
+            [mi.node_id for mi in self.node_inputs.main_inputs] if self.node_inputs.main_inputs is not None else None
+        )
+        node_information.setting_input = self.setting_input
+        node_information.outputs, node_information.output_handles = self._output_edges()
+        if self.accepts_dynamic_inputs and self.node_inputs.keyed_inputs:
+            source_handles = self.node_inputs.keyed_source_handles or {}
+            node_information.input_connections = [
+                schemas.FlowfileInputConnection(
+                    from_id=source.node_id,
+                    input_handle=handle,
+                    source_handle=source_handles.get(handle, DEFAULT_OUTPUT_HANDLE),
+                )
+                for handle, source in self.node_inputs.slot_items()
+            ]
+        else:
+            node_information.input_connections = None
+        user_description = self.setting_input.description if hasattr(self.setting_input, "description") else ""
+        if user_description:
+            node_information.description = user_description
+        elif hasattr(self.setting_input, "get_default_description"):
+            node_information.description = self.setting_input.get_default_description()
+        else:
+            node_information.description = ""
+        node_information.node_reference = (
+            self.setting_input.node_reference if hasattr(self.setting_input, "node_reference") else None
+        )
+        node_information.is_setup = self.is_setup
+        node_information.x_position = self.setting_input.pos_x
+        node_information.y_position = self.setting_input.pos_y
+        node_information.group_id = getattr(self.setting_input, "group_id", None)
+        node_information.type = self.node_type
+
+    def _incoming_edges(self) -> list[tuple["FlowNode", str]]:
+        """``(source node, source output handle)`` for every connected input slot, one entry per edge."""
+        inputs = self.node_inputs
+        if self.accepts_dynamic_inputs:
+            source_handles = inputs.keyed_source_handles or {}
+            return [
+                (source, source_handles.get(handle, DEFAULT_OUTPUT_HANDLE)) for handle, source in inputs.slot_items()
+            ]
+        return [
+            (source, self._input_output_handles.get(source.node_id, DEFAULT_OUTPUT_HANDLE))
+            for source in inputs.get_all_inputs()
+        ]
+
+    def _output_edges(self) -> tuple[list[int], list[str]]:
+        """Target ids and parallel source handles of every outgoing edge, sorted by (target, handle).
+
+        Read from the targets' input slots, which is what a graph rebuild reproduces;
+        ``leads_to_nodes`` only says which targets to look at, so a stale entry there can
+        never surface as a phantom edge in a snapshot or a saved file.
+        """
+        edges: list[tuple[int, str]] = []
+        visited: set[int] = set()
+        for target in self.leads_to_nodes:
+            if id(target) in visited:
+                continue
+            visited.add(id(target))
+            edges.extend(
+                (target.node_id, handle)
+                for source, handle in target._incoming_edges()
+                if source.node_id == self.node_id
+            )
+        edges.sort()
+        return [target_id for target_id, _ in edges], [handle for _, handle in edges]
+
+    def _reads_from(self, node_id: int) -> bool:
+        """True when any input slot is still fed by node ``node_id``."""
+        return any(source.node_id == node_id for source in self.node_inputs.get_all_inputs())
+
+    def _forget_source_handle(self, node_id: int) -> None:
+        """Drop the remembered output handle of ``node_id`` once no input slot reads from it."""
+        if not self._reads_from(node_id):
+            self._input_output_handles.pop(node_id, None)
+
+    def _link_source(self, from_node: "FlowNode", output_handle: str, main: bool) -> None:
+        """Bookkeeping for a static edge that now feeds this node: reverse link, handle, dependency, resets."""
+        from_node.leads_to_nodes.append(self)
+        self._input_output_handles[from_node.node_id] = output_handle
+        settings = self.setting_input
+        if main and settings.is_setup and hasattr(settings, "depending_on_id"):
+            settings.depending_on_id = from_node.node_id
+        self.reset()
+        from_node.reset()
+
+    def get_node_information(self) -> schemas.NodeInformation:
+        """Updates and returns the node's information object.
+
+        Returns:
+            The `NodeInformation` object for this node.
+        """
+        self.set_node_information()
+        return self.node_information
+
+    @property
+    def function(self) -> Callable:
+        """Gets the core processing function of the node.
+
+        Returns:
+            The callable function.
+        """
+        return self._function
+
+    @function.setter
+    def function(self, function: Callable):
+        """Sets the core processing function of the node.
+
+        Args:
+            function: The new callable function.
+        """
+        self._function = function
+
+    @property
+    def all_inputs(self) -> list["FlowNode"]:
+        """Gets a list of all nodes connected to any input port.
+
+        Returns:
+            A list of all input FlowNodes.
+        """
+        return self.node_inputs.get_all_inputs()
+
+    def check_upstream_laziness(self) -> tuple[bool, list[str]]:
+        """Check whether all upstream dependencies of this node support lazy execution.
+
+        Walks the DAG backwards from this node (excluding itself) and reports
+        any eager or conditional nodes that would prevent a lazy/optimized
+        execution path.
+
+        Returns:
+            A tuple of (is_lazy, reasons).  ``is_lazy`` is True when every
+            upstream node has ``laziness == "lazy"``.
+        """
+        visited: set[FlowNode] = set()
+        stack = list(self.all_inputs)
+        reasons: list[str] = []
+
+        while stack:
+            current = stack.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+
+            if isinstance(current.setting_input, input_schema.NodeCatalogReader):
+                if current.setting_input.is_virtual_optimized is False:
+                    reasons.append(
+                        f"Node '{current.node_template.name}' (id={current.node_id}) reads a "
+                        "non-optimized virtual table"
+                    )
+            else:
+                laziness: schemas.LazinessLiteral = current.node_template.laziness
+                if laziness == "eager":
+                    reasons.append(f"Node '{current.node_template.name}' (id={current.node_id}) is eager")
+                elif laziness == "conditional":
+                    # TODO: resolve conditional nodes by isinstance like catalog_reader, then raise ValueError here.
+                    reasons.append(
+                        f"Node '{current.node_template.name}' (id={current.node_id}) is conditional"
+                        " — defaulting to non-optimized"
+                    )
+
+            stack.extend(current.all_inputs)
+        return len(reasons) == 0, reasons
+
+    def calculate_hash(self, setting_input: Any) -> str:
+        """Calculates a hash based on settings and input node hashes.
+
+        Args:
+            setting_input: The node's settings object to be included in the hash.
+
+        Returns:
+            A string hash value.
+        """
+        if self.accepts_dynamic_inputs:
+            # Fold in both handles so rewiring an upstream to another named input invalidates caches.
+            source_handles = self.node_inputs.keyed_source_handles or {}
+            depends_on_hashes = [
+                f"{handle}:{source_handles.get(handle, DEFAULT_OUTPUT_HANDLE)}:{_node.hash}"
+                for handle, _node in self.node_inputs.slot_items()
+            ]
+        else:
+            depends_on_hashes = [_node.hash for _node in self.all_inputs]
+        node_data_hash = get_hash(_settings_for_hash(setting_input))
+        return get_hash(depends_on_hashes + [node_data_hash, self.parent_uuid, self._cache_epoch])
+
+    @property
+    def hash(self) -> str:
+        """Gets the cached hash for the node, calculating it if it doesn't exist.
+
+        Returns:
+            The string hash value.
+        """
+        if not self._hash:
+            self._hash = self.calculate_hash(self.setting_input)
+        return self._hash
+
+    def add_node_connection(
+        self,
+        from_node: "FlowNode",
+        insert_type: Literal["main", "left", "right"] = "main",
+        output_handle: str = DEFAULT_OUTPUT_HANDLE,
+        target_handle: str | None = None,
+    ) -> None:
+        """Adds a connection from a source node to this node.
+
+        Every edge is exactly one input-slot entry plus one ``leads_to_nodes`` entry on its
+        source. A single-source slot (single main, left, right) already fed by this edge is
+        left as is; one fed by another source is replaced, and that source stops leading
+        here. A multi-input node's main inputs are positional, so the same source can be
+        added more than once (e.g. a polars_code self-join reads it as two inputs).
+
+        Args:
+            from_node: The node to connect from.
+            insert_type: The type of input to connect to ('main', 'left', 'right').
+            output_handle: The output handle on the source node (e.g. 'output-0', 'output-1').
+            target_handle: For dynamic-input nodes only: the target handle the edge
+                lands on ('input-0'..'input-N'). Ignored for static nodes.
+
+        Raises:
+            Exception: If the insert_type is invalid.
+        """
+        if self.accepts_dynamic_inputs:
+            self._add_keyed_connection(from_node, target_handle or PARAM_INPUT_HANDLE, output_handle)
+            return
+        inputs = self.node_inputs
+        single_main = self.node_template.input <= 2 or inputs.main_inputs is None
+        if insert_type == "main":
+            occupants = list(inputs.main_inputs or []) if single_main else []
+        elif insert_type == "right":
+            occupants = [inputs.right_input] if inputs.right_input is not None else []
+        elif insert_type == "left":
+            occupants = [inputs.left_input] if inputs.left_input is not None else []
+        else:
+            raise Exception("Cannot find the connection")
+        if [n.node_id for n in occupants] == [from_node.node_id] and (
+            self._input_output_handles.get(from_node.node_id, DEFAULT_OUTPUT_HANDLE) == output_handle
+        ):
+            return
+        for occupant in occupants:
+            occupant.delete_lead_to_node(self.node_id)
+        if insert_type == "main":
+            if single_main:
+                inputs.main_inputs = [from_node]
+            else:
+                inputs.main_inputs.append(from_node)
+        elif insert_type == "right":
+            inputs.right_input = from_node
+        else:
+            inputs.left_input = from_node
+        for occupant in occupants:
+            self._forget_source_handle(occupant.node_id)
+        self._link_source(from_node, output_handle, main=insert_type == "main")
+
+    def input_edge_handle(self, source_id: int, connection_class: str) -> str | None:
+        """The source output handle of the edge ``source_id -> connection_class``, or None when there is none."""
+        inputs = self.node_inputs
+        if self.accepts_dynamic_inputs:
+            if not inputs.keyed_connection_exists(connection_class, source_id):
+                return None
+            return (inputs.keyed_source_handles or {}).get(connection_class, DEFAULT_OUTPUT_HANDLE)
+        slots = {"input-0": inputs.main_inputs or [], "input-1": [inputs.right_input], "input-2": [inputs.left_input]}
+        if not any(node is not None and node.node_id == source_id for node in slots.get(connection_class, [])):
+            return None
+        return self._input_output_handles.get(source_id, DEFAULT_OUTPUT_HANDLE)
+
+    def replace_input_source(
+        self,
+        old_source: "FlowNode",
+        new_source: "FlowNode",
+        connection_class: str = "input-0",
+        output_handle: str = DEFAULT_OUTPUT_HANDLE,
+    ) -> bool:
+        """Swap the source of one existing edge in place; False when ``old_source`` does not feed that slot.
+
+        The edge keeps its slot and its position: a multi-input node's main input stays at the
+        same index (``input_df_N`` and union order are unchanged) and a keyed dynamic-input edge
+        keeps its handle. Removing the edge and connecting the new source would append it instead.
+        """
+        if self.input_edge_handle(old_source.node_id, connection_class) is None:
+            return False
+        if self.accepts_dynamic_inputs:
+            self._add_keyed_connection(new_source, connection_class, output_handle)
+            return True
+        inputs = self.node_inputs
+        if connection_class == "input-1":
+            inputs.right_input = new_source
+        elif connection_class == "input-2":
+            inputs.left_input = new_source
+        else:
+            index = next(i for i, node in enumerate(inputs.main_inputs) if node.node_id == old_source.node_id)
+            inputs.main_inputs[index] = new_source
+        old_source.delete_lead_to_node(self.node_id)
+        self._forget_source_handle(old_source.node_id)
+        self._link_source(new_source, output_handle, main=connection_class == "input-0")
+        return True
+
+    def _add_keyed_connection(self, from_node: "FlowNode", target_handle: str, output_handle: str) -> None:
+        """Attach *from_node* to a specific handle of a dynamic-input node.
+
+        Replace-if-occupied (permissive) so load/restore/remap paths never fail;
+        the connect API rejects occupied handles before calling this.
+        """
+        inputs = self.node_inputs
+        if inputs.keyed_inputs is None:
+            inputs.keyed_inputs = {}
+            inputs.keyed_source_handles = {}
+        existing = inputs.keyed_inputs.get(target_handle)
+        if existing is not None:
+            existing.delete_lead_to_node(self.node_id)
+            if not any(n is existing for h, n in inputs.keyed_inputs.items() if h != target_handle):
+                self._input_output_handles.pop(existing.node_id, None)
+        from_node.leads_to_nodes.append(self)
+        inputs.keyed_inputs[target_handle] = from_node
+        inputs.keyed_source_handles[target_handle] = output_handle
+        # Legacy readers key by source id, ambiguous for one source on two handles; keyed_source_handles wins.
+        self._input_output_handles[from_node.node_id] = output_handle
+        inputs.rebuild_keyed_projection()
+        self.reset()
+        from_node.reset()
+
+    def _delete_keyed_connection(self, node_id: int, handle: str | None, complete: bool) -> bool:
+        """Remove keyed connection(s) fed by *node_id*; all of them when *complete*."""
+        inputs = self.node_inputs
+        if not inputs.keyed_inputs:
+            return False
+        if complete:
+            handles = [h for h, n in inputs.keyed_inputs.items() if n.node_id == node_id]
+        else:
+            handles = [handle] if inputs.keyed_connection_exists(handle, node_id) else []
+        if not handles:
+            return False
+        for h in handles:
+            inputs.keyed_inputs.pop(h, None)
+            if inputs.keyed_source_handles:
+                inputs.keyed_source_handles.pop(h, None)
+        if not any(n.node_id == node_id for n in inputs.keyed_inputs.values()):
+            self._input_output_handles.pop(node_id, None)
+        inputs.rebuild_keyed_projection()
+        self.reset()
+        return True
+
+    def remap_dynamic_inputs(self, mapping: dict[str, str | None]) -> dict[str, list[str]]:
+        """Re-key keyed connections after the node's input slots changed.
+
+        Args:
+            mapping: old handle -> new handle, or None to drop that connection.
+                Handles absent from the mapping keep their key.
+
+        Returns:
+            {"moved": [...], "dropped": [...]} describing what happened, so the
+            API layer can surface removed connections to the UI.
+        """
+        inputs = self.node_inputs
+        if not inputs.keyed_inputs:
+            return {"moved": [], "dropped": []}
+        moved: list[str] = []
+        dropped: list[str] = []
+        new_inputs: dict[str, FlowNode] = {}
+        new_source_handles: dict[str, str] = {}
+        for handle, node in inputs.keyed_inputs.items():
+            new_handle = mapping.get(handle, handle)
+            if new_handle is None:
+                dropped.append(handle)
+                node.delete_lead_to_node(self.node_id)
+                continue
+            if new_handle != handle:
+                moved.append(f"{handle}->{new_handle}")
+            new_inputs[new_handle] = node
+            new_source_handles[new_handle] = (inputs.keyed_source_handles or {}).get(handle, DEFAULT_OUTPUT_HANDLE)
+        inputs.keyed_inputs = new_inputs
+        inputs.keyed_source_handles = new_source_handles
+        remaining_ids = {n.node_id for n in new_inputs.values()}
+        for node_id in list(self._input_output_handles):
+            if node_id not in remaining_ids:
+                self._input_output_handles.pop(node_id, None)
+        inputs.rebuild_keyed_projection()
+        self.reset()
+        return {"moved": moved, "dropped": dropped}
+
+    def evaluate_nodes(self, deep: bool = False) -> None:
+        """Triggers a state reset for all directly connected downstream nodes.
+
+        Args:
+            deep: If True, the reset propagates recursively through the entire downstream graph.
+        """
+        for node in self.leads_to_nodes:
+            self.print(f"resetting node: {node.node_id}")
+            node.reset(deep)
+
+    def get_flow_file_column_schema(self, col_name: str) -> FlowfileColumn | None:
+        """Retrieves the schema for a specific column from the output schema.
+
+        Args:
+            col_name: The name of the column.
+
+        Returns:
+            The FlowfileColumn object for that column, or None if not found.
+        """
+        for s in self.schema:
+            if s.column_name == col_name:
+                return s
+
+    def get_predicted_schema(self, force: bool = False) -> list[FlowfileColumn] | None:
+        """Predicts the output schema of the node without full execution.
+
+        It uses the schema_callback or infers from predicted data.
+
+        Args:
+            force: If True, forces recalculation even if a predicted schema exists.
+
+        Returns:
+            A list of FlowfileColumn objects representing the predicted schema.
+        """
+        _has_output_field_config = (
+            hasattr(self._setting_input, "output_field_config") and self._setting_input.output_field_config is not None
+            if self._setting_input
+            else False
+        )
+        logger.info(
+            f"get_predicted_schema: node_id={self.node_id}, node_type={self.node_type}, force={force}, "
+            f"has_predicted_schema={self.node_schema.predicted_schema is not None}, "
+            f"has_schema_callback={self.schema_callback is not None}, "
+            f"has_output_field_config={_has_output_field_config}"
+        )
+
+        if self.node_schema.predicted_schema and not force:
+            logger.debug(f"get_predicted_schema: node_id={self.node_id} - returning cached predicted_schema")
+            return self.node_schema.predicted_schema
+
+        if self.schema_callback is not None and (self.node_schema.predicted_schema is None or force):
+            self.print("Getting the data from a schema callback")
+            logger.info(f"get_predicted_schema: node_id={self.node_id} - invoking schema_callback")
+            if force:
+                # Force the schema callback to reset, so that it will be executed again
+                logger.debug(f"get_predicted_schema: node_id={self.node_id} - forcing schema_callback reset")
+                self.schema_callback.reset()
+
+            try:
+                schema = self.schema_callback()
+                logger.info(
+                    f"get_predicted_schema: node_id={self.node_id} - schema_callback returned "
+                    f"{len(schema) if schema else 0} columns: {[c.name for c in schema] if schema else []}"
+                )
+            except Exception as e:
+                logger.error(f"get_predicted_schema: node_id={self.node_id} - schema_callback raised exception: {e}")
+                schema = None
+
+            if schema is not None and len(schema) > 0:
+                self.print("Calculating the schema based on the schema callback")
+                self.node_schema.predicted_schema = schema
+                logger.info(f"get_predicted_schema: node_id={self.node_id} - set predicted_schema from schema_callback")
+                return self.node_schema.predicted_schema
+            else:
+                logger.warning(
+                    f"get_predicted_schema: node_id={self.node_id} - schema_callback returned empty/None schema"
+                )
+        else:
+            logger.debug(f"get_predicted_schema: node_id={self.node_id} - no schema_callback available")
+
+        if self._schema_prediction_blocked is None and (self._prediction_requires_data or self._executes_on_kernel):
+            self._schema_prediction_blocked = kernel_block_reason(self, include_self=True)
+        if self._schema_prediction_blocked:
+            # Never run an un-run kernel node to predict; warn and skip the exec tier.
+            self.results.warnings = self._schema_prediction_blocked
+            return self.node_schema.predicted_schema
+
+        logger.debug(f"get_predicted_schema: node_id={self.node_id} - falling back to _predicted_data_getter")
+        # Without a callback, prediction runs the node's real function; concurrent callers must not run it twice.
+        with self._execution_lock:
+            if self.node_schema.predicted_schema and not force:
+                return self.node_schema.predicted_schema
+            predicted_data = self._predicted_data_getter()
+            if predicted_data is not None and predicted_data.schema is not None:
+                self.print("Calculating the schema based on the predicted resulting data")
+                logger.info(
+                    f"get_predicted_schema: node_id={self.node_id} - using schema from predicted_data "
+                    f"({len(predicted_data.schema)} columns)"
+                )
+                self.node_schema.predicted_schema = predicted_data.schema
+            else:
+                logger.warning(
+                    f"get_predicted_schema: node_id={self.node_id} - no schema available from any source "
+                    f"(predicted_data={'None' if predicted_data is None else 'has_data'}, "
+                    f"schema={'None' if predicted_data is None or predicted_data.schema is None else 'has_schema'})"
+                )
+
+        return self.node_schema.predicted_schema
+
+    @property
+    def is_setup(self) -> bool:
+        """Checks if the node has been properly configured and is ready for execution.
+
+        Returns:
+            True if the node is set up, False otherwise.
+        """
+        if not self.node_information.is_setup:
+            if self.function.__name__ != "placeholder":
+                self.node_information.is_setup = True
+                self.setting_input.is_setup = True
+        return self.node_information.is_setup
+
+    def print(self, v: Any):
+        """Helper method to log messages with node context.
+
+        Args:
+            v: The message or value to log.
+        """
+        logger.info(f"{self.node_type}, node_id: {self.node_id}: {v}")
+
+    def get_output(self, handle: str = DEFAULT_OUTPUT_HANDLE) -> FlowDataEngine | None:
+        """Get the result for a specific output handle.
+
+        For nodes with multiple outputs (e.g. kernel-based custom nodes),
+        returns the FlowDataEngine associated with the given handle.
+        Falls back to the default ``results.resulting_data`` for single-output nodes.
+
+        Args:
+            handle: The output handle identifier (e.g. ``"output-0"``, ``"output-1"``).
+
+        Returns:
+            The FlowDataEngine for the requested output, or None.
+        """
+        self.get_resulting_data()
+        if handle in self._named_outputs:
+            return self._named_outputs[handle]
+        return self.results.resulting_data
+
+    def _resolve_input_result(self, input_node: "FlowNode") -> FlowDataEngine | None:
+        """Resolve the correct output from an input node based on connection handle.
+
+        Args:
+            input_node: The upstream node to get data from.
+
+        Returns:
+            The FlowDataEngine from the appropriate output handle.
+        """
+        handle = self._input_output_handles.get(input_node.node_id, DEFAULT_OUTPUT_HANDLE)
+        return self._resolve_input_result_for_handle(input_node, handle)
+
+    @staticmethod
+    def _resolve_input_result_for_handle(input_node: "FlowNode", handle: str) -> FlowDataEngine | None:
+        if handle != DEFAULT_OUTPUT_HANDLE:
+            # get_output executes first, then routes by handle, so it works before _named_outputs fills.
+            return input_node.get_output(handle)
+        return input_node.get_resulting_data()
+
+    def _slot_input_pairs(self) -> list[tuple[Optional["FlowNode"], str]]:
+        """Positional inputs for the node function, as (source_node, source_handle).
+
+        Static nodes: one pair per connected input, in canvas handle order
+        (input-0, input-1, input-2 -> main, right, left). ``all_inputs`` yields
+        main + [left, right], which swaps the last two for a 3-input node — the
+        canvas labels the handles top-to-bottom, so the arguments must follow.
+        Dynamic-input nodes: index i corresponds to handle ``input-i`` (0 = the
+        parameter handle); unconnected slots yield ``(None, DEFAULT_OUTPUT_HANDLE)``
+        so the function signature stays positional with gaps preserved.
+        """
+        if not self.accepts_dynamic_inputs:
+            ordered = [
+                *(self.node_inputs.main_inputs or []),
+                self.node_inputs.right_input,
+                self.node_inputs.left_input,
+            ]
+            return [
+                (node, self._input_output_handles.get(node.node_id, DEFAULT_OUTPUT_HANDLE))
+                for node in ordered
+                if node is not None
+            ]
+        keyed = self.node_inputs.keyed_inputs or {}
+        source_handles = self.node_inputs.keyed_source_handles or {}
+        max_index = len(getattr(self.setting_input, "input_slots", None) or [])
+        for handle in keyed:
+            max_index = max(max_index, input_handle_index(handle))
+        pairs: list[tuple[FlowNode | None, str]] = []
+        for i in range(max_index + 1):
+            handle = input_handle(i)
+            pairs.append((keyed.get(handle), source_handles.get(handle, DEFAULT_OUTPUT_HANDLE)))
+        return pairs
+
+    @contextmanager
+    def _execution_lock_held(self, poll: float = 0.25) -> Generator[None, None, None]:
+        """Hold this node's own ``_execution_lock`` while staying cancellable.
+
+        A plain ``with self._execution_lock`` blocks uninterruptibly, so a cancel
+        request issued while another thread is slowly materializing this node
+        (single-flight contention) would never be observed. Poll the acquire and
+        re-check the cancel flag so ``flow.cancel()`` can break a hung/slow collect.
+        ``RLock.acquire(timeout=...)`` still returns immediately for the owning
+        thread, so same-thread reentrancy (recursion through
+        ``_resolve_input_result_for_handle``) is preserved.
+        """
+        while not self._execution_lock.acquire(timeout=poll):
+            if self._cancel_requested():
+                # Without the lock, writing results.errors races the holder; the executor records the cancel.
+                raise Exception("Node execution canceled")
+        try:
+            yield
+        finally:
+            self._execution_lock.release()
+
+    def _cancel_requested(self) -> bool:
+        """Whether this node's run was cancelled, by ``cancel()`` or by its flow.
+
+        ``FlowGraph.cancel`` flags the flow and then every node, but a node that starts executing right after
+        clears its own flag in ``_prepare_for_execution``, so the flow's flag is read too; it is folded back onto
+        the node, so the executor records the cancel instead of a failure.
+        """
+        if not self._execution_state.is_canceled and self._flow_canceled is not None and self._flow_canceled():
+            self._execution_state.is_canceled = True
+            self.node_stats.is_canceled = True
+        return self._execution_state.is_canceled
+
+    @contextmanager
+    def _in_execution_context(self) -> Generator[None, None, None]:
+        """Run the block in the execution context of the node's graph, when the graph gave the node one.
+
+        During a run that is the run's context. Outside one (a FlowFrame's build-time read, a schema prediction) it
+        is the graph's own, so the bounded reads the node's function makes through ``current_context()`` run where
+        the graph runs: in core for a local graph, on the default backend for a remote one.
+        """
+        if self._execution_context_getter is None:
+            yield
+            return
+        with use_context(self._execution_context_getter()):
+            yield
+
+    def get_resulting_data(self) -> FlowDataEngine | None:
+        """Executes the node's function to produce the actual output data.
+
+        Handles both regular functions and external data sources.
+        Thread-safe and single-flight: the node's own ``_execution_lock`` ensures
+        the function runs at most once and the result is memoized, so N downstream
+        consumers materialize it once. A node acquires only its OWN lock; upstream
+        inputs are read through each upstream's own ``get_resulting_data()``, so
+        lock acquisition always follows the DAG (a node -> its parents) and cannot
+        form a cross-node cycle.
+
+        Returns:
+            A FlowDataEngine instance containing the result, or None on error.
+
+        Raises:
+            Exception: Propagates exceptions from the node's function execution. While the last run's failure
+                stands (``results.errors`` set), every read raises that exception, never the frame built before it.
+        """
+        if self.is_setup:
+            with self._execution_lock_held():
+                if self._last_run_error is not None and self.results.errors is not None:
+                    raise self._last_run_error
+                if self.results.resulting_data is None and self.results.errors is None:
+                    if self.deferred_until_run:
+                        raise DeferredNodeError(f"node {self.node_id} is deferred until the flow runs")
+                    self.print("getting resulting data")
+                    # Drop handles from a previous run; multi-output nodes repopulate them below.
+                    self._named_outputs = {}
+                    try:
+                        if self._cancel_requested():
+                            raise Exception("Node execution canceled")
+                        if isinstance(self.function, FlowDataEngine):
+                            fl: FlowDataEngine = self.function
+                        elif self.node_type == "external_source":
+                            with self._in_execution_context():
+                                fl: FlowDataEngine = self.function()
+                            fl.collect_external()
+                            self.node_settings.streamable = False
+                        else:
+                            self.print("Collecting input data from all inputs")
+                            input_data = []
+                            for i, (v, src_handle) in enumerate(self._slot_input_pairs()):
+                                if v is None:
+                                    input_data.append(None)
+                                    continue
+                                if self._cancel_requested():
+                                    raise Exception("Node execution canceled")
+                                if (v.node_id, src_handle) in self._skipped_input_ids_this_run:
+                                    # gated-off inputs are dropped: the union outputs only what ran
+                                    continue
+                                self.print(f"Getting resulting data from input {i} (node {v.node_id})")
+                                # Never take an input's lock here: in slot order it deadlocked siblings (AB-BA).
+                                edge = self._boundary_inputs.get((v.node_id, src_handle))
+                                if edge is not None:
+                                    input_result = edge.cross()
+                                else:
+                                    input_result = self._resolve_input_result_for_handle(v, src_handle)
+                                if input_result is not None:
+                                    # A private view: functions mutate or pass on inputs that siblings share.
+                                    input_result = input_result.shallow_copy()
+                                # Truthiness on a FlowDataEngine hits __len__ -> collect(); keep it "is not None".
+                                _df_type = type(input_result.data_frame) if input_result is not None else "None"
+                                self.print(f"Input {i} data type: {type(input_result)}, dataframe type: {_df_type}")
+                                input_data.append(input_result)
+                            self.print(f"All {len(input_data)} inputs collected, calling node function")
+                            with self._in_execution_context():
+                                fl = self._function(*input_data)
+                        if isinstance(fl, NamedOutputs):
+                            self._named_outputs = fl.by_handle()
+                            self._named_schemas = {h: e.schema for h, e in self._named_outputs.items()}
+                            for v in self._named_outputs.values():
+                                v.set_streamable(self.node_settings.streamable)
+                            # Handle-less consumers read the first output; output_field_config applies to it only.
+                            fl = self._named_outputs[DEFAULT_OUTPUT_HANDLE]
+                        else:
+                            fl.set_streamable(self.node_settings.streamable)
+
+                        if (
+                            hasattr(self._setting_input, "output_field_config")
+                            and self._setting_input.output_field_config
+                        ):
+                            try:
+                                fl = apply_output_field_config(fl, self._setting_input.output_field_config)
+                            except Exception as e:
+                                logger.error(f"Error applying output field config for node {self.node_id}: {e}")
+                                raise
+
+                        self.results.resulting_data = fl
+                        self.node_schema.result_schema = fl.schema
+                    except Exception as e:
+                        self.results.resulting_data = FlowDataEngine()
+                        self.results.errors = str(e)
+                        self._last_run_error = e
+                        self.node_stats.has_run_with_current_setup = False
+                        self.node_stats.has_completed_last_run = False
+                        raise e
+                return self.results.resulting_data
+
+    def _predicted_data_getter(self) -> FlowDataEngine | None:
+        """Internal helper to get a predicted data result.
+
+        This calls the function with predicted data from input nodes.
+        If flow_parameters is set, ${...} references in setting_input are resolved
+        temporarily so that nodes like polars_code produce a correct predicted schema.
+
+        Returns:
+            A FlowDataEngine instance with predicted data, or an empty one on error.
+
+        Raises:
+            DeferredNodeError: The node is deferred until the flow runs.
+        """
+        if self.deferred_until_run:
+            raise DeferredNodeError(f"node {self.node_id} is deferred until the flow runs")
+        restorations = []
+        flow_params = self._params_getter() if self._params_getter else {}
+        if flow_params:
+            try:
+                restorations = apply_parameters_in_place(self.setting_input, flow_params)
+            except ValueError:
+                # Unresolved parameters during lazy eval are non-fatal; just run without substitution
+                restorations = []
+        try:
+            predicted_inputs = [
+                (v.get_predicted_resulting_data(src_handle) if v is not None else None)
+                for v, src_handle in self._slot_input_pairs()
+            ]
+            with self._in_execution_context():
+                fl = self._function(*predicted_inputs)
+            fl = self._as_default_output(fl)
+
+            # As get_resulting_data does, so the prediction reflects output_field_config.
+            if hasattr(self._setting_input, "output_field_config") and self._setting_input.output_field_config:
+                if self._setting_input.output_field_config.enabled:
+                    fl = apply_output_field_config(fl, self._setting_input.output_field_config)
+
+            return fl
+        except ValueError as e:
+            if str(e) == "generator already executing":
+                logger.info("Generator already executing, waiting for the result")
+                sleep(1)
+                return self._predicted_data_getter()
+            fl = FlowDataEngine()
+            return fl
+
+        except Exception as e:
+            logger.warning("there was an issue with the function, returning an empty Flowfile")
+            logger.warning(e)
+        finally:
+            if restorations:
+                restore_parameters(restorations)
+
+    def get_predicted_resulting_data(self, handle: str = DEFAULT_OUTPUT_HANDLE) -> FlowDataEngine:
+        """Creates a `FlowDataEngine` instance based on the predicted schema.
+
+        This avoids executing the node's full logic. For multi-output nodes the
+        ``handle`` argument selects which output's schema to reflect so that a
+        downstream node wired to e.g. ``output-1`` sees that partition's schema.
+
+        Args:
+            handle: The output handle to reflect. Ignored for single-output nodes.
+
+        Returns:
+            A FlowDataEngine instance with a schema but no data.
+        """
+        # Multi-output: prefer the handle-specific cached schema if we have it.
+        if handle != DEFAULT_OUTPUT_HANDLE and (self._named_schemas or self._named_outputs):
+            schema = self.schema_for_handle(handle)
+            if schema:
+                return FlowDataEngine.create_from_schema(schema)
+
+        # Prediction never depends on the worker: an outage reads as "needs run".
+        try:
+            run_needed = self.needs_run(False)
+        except ComputeError as e:
+            logger.warning(f"Node {self.node_id}: worker not usable, predicting the schema without its cache: {e}")
+            run_needed = True
+        if run_needed and self.schema_callback is not None or self.node_schema.result_schema is not None:
+            self.print("Getting data based on the schema")
+            # The schema callback fills _named_schemas, so check the handle cache again.
+            if self.node_schema.result_schema is None:
+                _s = self.schema_callback()
+                if handle != DEFAULT_OUTPUT_HANDLE and handle in self._named_schemas:
+                    _s = self._named_schemas[handle]
+                if not _s:
+                    # Empty means no declared schema (a hook opting out); use the full prediction ladder.
+                    _s = self.get_predicted_schema()
+                    if handle != DEFAULT_OUTPUT_HANDLE:
+                        # The exec fallback fills the per-handle caches; prefer them.
+                        _s = self.schema_for_handle(handle)
+            else:
+                _s = self.node_schema.result_schema
+            return FlowDataEngine.create_from_schema(_s or [])
+        else:
+            if isinstance(self.function, FlowDataEngine):
+                fl = self.function
+            else:
+                fl = FlowDataEngine.create_from_schema(self.get_predicted_schema())
+            return fl
+
+    def add_lead_to_in_depend_source(self):
+        """Ensures this node is registered in the `leads_to_nodes` list of its inputs."""
+        for input_node in self.all_inputs:
+            if self.node_id not in [n.node_id for n in input_node.leads_to_nodes]:
+                input_node.leads_to_nodes.append(self)
+
+    def get_all_dependent_nodes(self) -> Generator["FlowNode", None, None]:
+        """Yields all downstream nodes recursively.
+
+        Returns:
+            A generator of all dependent FlowNode objects.
+        """
+        for node in self.leads_to_nodes:
+            yield node
+            yield from node.get_all_dependent_nodes()
+
+    def get_all_dependent_node_ids(self) -> Generator[int, None, None]:
+        """Yields the IDs of all downstream nodes recursively.
+
+        Returns:
+            A generator of all dependent node IDs.
+        """
+        for node in self.leads_to_nodes:
+            yield node.node_id
+            yield from node.get_all_dependent_node_ids()
+
+    @property
+    def schema(self) -> list[FlowfileColumn]:
+        """Gets the definitive output schema of the node.
+
+        If not already run, it falls back to the predicted schema.
+
+        Returns:
+            A list of FlowfileColumn objects.
+        """
+        try:
+            if self.is_setup and self.results.errors is None:
+                if self.node_schema.result_schema is not None and len(self.node_schema.result_schema) > 0:
+                    return self.node_schema.result_schema
+                elif self.node_type in ("output", "api_response", "flow_output"):
+                    if len(self.node_inputs.main_inputs) > 0:
+                        self.node_schema.result_schema = self.node_inputs.main_inputs[0].schema
+                else:
+                    self.node_schema.result_schema = self.get_predicted_schema()
+                return self.node_schema.result_schema
+            else:
+                return []
+        except Exception as e:
+            logger.error(e)
+            return []
+
+    def remove_cache(self):
+        """Lets the backend that holds this node's last result drop it (``release_result``).
+
+        Unguarded by ``exists``: a task whose result file is already gone still holds a worker status entry, and
+        that is exactly the case that needs clearing.
+        """
+        self.release_result()
+
+    def release_result(self) -> None:
+        """Releases every result this node minted on the backend that holds it and forgets the references.
+
+        That is its result (``results.result_ref``), the outputs stored beside it (``_store_other_outputs``), its
+        operation's stored outputs (``_operation_refs``) and the results it adopted, each id released once.
+        ``results.model_ref`` is forgotten only when the node fitted that model. One carried onto a combined graph's
+        node is left as it is.
+
+        A failed release (an unreachable backend, one removed or of another version, a refused task) is logged and
+        the reference dropped, never raised, so a close, a delete or a run's end never stops on it.
+        """
+        ref = self.results.result_ref
+        self.results.result_ref = None
+        self.results.job_handle = None
+        stored, self._stored_outputs = list(self._stored_outputs.values()), {}
+        minted, self._operation_refs = list(self._operation_refs.values()), {}
+        adopted, self._adopted_refs = self._adopted_refs, []
+        if self.results.model_ref in minted:
+            self.results.model_ref = None
+        released: set[tuple[str, str]] = set()
+        for held in [ref, *stored, *minted, *adopted]:
+            if held is None or (held.backend_id, held.result_id) in released:
+                continue
+            released.add((held.backend_id, held.result_id))
+            self._release_or_drop(held)
+
+    def _release_or_drop(self, held: ResultRef) -> None:
+        """Release ``held`` on its backend; any failure is logged and the reference dropped."""
+        try:
+            registry.backend(held.backend_id).release(held)
+        except ComputeUnavailable as e:
+            logger.warning(
+                f"Node {self.node_id}: dropped result {held.result_id} without releasing it, "
+                f"backend {held.backend_id!r} cannot be reached: {e}"
+            )
+        except Exception as e:
+            logger.warning(
+                f"Node {self.node_id}: dropped result {held.result_id} without releasing it on backend "
+                f"{held.backend_id!r}: {type(e).__name__}: {e}"
+            )
+
+    def adopt_results(self, other: "FlowNode") -> None:
+        """Takes over every result ``other`` holds, released with this node's own (``release_result``).
+
+        For a ``run_flow`` child graph's node once the child run ended: the parent's output may scan the child's
+        stored results, so they must outlive the child graph.
+        """
+        held = [
+            other.results.result_ref,
+            *other._stored_outputs.values(),
+            *other._operation_refs.values(),
+            *other._adopted_refs,
+        ]
+        other.results.result_ref = None
+        other.results.job_handle = None
+        other._stored_outputs, other._operation_refs, other._adopted_refs = {}, {}, []
+        if other.results.model_ref in held:
+            other.results.model_ref = None
+        self._adopted_refs.extend(ref for ref in held if ref is not None)
+
+    def take_adopted_results(self) -> list[ResultRef]:
+        """Hands over the child results this node adopted so far and holds none; for ``release_superseded``."""
+        adopted, self._adopted_refs = self._adopted_refs, []
+        return adopted
+
+    def release_superseded(self, previous: list[ResultRef]) -> bool:
+        """Releases the results of ``previous`` this node no longer adopts; whether it released any.
+
+        A ``run_flow`` node's child runs under a fresh graph each time, so its stored results come back under new
+        ids. The previous run's go once the new ones are adopted.
+        """
+        kept = {(ref.backend_id, ref.result_id) for ref in self._adopted_refs}
+        released: set[tuple[str, str]] = set()
+        for ref in previous:
+            key = (ref.backend_id, ref.result_id)
+            if key in kept or key in released:
+                continue
+            released.add(key)
+            self._release_or_drop(ref)
+        return bool(released)
+
+    def drop_downstream_results(self) -> None:
+        """Every node downstream releases what it holds and counts as not run with its current setup.
+
+        For a node whose rerun (a preview fetch) just released its operation outputs: they come back under new ids,
+        so a downstream plan built over the old ones can no longer be read.
+        """
+        seen: set[int] = set()
+        stack = list(self.leads_to_nodes)
+        while stack:
+            node = stack.pop()
+            if id(node) in seen:
+                continue
+            seen.add(id(node))
+            node.release_result()
+            node.results.reset()
+            node.node_stats.has_run_with_current_setup = False
+            node.node_stats.has_completed_last_run = False
+            node._execution_state.has_run_with_current_setup = False
+            node._execution_state.has_completed_last_run = False
+            stack.extend(node.leads_to_nodes)
+
+    def release_deferred_result(self) -> None:
+        """Releases the held result if it is a deferred plan, leaving a stored one to whatever scans its file.
+
+        For a graph discarded while what it computed lives on (a ``run_flow`` child's output in its parent's
+        result). A consumer holds a deferred plan itself, so only the backend's copy goes. The node's other stored
+        results stay held, since that plan may scan them.
+        """
+        ref = self.results.result_ref
+        if ref is None or ref.state != "deferred":
+            return
+        self.results.result_ref = None
+        self.results.job_handle = None
+        self._release_or_drop(ref)
+
+    def held_result(self, backend_id: str) -> ResultRef | None:
+        """The result this node holds on backend ``backend_id`` under its current hash, else ``None``."""
+        ref = self.results.result_ref
+        if ref is None or ref.backend_id != backend_id or ref.result_id != self.hash:
+            return None
+        return ref
+
+    def result_backend(self, handle: str = DEFAULT_OUTPUT_HANDLE) -> ComputeBackend | None:
+        """The backend that holds the result of output ``handle``, else ``None``; a plan over it runs there."""
+        held = self.results.result_ref if handle == DEFAULT_OUTPUT_HANDLE else None
+        held = held or self.held_output(handle)
+        return None if held is None else registry.backend(held.backend_id)
+
+    def held_output(self, handle: str) -> ResultRef | None:
+        """The stored result this node holds for its output ``handle``, else ``None``.
+
+        In order: the output stored beside its result (``_store_other_outputs``), the operation output keyed by the
+        handle (a custom node's), else, when the operation answered one output per handle (a random split's, by
+        split name), the one at the handle's position.
+        """
+        ref = self._stored_outputs.get(handle) or self._operation_refs.get(handle)
+        if ref is not None:
+            return ref
+        outputs = list(self._operation_refs.values())
+        if handle in self._named_outputs and len(outputs) == len(self._named_outputs):
+            return outputs[output_handle_index(handle)]
+        return None
+
+    def _held_result_exists(self) -> bool:
+        """Whether the backend that minted this node's result for its current hash still holds it."""
+        ref = self.results.result_ref
+        if ref is None or ref.result_id != self.hash:
+            return False
+        return registry.backend(ref.backend_id).exists(ref)
+
+    def needs_run(self, performance_mode: bool, node_logger: NodeLogger = None) -> bool:
+        """Determines if the node needs to be executed.
+
+        The decision is based on its run state, caching settings, and execution mode. A cached result counts
+        only while the backend that minted it still holds it under the node's current hash.
+
+        Args:
+            performance_mode: True if the flow is in performance mode.
+            node_logger: The logger instance for this node.
+
+        Returns:
+            True if the node should be run, False otherwise.
+        """
+        flow_logger = logger if node_logger is None else node_logger
+        cache_result_exists = self._held_result_exists()
+        if not self.node_stats.has_run_with_current_setup:
+            flow_logger.info("Node has not run, needs to run")
+            return True
+        if self.node_settings.cache_results and cache_result_exists:
+            return False
+        elif self.node_settings.cache_results and not cache_result_exists:
+            return True
+        elif not performance_mode and cache_result_exists:
+            return False
+        else:
+            return True
+
+    def __call__(self, *args, **kwargs):
+        """Makes the node instance callable, acting as an alias for execute_node."""
+        self.execute_node(*args, **kwargs)
+
+    _INFER_SCHEMA_RUNGS = (10_000, 100_000)
+
+    @staticmethod
+    def _is_type_inference_error(error_description: str | None) -> bool:
+        """True when a worker error looks like a CSV schema/type-inference failure worth widening for."""
+        if not error_description:
+            return False
+        lowered = error_description.lower()
+        signatures = ("could not parse", "as dtype", "conversion from", "schemaerror", "computeerror", "infer_schema")
+        return any(sig in lowered for sig in signatures)
+
+    @classmethod
+    def _next_infer_rung(cls, current: int) -> int | None:
+        """Next inference length above ``current`` on the escalation ladder, or None if exhausted."""
+        return min((rung for rung in cls._INFER_SCHEMA_RUNGS if rung > current), default=None)
+
+    def _eligible_infer_length(self) -> int | None:
+        """Configured infer length if this is a CSV read with inference on, else None (ineligible).
+
+        Scoped to file_type == "csv": _escalated_read_frame rebuilds via
+        FlowDataEngine.create_from_path, which has no "json" handler (json reads route
+        through the worker), so an InputJsonTable (a subclass of InputCsvTable) must not
+        be treated as eligible.
+        """
+        if self.node_type != "read":
+            return None
+        received_file = getattr(self.setting_input, "received_file", None)
+        if getattr(received_file, "file_type", None) != "csv":
+            return None
+        table_settings = getattr(received_file, "table_settings", None)
+        if not isinstance(table_settings, input_schema.InputCsvTable):
+            return None
+        if not getattr(table_settings, "infer_schema", True):
+            return None
+        return table_settings.infer_schema_length
+
+    def _escalated_read_frame(self, rung: int) -> FlowDataEngine | None:
+        """Rebuild the read frame at a higher infer_schema_length on a copy (saved setting untouched)."""
+        if self._eligible_infer_length() is None:
+            return None
+        escalated_file = self.setting_input.received_file.model_copy(deep=True)
+        escalated_file.table_settings.infer_schema_length = rung
+        escalated_file.set_absolute_filepath()
+        return FlowDataEngine.create_from_path(escalated_file)
+
+    def _do_execute(self, hints: SubmitHints, preview: bool, node_logger: NodeLogger) -> None:
+        """Builds this node's plan and submits it to the run's backend, which holds the result by its policy.
+
+        The held result becomes ``results.resulting_data`` through ``plan_for``. The preview is the backend's
+        inline sample, else (with *preview*) a sample read when first opened.
+
+        - A ``cache_results`` node whose stored result the backend still holds reads it back instead.
+        - A node holding no result under its hash on this backend first releases what it holds, so a rerun under
+          another hash or backend frees the last generation before minting the next.
+        - A node that read a boundary input stores its other outputs beside its result, releasing all it holds if
+          that fails.
+        - A CSV read whose type inference fails is resubmitted at a higher ``infer_schema_length`` under the same
+          id, so the widened result is the node's held result.
+
+        Raises:
+            ComputeError: From the backend.
+            RemoteExecutionError: The plan failed with an exception class its message names, or a CSV read still
+                failed type inference at the last escalation.
+        """
+        backend = current_context().backend
+        held = self.held_result(backend.id)
+        if held is None:
+            self.release_result()
+        if self.node_settings.cache_results and held is not None and held.state == "materialised":
+            if self._read_stored_result(backend, held, preview, node_logger):
+                return
+
+        engine = self.get_resulting_data()
+        if engine is None:
+            raise RemoteExecutionError("get_resulting_data returned None")
+        result = self._submit(backend, engine, hints, node_logger)
+        self._take_result(backend, result, engine, hints.preview_rows, preview)
+        if self._boundary_inputs:
+            try:
+                self._store_other_outputs(backend, hints, node_logger)
+            except BaseException:
+                self.release_result()
+                raise
+
+    def _store_other_outputs(self, backend: ComputeBackend, hints: SubmitHints, node_logger: NodeLogger) -> None:
+        """Stores each output but the default on ``backend`` beside this node's result, as ``<hash>_<handle>``.
+
+        For a node that read a boundary input: every output then reads a stored result (the default the node's own),
+        so none refers to the import, whose exchange-store object lasts only as long as the run.
+        """
+        if DEFAULT_OUTPUT_HANDLE in self._named_outputs:
+            self._named_outputs[DEFAULT_OUTPUT_HANDLE] = self.results.resulting_data
+        for handle, output in list(self._named_outputs.items()):
+            if handle == DEFAULT_OUTPUT_HANDLE:
+                continue
+            result_id = f"{self.hash}_{handle}"
+            self._submit_in_flight = JobHandle(backend.id, result_id)
+            try:
+                ref = backend.submit(
+                    output.data_frame.lazy(),
+                    self._input_refs(backend.id),
+                    replace(hints, preview_rows=None),
+                    result_id,
+                    flow_id=node_logger.flow_id,
+                    node_id=self.node_id,
+                ).ref
+            finally:
+                self._submit_in_flight = None
+            self._stored_outputs[handle] = ref
+            self._named_outputs[handle] = FlowDataEngine(
+                backend.plan_for(ref), schema=ref.schema, number_of_records=ref.row_count
+            )
+
+    def _read_stored_result(
+        self, backend: ComputeBackend, ref: ResultRef, preview: bool, node_logger: NodeLogger
+    ) -> bool:
+        """Takes the stored result ``ref`` as this run's result; False when it cannot be read back.
+
+        Raises:
+            ComputeError: Asking the backend whether it still holds ``ref`` failed.
+        """
+        if not backend.exists(ref):
+            return False
+        handle = self.results.job_handle or JobHandle(backend.id, ref.result_id)
+        try:
+            self._take_result(backend, SubmitResult(ref=ref, sample=None, handle=handle), None, None, preview)
+        except Exception:
+            node_logger.warning("Failed to read the cache, rerunning the code")
+            return False
+        return True
+
+    def _submit(
+        self, backend: ComputeBackend, engine: FlowDataEngine, hints: SubmitHints, node_logger: NodeLogger
+    ) -> SubmitResult:
+        """Submits ``engine``'s plan under the node's hash, retrying failed CSV type inference under that id."""
+        inputs = self._input_refs(backend.id)
+        frame = engine.data_frame
+        current_infer = self._eligible_infer_length()
+        result_id = self.hash
+        while True:
+            plan = frame.lazy() if isinstance(frame, pl.DataFrame) else frame
+            self._submit_in_flight = JobHandle(backend.id, result_id)
+            try:
+                return backend.submit(plan, inputs, hints, result_id, flow_id=node_logger.flow_id, node_id=self.node_id)
+            except Exception as e:
+                description = str(e)
+                if current_infer is None or not self._is_type_inference_error(description):
+                    failed_class = _failed_class(e) if isinstance(e, TaskFailed) else None
+                    if failed_class is None:
+                        raise
+                    raise RemoteExecutionError(description, failed_class) from e
+                next_rung = self._next_infer_rung(current_infer)
+                escalated = self._escalated_read_frame(next_rung) if next_rung is not None else None
+                if escalated is None:
+                    guidance = (
+                        f"{description}\n\n"
+                        "Automatic schema-inference escalation reached its maximum "
+                        f"({self._INFER_SCHEMA_RUNGS[-1]} rows) but the file still has a type conflict. "
+                        "Increase 'Schema Infer Length' further, turn off 'Infer data types' to read "
+                        "every column as text, or enable 'Ignore Errors' to null the unparseable values."
+                    )
+                    raise RemoteExecutionError(guidance, _failed_class(e)) from e
+                node_logger.warning(f"CSV type inference failed; retrying read with infer_schema_length={next_rung}.")
+                frame = escalated.data_frame
+                current_infer = next_rung
+            finally:
+                self._submit_in_flight = None
+
+    def run_op(self, backend: ComputeBackend, op: OperationKind, payload: OpPayload, *, job_id: str) -> OpResult:
+        """Run ``op`` on ``backend`` for this node, so that ``cancel`` reaches it while it runs.
+
+        *job_id* is the payload's ``job_id``: while the call runs, ``cancel`` hands ``JobHandle(backend.id, job_id)``
+        to ``backend.cancel``. Each stored result the operation answers is the node's from then on
+        (``_operation_refs``, by output name), released with its result. A deferred one stays the caller's to
+        release, since the engine built over it holds its plan. A stored output replaced under the same name by
+        another id (a random split or database read rerun) is released first. Failures follow ``run_operation``.
+        """
+        self._submit_in_flight = JobHandle(backend.id, job_id)
+        try:
+            result = run_operation(backend, op, payload)
+        finally:
+            self._submit_in_flight = None
+        minted = {name: ref for name, ref in result.refs.items() if ref.state == "materialised"}
+        for name, ref in minted.items():
+            replaced = self._operation_refs.get(name)
+            if replaced is not None and (replaced.backend_id, replaced.result_id) != (ref.backend_id, ref.result_id):
+                if self.results.model_ref == replaced:
+                    self.results.model_ref = None
+                self._release_or_drop(replaced)
+        self._operation_refs.update(minted)
+        return result
+
+    def _input_refs(self, backend_id: str) -> list[ResultRef]:
+        """The results this node's upstream nodes hold on backend ``backend_id``; one holding none is left out.
+
+        An input that crossed to this node from another backend (``_boundary_inputs``) counts by its import.
+        """
+        refs: dict[str, ResultRef] = {}
+        held = [node.results.result_ref for node in self.all_inputs]
+        for ref in [*held, *(edge.ref for edge in self._boundary_inputs.values())]:
+            if ref is not None and ref.backend_id == backend_id:
+                refs[ref.result_id] = ref
+        return list(refs.values())
+
+    def _take_result(
+        self,
+        backend: ComputeBackend,
+        result: SubmitResult,
+        engine: FlowDataEngine | None,
+        preview_rows: int | None,
+        preview: bool,
+    ) -> None:
+        """Holds ``result`` and makes it this node's resulting data and preview.
+
+        A deferred result is this node's own plan, so its engine keeps what ``engine`` knew (schema, a known row
+        count, streamability). A stored one takes the schema and row count its reference carries, so core never
+        resolves a stored result's schema from the backend's storage.
+        """
+        ref = result.ref
+        self.results.result_ref = ref
+        self.results.job_handle = result.handle
+        plan = backend.plan_for(ref)
+        if ref.state == "deferred" and engine is not None:
+            data = FlowDataEngine(plan, schema=engine.schema, number_of_records=engine.known_record_count())
+            data.set_streamable(self.node_settings.streamable)
+        else:
+            data = FlowDataEngine(plan, schema=ref.schema, number_of_records=ref.row_count)
+        self.results.resulting_data = data
+        self.node_schema.result_schema = data.schema
+        self.results.example_data_path = _result_file(backend, ref)
+        if result.sample is not None:
+            table = _arrow_table(result.sample)
+            self.results.example_data_generator = lambda: table
+        elif preview:
+            self.results.example_data_generator = _sample_on_read(backend, ref, preview_rows or DEFAULT_PREVIEW_ROWS)
+        if ref.state == "deferred" and not self.node_settings.streamable:
+            for step in self.leads_to_nodes:
+                step.node_settings.streamable = False
+
+    def read_example_data(self) -> None:
+        """Takes the grid's rows now, so a plan that fails on its rows fails here rather than on the first grid read.
+
+        A sample read from a task-route deferred result leaves a file, which then backs the first-row reads that go
+        through ``example_data_path``.
+        """
+        generator = self.results.example_data_generator
+        if generator is None:
+            return
+        try:
+            generator()
+        except Exception:
+            self.results.example_data_generator = None
+            raise
+        ref = self.results.result_ref
+        if ref is not None and self.results.example_data_path is None:
+            self.results.example_data_path = _result_file(registry.backend(ref.backend_id), ref)
+
+    def prepare_before_run(self):
+        """Resets results and errors before a new execution."""
+
+        self.results.errors = None
+        self.results.resulting_data = None
+        self.results.example_data = None
+        self._named_outputs = {}
+        self._named_schemas = {}
+
+    def cancel(self):
+        """Cancels an ongoing external process if one is running.
+
+        While the node waits on its backend's submit or ``run_op``, the backend's ``cancel`` gets the job's handle.
+        """
+
+        submit_in_flight = self._submit_in_flight
+        if submit_in_flight is not None:
+            try:
+                registry.backend(submit_in_flight.backend_id).cancel(submit_in_flight)
+            except Exception:
+                logger.exception("Failed to cancel the backend job of node %s", self.node_id)
+        elif self._fetch_cached_df is not None:
+            self._fetch_cached_df.cancel()
+        elif self._kernel_cancel_context is not None:
+            kernel_id, manager, exec_token = self._kernel_cancel_context
+            logger.info("Cancelling kernel execution for kernel '%s'", kernel_id)
+            # Signal the cancel event so execute_sync returns promptly
+            if self._kernel_cancel_event is not None:
+                self._kernel_cancel_event.set()
+            try:
+                # Addressed to this node's own cell, so a node queued behind another flow interrupts nothing.
+                manager.interrupt_execution_sync(kernel_id, exec_token)
+            except Exception:
+                logger.exception("Failed to interrupt kernel execution for kernel '%s'", kernel_id)
+        elif self._subflow_cancel_context is not None:
+            logger.info("Cancelling running subflow for node %s", self.node_id)
+            try:
+                self._subflow_cancel_context.cancel()
+            except Exception:
+                logger.exception("Failed to cancel subflow for node %s", self.node_id)
+        else:
+            logger.info("No external process to cancel; signalling in-process cancellation")
+        self.node_stats.is_canceled = True
+        self._execution_state.is_canceled = True
+
+    def execute_node(
+        self,
+        reset_cache: bool = False,
+        performance_mode: bool = False,
+        retry: bool = True,
+        node_logger: NodeLogger | None = None,
+        unreachable: Exception | None = None,
+        running: Collection[int | str] | None = None,
+        preview: bool | None = None,
+    ) -> None:
+        """Execute the node based on its current state and settings.
+
+        Delegates all execution and skip logic to the NodeExecutor, which is
+        the single source of truth for deciding whether a node should run.
+        The node runs on the backend of the current execution context
+        (``current_context``): a caller outside ``run_graph`` enters the
+        graph's context first (``use_context(graph.execution_context)``).
+
+        Args:
+            reset_cache: Force cache invalidation
+            performance_mode: Skip example data generation for speed
+            retry: Allow retry on recoverable errors
+            node_logger: Logger for this node's execution
+            unreachable: The handshake error of the backend placement assigned the node. The node fails with it
+                and nothing runs.
+            running: The ids of the nodes the run executes, among which the hints count this node's consumers
+                (``executor.hints_for``); ``None`` counts every consumer.
+            preview: Fill the 100-row grid; ``None`` means ``not performance_mode``.
+        """
+        if node_logger is None:
+            raise ValueError("node_logger is required")
+        if not self.is_setup:
+            node_logger.warning(f"Node {self.__name__} is not setup, cannot run")
+            return
+
+        self.executor.execute(
+            reset_cache=reset_cache,
+            performance_mode=performance_mode,
+            retry=retry,
+            node_logger=node_logger,
+            unreachable=unreachable,
+            running=running,
+            preview=preview,
+        )
+
+    def needs_reset(self) -> bool:
+        """Checks if the node's hash has changed, indicating an outdated state.
+
+        Returns:
+            True if the calculated hash differs from the stored hash.
+        """
+        return self._hash != self.calculate_hash(self.setting_input)
+
+    def reset(self, deep: bool = False):
+        """Resets the node's execution state and schema information.
+
+        This also triggers a reset on all downstream nodes. A node placed deferred
+        (``placed_deferred``) gets ``deferred_until_run`` back with its dropped result, so only a
+        real run executes it again. A start node's eager schema prefetch is skipped while
+        ``deferred_until_run`` is set (without a declared schema callback that prefetch runs the
+        node function) and while ``schema_prefetch_blocked`` is set in the calling context.
+
+        Args:
+            deep: If True, forces a reset even if the hash hasn't changed.
+        """
+        needs_reset = self.needs_reset() or deep
+        if needs_reset:
+            logger.info(f"{self.node_id}: Node needs reset")
+            self.node_stats.has_run_with_current_setup = False
+            self.results.reset()
+            self.node_schema.result_schema = None
+            self.node_schema.predicted_schema = None
+            self._schema_prediction_blocked = None
+            self._hash = None
+            self.node_information.is_setup = None
+            self.results.errors = None
+            self._last_run_error = None
+            if self.placed_deferred:
+                self.deferred_until_run = True
+
+            # Reset execution state but preserve source file info for change detection
+            self._execution_state.has_run_with_current_setup = False
+            self._execution_state.has_completed_last_run = False
+            self._execution_state.is_canceled = False
+            self._execution_state.result_schema = None
+            self._execution_state.predicted_schema = None
+            self._execution_state.execution_hash = None
+            # Note: source_file_info / source_version_info NOT reset - needed for change detection
+
+            if self.is_correct:
+                self._schema_callback = None
+                # Prefetch start nodes only: others read upstream state that graph.reset() is still resetting.
+                prefetch = self.is_start and not self.deferred_until_run and not schema_prefetch_blocked.get()
+                if prefetch and self.schema_callback:
+                    logger.info(f"{self.node_id}: Resetting the schema callback")
+                    self.schema_callback.start()
+            self.evaluate_nodes()
+            _ = self.hash  # Recalculate the hash after reset
+
+    def refresh_predicted_schema(self) -> None:
+        """Drop cached schema predictions here and downstream, leaving results and hashes alone.
+
+        For settings excluded from the hash (``hash_excluded_fields``): the hash-driven
+        ``reset()`` skips such an edit, so without this the stale prediction would survive.
+        Nodes that have run with their current setup keep their real result schema.
+        """
+        stack: list[FlowNode] = [self]
+        seen: set[int] = set()
+        while stack:
+            node = stack.pop()
+            if id(node) in seen or node.node_stats.has_run_with_current_setup:
+                continue
+            seen.add(id(node))
+            node._schema_callback = None
+            node._named_schemas = {}
+            node._schema_prediction_blocked = None
+            node.node_schema.predicted_schema = None
+            node.node_schema.result_schema = None
+            node._execution_state.predicted_schema = None
+            node._execution_state.result_schema = None
+            stack.extend(node.leads_to_nodes)
+
+    def invalidate_cache(self):
+        """Force cache invalidation by incrementing the cache epoch.
+
+        Changes the node's hash so Development mode re-executes instead
+        of returning stale results.  Used after external state changes
+        (e.g. Kafka consumer group offset reset) that don't alter the
+        node's configuration.
+        """
+        self._cache_epoch += 1
+        self._hash = None
+        self._execution_state.reset()
+        self.node_stats.has_run_with_current_setup = False
+        self.node_stats.has_completed_last_run = False
+
+    def delete_lead_to_node(self, node_id: int) -> bool:
+        """Removes a connection to a specific downstream node.
+
+        Args:
+            node_id: The ID of the downstream node to disconnect.
+
+        Returns:
+            True if the connection was found and removed, False otherwise.
+        """
+        logger.info(f"Deleting lead to node: {node_id}")
+        for i, lead_to_node in enumerate(self.leads_to_nodes):
+            logger.info(f"Checking lead to node: {lead_to_node.node_id}")
+            if lead_to_node.node_id == node_id:
+                logger.info(f"Found the node to delete: {node_id}")
+                self.leads_to_nodes.pop(i)
+                return True
+        return False
+
+    def delete_input_node(
+        self, node_id: int, connection_type: input_schema.InputConnectionClass = "input-0", complete: bool = False
+    ) -> bool:
+        """Removes a connection from a specific input node.
+
+        Args:
+            node_id: The ID of the input node to disconnect.
+            connection_type: The specific input handle (e.g., 'input-0', 'input-1').
+            complete: If True, tries to delete from all input types.
+
+        Returns:
+            True if a connection was found and removed, False otherwise.
+        """
+        if self.accepts_dynamic_inputs:
+            return self._delete_keyed_connection(node_id, connection_type, complete)
+        deleted: bool = False
+        if connection_type == "input-0" or complete:
+            main_inputs = self.node_inputs.main_inputs or []
+            matches = [i for i, node in enumerate(main_inputs) if node.node_id == node_id]
+            # One edge is one slot entry: a single delete removes exactly one of them.
+            for i in reversed(matches if complete else matches[:1]):
+                main_inputs.pop(i)
+                deleted = True
+        if connection_type == "input-1" or complete:
+            if self.node_inputs.right_input is not None and self.node_inputs.right_input.node_id == node_id:
+                self.node_inputs.right_input = None
+                deleted = True
+        if connection_type == "input-2" or complete:
+            if self.node_inputs.left_input is not None and self.node_inputs.left_input.node_id == node_id:
+                self.node_inputs.left_input = None
+                deleted = True
+        if not deleted and connection_type not in ("input-0", "input-1", "input-2"):
+            logger.warning("Could not find the connection to delete...")
+        if deleted:
+            self._forget_source_handle(node_id)
+            self.reset()
+        return deleted
+
+    def __repr__(self) -> str:
+        """Provides a string representation of the FlowNode instance.
+
+        Returns:
+            A string showing the node's ID and type.
+        """
+        return f"Node id: {self.node_id} ({self.node_type})"
+
+    def _get_readable_schema(self) -> list[dict] | None:
+        """Helper to get a simplified, dictionary representation of the output schema.
+
+        Returns:
+            A list of dictionaries, each with 'column_name' and 'data_type'.
+        """
+        if self.is_setup:
+            output = []
+            for s in self.schema:
+                output.append(dict(column_name=s.column_name, data_type=s.data_type))
+            return output
+
+    def get_repr(self) -> dict:
+        """Gets a detailed dictionary representation of the node's state.
+
+        Returns:
+            A dictionary containing key information about the node.
+        """
+        return dict(
+            FlowNode=dict(
+                node_id=self.node_id,
+                step_name=self.__name__,
+                output_columns=self.node_schema.output_columns,
+                output_schema=self._get_readable_schema(),
+            )
+        )
+
+    @property
+    def number_of_leads_to_nodes(self) -> int | None:
+        """Counts the number of downstream node connections.
+
+        Returns:
+            The number of nodes this node leads to.
+        """
+        if self.is_setup:
+            return len(self.leads_to_nodes)
+
+    @property
+    def has_next_step(self) -> bool:
+        """Checks if this node has any downstream connections.
+
+        Returns:
+            True if it has at least one downstream node.
+        """
+        return len(self.leads_to_nodes) > 0
+
+    @property
+    def has_input(self) -> bool:
+        """Checks if this node has any input connections.
+
+        Returns:
+            True if it has at least one input node.
+        """
+        return len(self.all_inputs) > 0
+
+    @property
+    def singular_input(self) -> bool:
+        """Checks if the node template specifies exactly one input.
+
+        Returns:
+            True if the node is a single-input type.
+        """
+        return self.node_template.input == 1
+
+    @property
+    def singular_main_input(self) -> "FlowNode":
+        """Gets the input node, assuming it is a single-input type.
+
+        Returns:
+            The single input FlowNode, or None.
+        """
+        if self.singular_input:
+            return self.all_inputs[0]
+
+    def clear_table_example(self) -> None:
+        """
+        Clear the table example in the results so that it clears the existing results
+        Returns:
+            None
+        """
+
+        self.results.example_data = None
+        self.results.example_data_generator = None
+        self.results.example_data_path = None
+
+    @staticmethod
+    def _preview_record_count(
+        engine: FlowDataEngine | None, sample_len: int | None, sample_size: int = 100
+    ) -> int | None:
+        """Best-effort exact row count for the preview header — never computed.
+
+        Uses only counts that are already free (a stored count, an eager frame's
+        height) plus the sample-shortfall rule: a sample strictly shorter than
+        the requested sample size is the whole table. Must never call
+        ``get_number_of_records()`` — on a lazy engine that collects the whole
+        upstream plan just to render a header.
+        """
+        if engine is not None:
+            count = engine.known_record_count()
+            if count is not None:
+                return count
+        if sample_len is not None and sample_len < sample_size:
+            return sample_len
+        return None
+
+    def peek_output_engine(self, output_handle: str = DEFAULT_OUTPUT_HANDLE) -> FlowDataEngine | None:
+        """Passively resolves the cached result engine for an output handle.
+
+        Never routes through ``get_output()``/``get_resulting_data()``, which
+        can re-execute the node. Identity checks only: FlowDataEngine truthiness
+        goes through ``__len__``, which can trigger a full collect.
+        """
+        engine = self._named_outputs.get(output_handle)
+        if engine is None:
+            engine = self.results.resulting_data
+        return engine
+
+    def _sink_source(self) -> tuple["FlowNode", str] | None:
+        """The upstream node and handle a sink previews; None for a node that previews itself."""
+        if self.node_template.node_group != "output" or getattr(self.setting_input, "output_names", None):
+            return None
+        if not self.main_input:
+            raise ColumnStatsUnavailable("Output node has no input connected.")
+        src = self.main_input[0]
+        return src, self._input_output_handles.get(src.node_id, DEFAULT_OUTPUT_HANDLE)
+
+    def get_cached_result(self, output_handle: str = DEFAULT_OUTPUT_HANDLE) -> FlowDataEngine:
+        """Returns the cached result engine of the last run with the current settings.
+
+        Never executes or re-pulls data. Raises ``ColumnStatsUnavailable`` when
+        there is no such result.
+        """
+        if sink := self._sink_source():
+            return sink[0].get_cached_result(sink[1])
+        engine = self.peek_output_engine(output_handle)
+        if engine is None:
+            raise ColumnStatsUnavailable("Node has no cached result. Run the flow first.")
+        if not self.node_stats.has_run_with_current_setup:
+            raise ColumnStatsUnavailable("Run the flow first: this node has no result for its current settings.")
+        if engine.external_source is not None:
+            raise ColumnStatsUnavailable("Result is an external source; reading it would re-pull the data.")
+        if engine.is_future and not engine.is_collected:
+            raise ColumnStatsUnavailable("Result is still being computed.")
+        return engine
+
+    def get_column_stats(
+        self,
+        column_name: str,
+        output_handle: str = DEFAULT_OUTPUT_HANDLE,
+        backend: ComputeBackend | None = None,
+    ) -> FileColumn:
+        """Computes on-demand stats for one column of this node's cached result.
+
+        The stats land on the result engine's ``FlowfileColumn`` (the single
+        source of truth), so this run's later previews carry them too; the
+        return value is that column's ordinary ``FileColumn`` representation.
+
+        The aggregate runs on *backend*. By default, with ``FLOWFILE_COMPUTE_PROTOCOL``
+        on, that is the backend holding the output's result, else the context of the
+        node's graph. With it off it is ``current_context()``'s, which outside a run
+        is the default backend, not the flow's.
+
+        Raises ``ColumnStatsUnavailable`` when there is no cached result to
+        aggregate over without executing or re-pulling data, or the backend
+        cannot compute even the counts, and ``pl.exceptions.ColumnNotFoundError``
+        for an unknown column.
+        """
+        if sink := self._sink_source():
+            return sink[0].get_column_stats(column_name, output_handle=sink[1], backend=backend)
+        engine = self.get_cached_result(output_handle)
+        if backend is None:
+            if settings.FLOWFILE_COMPUTE_PROTOCOL:
+                backend = self.result_backend(output_handle)
+                if backend is None:
+                    with self._in_execution_context():
+                        backend = current_context().backend
+            else:
+                backend = current_context().backend
+        stats = compute_column_stats(engine, column_name, backend=backend)
+        # The engine's schema list was rebound (copy-on-write); follow it so self.schema carries the stats.
+        if engine is self.results.resulting_data:
+            self.node_schema.result_schema = engine.schema
+        return stats
+
+    def get_table_example(
+        self, include_data: bool = False, output_handle: str = DEFAULT_OUTPUT_HANDLE
+    ) -> TableExample | None:
+        """Generates a `TableExample` model summarizing the node's output.
+
+        This can optionally include a sample of the data. For multi-output
+        nodes, ``output_handle`` selects which named output to preview.
+
+        With ``FLOWFILE_COMPUTE_PROTOCOL`` on and a reference held, a named
+        output's rows never come from core: the default output's cached sample,
+        else a ``sample`` of the result held for it (``held_output``), else
+        ``bounded.head_rows`` of its plan on the backend of the node's reference
+        (not cached). With the flag off, or no reference, they are collected in
+        core.
+
+        Args:
+            include_data: If True, includes a data sample in the result.
+            output_handle: The output handle to preview (e.g. ``"output-0"``).
+                For single-output nodes the default is the only choice.
+
+        Returns:
+            A `TableExample` object, or None if the node is not set up.
+        """
+        self.print("Getting a table example")
+        if self.is_setup and include_data and self.node_stats.has_completed_last_run:
+            if self.node_template.node_group == "output" and not getattr(self.setting_input, "output_names", None):
+                # A sink previews its upstream input; one declaring an output handle previews itself.
+                self.print("getting the table example")
+                src, handle = self._sink_source()
+                return src.get_table_example(include_data, output_handle=handle)
+
+            logger.info("getting the table example since the node has run")
+            # A multi-output node previews the requested named output.
+            if self._named_outputs and output_handle in self._named_outputs:
+                engine = self._named_outputs[output_handle]
+                ref = self.results.result_ref
+                if settings.FLOWFILE_COMPUTE_PROTOCOL and ref is not None:
+                    cached = self.results.example_data_generator
+                    output = self.held_output(output_handle) if output_handle != DEFAULT_OUTPUT_HANDLE else None
+                    if output_handle == DEFAULT_OUTPUT_HANDLE and cached is not None:
+                        table = cached()
+                    elif output is not None:
+                        table = _arrow_table(registry.backend(output.backend_id).sample(output, 100))
+                    else:
+                        table = head_rows(registry.backend(ref.backend_id), engine.data_frame, 100)
+                    data = table.to_pylist()
+                else:
+                    preview_df = engine.data_frame.head(100)
+                    if isinstance(preview_df, pl.LazyFrame):
+                        preview_df = preview_df.collect()
+                    data = preview_df.to_dicts() if preview_df is not None else []
+                schema = [FileColumn.model_validate(c.get_column_repr()) for c in engine.schema]
+                return TableExample(
+                    node_id=self.node_id,
+                    name=str(self.node_id),
+                    number_of_records=self._preview_record_count(engine, len(data)),
+                    number_of_columns=len(schema),
+                    table_schema=schema,
+                    columns=[c.name for c in schema],
+                    data=data,
+                    has_example_data=True,
+                    has_run_with_current_setup=self.node_stats.has_run_with_current_setup,
+                )
+
+            example_data_getter = self.results.example_data_generator
+            if example_data_getter is not None:
+                data = example_data_getter().to_pylist()
+                if data is None:
+                    data = []
+            else:
+                data = []
+            schema = [FileColumn.model_validate(c.get_column_repr()) for c in self.schema]
+            has_example_data = self.results.example_data_generator is not None
+
+            return TableExample(
+                node_id=self.node_id,
+                name=str(self.node_id),
+                number_of_records=self._preview_record_count(
+                    self.results.resulting_data, len(data) if has_example_data else None
+                ),
+                number_of_columns=len(schema),
+                table_schema=schema,
+                columns=[c.name for c in schema],
+                data=data,
+                has_example_data=has_example_data,
+                has_run_with_current_setup=self.node_stats.has_run_with_current_setup,
+            )
+        else:
+            logger.warning("getting the table example but the node has not run")
+            try:
+                schema = [FileColumn.model_validate(c.get_column_repr()) for c in self.schema]
+            except Exception as e:
+                logger.warning(e)
+                schema = []
+            columns = [s.name for s in schema]
+            return TableExample(
+                node_id=self.node_id,
+                name=str(self.node_id),
+                number_of_records=None,
+                number_of_columns=len(columns),
+                table_schema=schema,
+                columns=columns,
+                data=[],
+            )
+
+    def settings_fingerprint(self) -> str | None:
+        """A digest of the drawer-owned settings, the token a settings save hands back as its expectation.
+
+        Layout, group membership and the owner are left out (``SETTINGS_FINGERPRINT_EXCLUDE``): a drag
+        or a group move while the drawer is open is not a conflict. ``None`` for a node without settings.
+        """
+        settings = self.setting_input
+        if settings is None or not hasattr(settings, "model_dump_json"):
+            return None
+        return hashlib.sha256(settings.model_dump_json(exclude=SETTINGS_FINGERPRINT_EXCLUDE).encode()).hexdigest()[:16]
+
+    def get_node_data(
+        self,
+        flow_id: int,
+        include_example: bool = False,
+        include_output: bool = True,
+        include_inputs: bool = True,
+    ) -> NodeData:
+        """Gathers all necessary data for representing the node in the UI.
+
+        Args:
+            flow_id: The ID of the parent flow.
+            include_example: If True, includes data samples.
+            include_output: If True, computes this node's own output preview
+                (``main_output``). The settings panel only needs the input
+                schemas, so callers that just open settings pass False to skip
+                the potentially expensive output-schema prediction (e.g. a pivot
+                must materialize data to determine its output columns).
+            include_inputs: If True, resolves each connected input's schema
+                (``main_input``/``left_input``/``right_input``). False is the
+                settings-open fast path: it skips upstream schema prediction
+                entirely (which can execute un-run custom nodes on a kernel or
+                worker) and therefore also the main_input-guarded setting
+                generators/updators (join/cross_join/fuzzy_match). Only the
+                custom-node drawer should use it for now.
+
+        Returns:
+            A `NodeData` object.
+        """
+        node = NodeData(
+            flow_id=flow_id,
+            node_id=self.node_id,
+            has_run=self.node_stats.has_run_with_current_setup,
+            is_setup=bool(self.is_setup),
+            setting_input=self.setting_input,
+            settings_fingerprint=self.settings_fingerprint(),
+            flow_type=self.node_type,
+        )
+        if include_inputs:
+            if self.accepts_dynamic_inputs:
+                # The panel's main_input is the parameter connection (input-0), not the first connected slot.
+                param_node = (self.node_inputs.keyed_inputs or {}).get(PARAM_INPUT_HANDLE)
+                if param_node is not None:
+                    node.main_input = param_node.get_table_example()
+            elif self.main_input:
+                node.main_input = self.main_input[0].get_table_example()
+            if self.left_input:
+                node.left_input = self.left_input.get_table_example()
+            if self.right_input:
+                node.right_input = self.right_input.get_table_example()
+            # Those calls set the inputs' kernel-gate flags; walk the whole upstream chain for the warning.
+            warning = first_upstream_prediction_warning(self)
+            if warning and not (self.node_schema.result_schema or self.node_schema.predicted_schema):
+                # A Schema Validator may declare this node's columns; predicting is cheap behind the blocked input.
+                try:
+                    self.get_predicted_schema()
+                except Exception:
+                    pass
+                if self.node_schema.result_schema or self.node_schema.predicted_schema:
+                    warning = None
+            node.prediction_warning = warning
+        if self.is_setup and include_output:
+            node.main_output = self.get_table_example(include_example)
+        # Generated/updated settings are only a proposal for the panel; a save applies them.
+        node = setting_generator.get_setting_generator(self.node_type)(node)
+        node = setting_updator.get_setting_updator(self.node_type)(node)
+        return node
+
+    def get_output_data(self) -> TableExample:
+        """Gets the full output data sample for this node.
+
+        Returns:
+            A `TableExample` object with data.
+        """
+        return self.get_table_example(True)
+
+    def resolve_description(self) -> tuple[str, bool]:
+        """Return ``(description, is_auto_generated)``: the user's text, else the settings' auto text.
+
+        Auto text is a cheap format of in-memory settings; a missing or failing generator
+        yields "" so one node cannot sink the flow payload.
+        """
+        user_description = getattr(self.setting_input, "description", "") or ""
+        if user_description:
+            return user_description, False
+        generate = getattr(self.setting_input, "get_default_description", None)
+        if generate is None:
+            return "", True
+        try:
+            return generate() or "", True
+        except Exception:
+            logger.warning("Auto description failed for node %s (%s)", self.node_id, self.node_type, exc_info=True)
+            return "", True
+
+    def get_node_input(self) -> schemas.NodeInput:
+        """Creates a `NodeInput` schema object for representing this node in the UI.
+
+        Returns:
+            A `NodeInput` object.
+        """
+        output_names = getattr(self.setting_input, "output_names", None)
+        node_reference = getattr(self.setting_input, "node_reference", None)
+        template_fields = {**self.node_template.__dict__}
+        if self.accepts_dynamic_inputs:
+            # Per-instance names travel verbatim ([] means zero outputs); the frontend counts from them.
+            template_fields["output_names"] = output_names
+        elif output_names and (len(output_names) > 1 or template_fields["output"] == 0):
+            # A sink template gains its only handle from settings (SCD2 catalog writer), so one name travels too.
+            template_fields["output_names"] = output_names
+        # Else keep the template's names: an unconfigured node has no settings, and its tooltips would go.
+        description, is_auto_generated = self.resolve_description()
+        return schemas.NodeInput(
+            pos_y=self.setting_input.pos_y,
+            pos_x=self.setting_input.pos_x,
+            group_id=getattr(self.setting_input, "group_id", None),
+            id=self.node_id,
+            node_reference=node_reference,
+            input_names=getattr(self.setting_input, "input_names", None),
+            description=description,
+            is_auto_generated=is_auto_generated,
+            **template_fields,
+        )
+
+    def get_edge_input(self) -> list[schemas.NodeEdge]:
+        """Generates `NodeEdge` objects for all input connections to this node.
+
+        Returns:
+            A list of `NodeEdge` objects.
+        """
+        edges = []
+        if self.accepts_dynamic_inputs:
+            source_handles = self.node_inputs.keyed_source_handles or {}
+            return [
+                schemas.NodeEdge(
+                    id=f"{source.node_id}-{self.node_id}-{handle}",
+                    source=source.node_id,
+                    target=self.node_id,
+                    sourceHandle=source_handles.get(handle, DEFAULT_OUTPUT_HANDLE),
+                    targetHandle=handle,
+                )
+                for handle, source in self.node_inputs.slot_items()
+            ]
+        if self.node_inputs.main_inputs is not None:
+            for i, main_input in enumerate(self.node_inputs.main_inputs):
+                source_handle = self._input_output_handles.get(main_input.node_id, DEFAULT_OUTPUT_HANDLE)
+                edges.append(
+                    schemas.NodeEdge(
+                        id=f"{main_input.node_id}-{self.node_id}-{i}",
+                        source=main_input.node_id,
+                        target=self.node_id,
+                        sourceHandle=source_handle,
+                        targetHandle="input-0",
+                    )
+                )
+        if self.node_inputs.left_input is not None:
+            left_handle = self._input_output_handles.get(self.node_inputs.left_input.node_id, DEFAULT_OUTPUT_HANDLE)
+            edges.append(
+                schemas.NodeEdge(
+                    id=f"{self.node_inputs.left_input.node_id}-{self.node_id}-right",
+                    source=self.node_inputs.left_input.node_id,
+                    target=self.node_id,
+                    sourceHandle=left_handle,
+                    targetHandle="input-2",
+                )
+            )
+        if self.node_inputs.right_input is not None:
+            right_handle = self._input_output_handles.get(self.node_inputs.right_input.node_id, DEFAULT_OUTPUT_HANDLE)
+            edges.append(
+                schemas.NodeEdge(
+                    id=f"{self.node_inputs.right_input.node_id}-{self.node_id}-left",
+                    source=self.node_inputs.right_input.node_id,
+                    target=self.node_id,
+                    sourceHandle=right_handle,
+                    targetHandle="input-1",
+                )
+            )
+        return edges

@@ -1,0 +1,527 @@
+from pl_fuzzy_frame_match.models import FuzzyMapping
+
+from flowfile_core.configs import logger
+from flowfile_core.flowfile.code_generator.base import ConverterMixinBase
+from flowfile_core.flowfile.code_generator.expression_helpers import _try_translate_to_polars_code
+from flowfile_core.flowfile.flow_data_engine.flow_file_column.main import convert_pl_type_to_string
+from flowfile_core.flowfile.flow_data_engine.flow_file_column.utils import cast_str_to_polars_type
+from flowfile_core.schemas import input_schema, transform_schema
+
+
+class TransformHandlersMixin(ConverterMixinBase):
+    """Row/column transform handlers (group_by, formula, pivot, sort, window, fuzzy, record_id, ...)."""
+
+    def _handle_group_by(self, settings: input_schema.NodeGroupBy, var_name: str, input_vars: dict[str, str]) -> None:
+        """Handle group by nodes."""
+        input_df = input_vars.get("main", "df")
+
+        group_cols = []
+        group_items = []
+        has_renamed_key = False
+        agg_exprs = []
+
+        for agg_col in settings.groupby_input.agg_cols:
+            if agg_col.agg == "groupby":
+                group_cols.append(agg_col.old_name)
+                if agg_col.new_name and agg_col.new_name != agg_col.old_name:
+                    has_renamed_key = True
+                    old = self._py_str(agg_col.old_name)
+                    new = self._py_str(agg_col.new_name)
+                    group_items.append(f"{self.framework}.col({old}).alias({new})")
+                else:
+                    group_items.append(self._py_str(agg_col.old_name))
+            else:
+                agg_func = self._get_agg_function(agg_col.agg)
+                old = self._py_str(agg_col.old_name)
+                new = self._py_str(agg_col.new_name)
+                expr = f"{self.framework}.col({old}).{agg_func}.alias({new})"
+                agg_exprs.append(expr)
+
+        if has_renamed_key:
+            self._add_code(f"{var_name} = {input_df}.group_by([{', '.join(group_items)}]).agg([")
+        else:
+            self._add_code(f"{var_name} = {input_df}.group_by({group_cols}).agg([")
+        for expr in agg_exprs:
+            self._add_code(f"    {expr},")
+        self._add_code("])")
+        self._add_code("")
+
+    def _handle_formula(self, settings: input_schema.NodeFormula, var_name: str, input_vars: dict[str, str]) -> None:
+        """Handle formula/expression nodes.
+
+        Entries always emit one chained `with_columns` step each, in order, never a fused call:
+        a later entry may read a column an earlier one writes, and chaining shows that instead
+        of leaving the reader to work out which form is sequential. A single entry emits exactly
+        the one-liner it always has; zero active entries is a pass-through assignment.
+        """
+        input_df = input_vars.get("main", "df")
+        entries = [entry for _, entry in settings.active_entries()]
+        if not entries:
+            self._add_code(f"{var_name} = {input_df}")
+        elif len(entries) == 1:
+            lines = self._formula_entry_lines(entries[0])
+            self._add_code(f"{var_name} = {input_df}{lines[0]}")
+            for line in lines[1:]:
+                self._add_code(line)
+        else:
+            self._add_code(f"{var_name} = ({input_df}")
+            for entry in entries:
+                for line in self._formula_entry_lines(entry):
+                    self._add_code(f"    {line}" if line.strip() else "")
+            self._add_code(")")
+        self._add_code("")
+
+    def _formula_entry_parts(self, entry: transform_schema.FunctionInput) -> tuple[str | None, str, str | None]:
+        """One entry as (native polars expression or None, output column name, cast target or None).
+
+        Registers the imports the chosen branch needs, so callers only assemble text.
+        """
+        pl_code = _try_translate_to_polars_code(entry.function)
+        if pl_code:
+            self._register_expr_stdlib_imports(pl_code)
+        else:
+            self.imports.add(
+                "from polars_expr_transformer.process.polars_expr_transformer import simple_function_to_expr"
+            )
+        output_type = None
+        if entry.field.data_type not in (None, transform_schema.AUTO_DATA_TYPE):
+            output_type = convert_pl_type_to_string(cast_str_to_polars_type(entry.field.data_type))
+            if output_type[:3] != f"{self.framework}.":
+                output_type = f"{self.framework}." + output_type
+        return pl_code, entry.field.name, output_type
+
+    def _formula_entry_lines(self, entry: transform_schema.FunctionInput) -> list[str]:
+        """The `.with_columns(...)` method-chain lines one formula entry emits."""
+        pl_code, col_name, output_type = self._formula_entry_parts(entry)
+        if pl_code:
+            expr_str = f"({pl_code}).alias({self._py_str(col_name)})"
+            if output_type:
+                expr_str += f".cast({output_type})"
+            return [f".with_columns([{expr_str}])"]
+        lines = [
+            ".with_columns([",
+            f"simple_function_to_expr({entry.function!r}).alias({self._py_str(col_name)})",
+        ]
+        if output_type:
+            lines.append(f"    .cast({output_type})")
+        lines.append("])")
+        return lines
+
+    def _handle_pivot_no_index(self, settings: input_schema.NodePivot, var_name: str, input_df: str, agg_func: str):
+        pivot_input = settings.pivot_input
+        self._add_code(f"{var_name} = ({input_df}.collect()")
+        self._add_code(f'    .with_columns({self.framework}.lit(1).alias("_temp_index_"))')
+        self._add_code("    .pivot(")
+        self._add_code(f"        values={self._py_str(pivot_input.value_col)},")
+        self._add_code('        index=["_temp_index_"],')
+        self._add_code(f"        on={self._py_str(pivot_input.pivot_column)},")
+        self._add_code(f'        aggregate_function="{agg_func}"')
+        self._add_code("    )")
+        self._add_code('    .drop("_temp_index_")')
+        self._add_code(").lazy()")
+        self._add_code("")
+
+    def _handle_pivot(self, settings: input_schema.NodePivot, var_name: str, input_vars: dict[str, str]) -> None:
+        """Handle pivot nodes."""
+        input_df = input_vars.get("main", "df")
+        pivot_input = settings.pivot_input
+        if len(pivot_input.aggregations) > 1:
+            logger.error("Multiple aggregations are not convertable to polars code. " "Taking the first value")
+        if len(pivot_input.aggregations) > 0:
+            agg_func = pivot_input.aggregations[0]
+        else:
+            agg_func = "first"
+        if len(settings.pivot_input.index_columns) == 0:
+            self._handle_pivot_no_index(settings, var_name, input_df, agg_func)
+        else:
+            self._add_code(f"{var_name} = {input_df}.collect().pivot(")
+            self._add_code(f"    values={self._py_str(pivot_input.value_col)},")
+            self._add_code(f"    index={pivot_input.index_columns},")
+            self._add_code(f"    on={self._py_str(pivot_input.pivot_column)},")
+
+            self._add_code(f"    aggregate_function='{agg_func}'")
+            self._add_code(").lazy()")
+            self._add_code("")
+
+    def _handle_unpivot(self, settings: input_schema.NodeUnpivot, var_name: str, input_vars: dict[str, str]) -> None:
+        """Handle unpivot nodes."""
+        input_df = input_vars.get("main", "df")
+        unpivot_input = settings.unpivot_input
+
+        self._add_code(f"{var_name} = {input_df}.unpivot(")
+
+        if unpivot_input.index_columns:
+            self._add_code(f"    index={unpivot_input.index_columns},")
+
+        if unpivot_input.data_type_selector_mode == "data_type":
+            self._add_code(f"    on={self._unpivot_selector(unpivot_input.data_type_selector or 'all')},")
+        elif unpivot_input.value_columns:
+            self._add_code(f"    on={unpivot_input.value_columns},")
+
+        self._add_code("    variable_name='variable',")
+        self._add_code("    value_name='value'")
+        self._add_code(")")
+        self._add_code("")
+
+    def _unpivot_selector(self, data_type: str) -> str:
+        """The selector for an unpivot node's data-type option, which the engine reads as ``polars.selectors``."""
+        self.imports.add("import polars.selectors as cs")
+        return f"cs.{data_type}()"
+
+    def _handle_union(self, settings: input_schema.NodeUnion, var_name: str, input_vars: dict[str, str]) -> None:
+        """Handle union nodes.
+
+        In a gated flow, inputs behind a closed gate are dropped — the engine's
+        ANY rule outputs only whichever branches survived. Each input whose
+        edge carries gate atoms beyond the union's own condition appends to a
+        list under an ``if`` guard for those extra atoms; the guard is what
+        makes the reference safe (extra ∪ combined ⊇ the producer's condition,
+        so the var is always assigned when the guard passes at the union's
+        site). Inputs without extra atoms append unguarded.
+
+        Exactly two inputs whose extras are one gate's exactly-complementary
+        singletons collapse to an if/else assignment — inside the union's own
+        condition block exactly one side is live, so no list and no fallback.
+        Any complementary pair among the extras also proves the list non-empty,
+        dropping the empty-frame fallback; the fallback stays only when the
+        guard set isn't provably exhaustive (e.g. independent gates).
+        """
+        dfs = []
+        if "main" in input_vars:
+            dfs.append(input_vars["main"])
+        else:
+            for key, df_var in input_vars.items():
+                if key.startswith("main"):
+                    dfs.append(df_var)
+
+        if settings.union_input.mode == "relaxed":
+            how = "diagonal_relaxed"
+        else:
+            how = "diagonal"
+
+        if getattr(self, "_gate_exprs", None):
+            edge_guards = self._any_input_edge_conds.get(settings.node_id, {})
+            union_node = self.flow_graph.get_node(settings.node_id)
+            producers = list(union_node.node_inputs.main_inputs or [])
+            # Length mismatch would mean inputs can't be attributed to
+            # producers (never expected: both derive from main_inputs); guards
+            # can't be placed then, so fall through to the plain concat —
+            # correct whenever no edge carries extra atoms.
+            if edge_guards and len(producers) == len(dfs):
+                extras = [edge_guards.get(producer.node_id) for producer in producers]
+                has_complementary_pair = any(
+                    self._conds_are_complementary(a, b)
+                    for i, a in enumerate(extras)
+                    if a
+                    for b in extras[i + 1:]
+                    if b
+                )
+                if len(dfs) == 2 and all(extras) and has_complementary_pair:
+                    self._add_code(f"if {self._render_gate_cond(extras[0])}:")
+                    self._add_code(f"    {var_name} = {dfs[0]}")
+                    self._add_code("else:")
+                    self._add_code(f"    {var_name} = {dfs[1]}")
+                    self._add_code("")
+                    return
+                list_var = f"{var_name}_frames"
+                self._add_code(f"{list_var} = []")
+                any_unguarded = False
+                for extra, df_var in zip(extras, dfs, strict=True):
+                    if extra:
+                        self._add_code(f"if {self._render_gate_cond(extra)}:")
+                        self._add_code(f"    {list_var}.append({df_var})")
+                    else:
+                        any_unguarded = True
+                        self._add_code(f"{list_var}.append({df_var})")
+                if not any_unguarded and not has_complementary_pair:
+                    # Every input is guarded and no pair is provably
+                    # exhaustive (independent gates): all branches can be
+                    # closed at run time, and concat needs ≥1 frame.
+                    empty = self._empty_frame_schema_expr(union_node) or "pl.LazyFrame()"
+                    self._add_code(f"if not {list_var}:")
+                    self._add_code(f"    {list_var}.append({empty})")
+                self._add_code(f"{var_name} = {self.framework}.concat({list_var}, how='{how}')")
+                self._add_code("")
+                return
+
+        self._add_code(f"{var_name} = {self.framework}.concat([")
+        for df in dfs:
+            self._add_code(f"    {df},")
+        self._add_code(f"], how='{how}')")
+        self._add_code("")
+
+    def _handle_sort(self, settings: input_schema.NodeSort, var_name: str, input_vars: dict[str, str]) -> None:
+        """Handle sort nodes."""
+        input_df = input_vars.get("main", "df")
+
+        sort_cols = []
+        descending = []
+
+        for sort_input in settings.sort_input:
+            sort_cols.append(self._py_str(sort_input.column))
+            descending.append(sort_input.descending)
+
+        self._add_code(f"{var_name} = {input_df}.sort([{', '.join(sort_cols)}], descending={descending})")
+        self._add_code("")
+
+    def _handle_sample(self, settings: input_schema.NodeSample, var_name: str, input_vars: dict[str, str]) -> None:
+        """Handle sample nodes.
+
+        Mirrors ``FlowDataEngine.random_sample``: the random methods filter on a
+        shuffled row rank rather than calling ``sample``, which only exists on
+        eager DataFrames, so the generated script stays lazy like the flow does.
+        The FlowFrame (``ff``) converter overrides this with native ``.sample()`` calls.
+        """
+        input_df = input_vars.get("main", "df")
+        if settings.sample_method == "first":
+            self._add_code(f"{var_name} = {input_df}.head(n={settings.sample_size})")
+            self._add_code("")
+            return
+
+        self.imports.add("import polars as pl")
+        seed_arg = "" if settings.seed is None else f"seed={settings.seed}"
+        if settings.sample_method == "random_fraction":
+            threshold = f"(pl.len() * {settings.fraction / 100.0}).round().cast(pl.Int64)"
+        else:
+            threshold = str(max(0, settings.sample_size))
+        self._add_code(f"{var_name} = {input_df}.filter(pl.int_range(0, pl.len()).shuffle({seed_arg}) < {threshold})")
+        self._add_code("")
+
+    def _build_window_expr_code(
+        self,
+        w: "transform_schema.WindowFunctionInput",
+        partition_by: list[str],
+        order_by: list["transform_schema.SortByInput"] | None = None,
+    ) -> str:
+        """Builds a Polars expression string for a single window-function op."""
+        fw = self.framework
+        partition_repr = repr(partition_by) if partition_by else None
+
+        def over(expr: str) -> str:
+            return f"{expr}.over({partition_repr})" if partition_by else expr
+
+        func = w.function
+        if func.startswith("rolling_"):
+            behavior = w.edge_behavior or "require_full"
+            kwargs = f"window_size={w.window_size}"
+            if behavior in ("partial", "fill_zero"):
+                kwargs += ", min_samples=1"
+            elif w.min_periods is not None:
+                kwargs += f", min_samples={w.min_periods}"
+            base = f"{fw}.col({self._py_str(w.column)}).{func}({kwargs})"
+            if behavior == "fill_zero":
+                base = f"{base}.fill_null(0)"
+            return f"{over(base)}.alias({self._py_str(w.new_column_name)})"
+        if func.startswith("cum_") or transform_schema.is_aggregate_window_function(func):
+            base = f"{fw}.col({self._py_str(w.column)}).{func}()"
+            return f"{over(base)}.alias({self._py_str(w.new_column_name)})"
+        if func == "rank":
+            method = w.rank_method or "ordinal"
+            base = f"{fw}.col({self._py_str(w.column)}).rank(method={self._py_str(method)})"
+            return f"{over(base)}.alias({self._py_str(w.new_column_name)})"
+        if func == "tile":
+            # Tile uses only Expr methods (cum_count, when/then/otherwise) and the
+            # framework-level ``len()`` so it works in both pl and ff codegen.
+            if not order_by:
+                raise ValueError("tile requires at least one order_by column")
+            order_col = order_by[0].column
+            n = int(w.number_of_groups)
+            pos = over(f"{fw}.col({self._py_str(order_col)}).cum_count()") + " - 1"  # 0..N-1 per group
+            group_len = over(f"{fw}.len()")
+            big = f"(({group_len}) + {n} - 1) // {n}"
+            threshold = f"(({group_len}) % {n}) * ({big})"
+            small = (
+                f"{fw}.when((({group_len}) // {n}) < 1).then(1)"
+                f".otherwise(({group_len}) // {n})"
+            )
+            expr = (
+                f"{fw}.when(({pos}) < ({threshold}))"
+                f".then(({pos}) // ({big}) + 1)"
+                f".otherwise((({pos}) - ({threshold})) // ({small}) + (({group_len}) % {n}) + 1)"
+                f".cast({fw}.Int64)"
+            )
+            return f"{expr}.alias({self._py_str(w.new_column_name)})"
+        raise ValueError(f"Unsupported window function: {func!r}")
+
+    def _handle_window_functions(
+        self, settings: input_schema.NodeWindowFunctions, var_name: str, input_vars: dict[str, str]
+    ) -> None:
+        """Handle window function nodes (rolling, cumulative, rank, tile, partition aggregates)."""
+        input_df = input_vars.get("main", "df")
+        window_input = settings.window_input
+
+        sorted_df = input_df
+        if window_input.order_by:
+            sort_cols = [self._py_str(s.column) for s in window_input.order_by]
+            descending = [s.descending for s in window_input.order_by]
+            self._add_code(f"{var_name} = {input_df}.sort([{', '.join(sort_cols)}], descending={descending})")
+            sorted_df = var_name
+
+        exprs = [
+            self._build_window_expr_code(w, window_input.partition_by, window_input.order_by)
+            for w in window_input.window_functions
+        ]
+        self._add_code(f"{var_name} = {sorted_df}.with_columns([")
+        for expr in exprs:
+            self._add_code(f"    {expr},")
+        self._add_code("])")
+        self._add_code("")
+
+    @staticmethod
+    def _transform_fuzzy_mappings_to_string(fuzzy_mappings: list[FuzzyMapping], prefix: str = "") -> str:
+        # TODO(FlowFrame): FuzzyMapping fields containing Polars Expr objects
+        # (e.g. threshold_expr) are serialized via repr, producing invalid code like
+        # `pl.lit(<Expr ['len()'] at 0x...>)`. Need to convert Expr objects to their
+        # code string representation.
+        output_str = "["
+        for i, fuzzy_mapping in enumerate(fuzzy_mappings):
+            output_str += (
+                f"{prefix}FuzzyMapping(left_col={fuzzy_mapping.left_col!r},"
+                f" right_col={fuzzy_mapping.right_col!r}, "
+                f"threshold_score={fuzzy_mapping.threshold_score}, "
+                f"fuzzy_type={fuzzy_mapping.fuzzy_type!r})"
+            )
+            if i < len(fuzzy_mappings) - 1:
+                output_str += ",\n"
+        output_str += "]"
+        return output_str
+
+    def _fuzzy_match_inputs(
+        self, settings: input_schema.NodeFuzzyMatch, input_vars: dict[str, str]
+    ) -> tuple[str, str, transform_schema.FuzzyMatchInputManager]:
+        """The left and right frames as the node matches them, and its input manager.
+
+        The node applies each side's select (drops, then renames) before it matches, and its ``join_mapping``
+        names the renamed keys, so each side gets the same select here.
+        """
+        fuzzy_match_handler = transform_schema.FuzzyMatchInputManager(settings.join_input)
+        left_df = input_vars.get("main", input_vars.get("main_0", "df_left"))
+        right_df = input_vars.get("right", input_vars.get("main_1", "df_right"))
+
+        if left_df == right_df:
+            right_df = "df_right"
+            self._add_code(f"{right_df} = {left_df}")
+
+        inputs = self.flow_graph.get_node(settings.node_id).node_inputs
+        left_columns = self._predicted_columns((inputs.main_inputs or [None])[0])
+        right_columns = self._predicted_columns(inputs.right_input)
+        node_id = settings.node_id
+        left_df = self._fuzzy_select(left_df, fuzzy_match_handler.left_select, left_columns, f"_fuzzy_left_{node_id}")
+        right_df = self._fuzzy_select(
+            right_df, fuzzy_match_handler.right_select, right_columns, f"_fuzzy_right_{node_id}"
+        )
+        return left_df, right_df, fuzzy_match_handler
+
+    @staticmethod
+    def _predicted_columns(node) -> set[str] | None:
+        """The column names ``node`` outputs; None without a node or when its schema can't be predicted."""
+        try:
+            schema = node.get_predicted_schema() if node is not None else None
+        except Exception:
+            return None
+        return {column.column_name for column in schema} if schema else None
+
+    def _fuzzy_select(
+        self, frame: str, select: transform_schema.JoinInputsManager, columns: set[str] | None, temp: str
+    ) -> str:
+        """``frame`` as the node selects it from one side before matching.
+
+        Like ``prepare_for_fuzzy_match``, an entry whose column is no longer in the input is ignored, and a
+        present column is kept only when it is available and kept or a join key; without a predicted
+        ``columns`` the stored flags decide.
+        """
+        if columns is None:
+            drops = [c.old_name for c in select.non_jk_drop_columns]
+        else:
+            select.join_inputs.renames = [c for c in select.renames if c.old_name in columns]
+            drops = [c.old_name for c in select.renames if not ((c.keep or c.join_key) and c.is_available)]
+        renames = {old: new for old, new in select.rename_table.items() if old != new}
+        return self._select_into_temp(frame, temp, drops, renames)
+
+    def _handle_fuzzy_match(
+        self, settings: input_schema.NodeFuzzyMatch, var_name: str, input_vars: dict[str, str]
+    ) -> None:
+        """Handle fuzzy match nodes."""
+        self.imports.add("from pl_fuzzy_frame_match import FuzzyMapping, fuzzy_match_dfs")
+        left_df, right_df, fuzzy_match_handler = self._fuzzy_match_inputs(settings, input_vars)
+        fuzzy_join_mapping_settings = self._transform_fuzzy_mappings_to_string(fuzzy_match_handler.join_mapping)
+        self._add_code(
+            f"{var_name} = fuzzy_match_dfs(\n"
+            f"       left_df={left_df}, right_df={right_df},\n"
+            f"       fuzzy_maps={fuzzy_join_mapping_settings}\n"
+            f"       ).lazy()"
+        )
+
+    def _handle_unique(self, settings: input_schema.NodeUnique, var_name: str, input_vars: dict[str, str]) -> None:
+        """Handle unique/distinct nodes."""
+        input_df = input_vars.get("main", "df")
+
+        if settings.unique_input.columns:
+            self._add_code(
+                f"{var_name} = {input_df}.unique("
+                f"subset={settings.unique_input.columns}, keep='{settings.unique_input.strategy}')"
+            )
+        else:
+            self._add_code(f"{var_name} = {input_df}.unique(keep='{settings.unique_input.strategy}')")
+        self._add_code("")
+
+    def _handle_text_to_rows(
+        self, settings: input_schema.NodeTextToRows, var_name: str, input_vars: dict[str, str]
+    ) -> None:
+        """Handle text to rows (explode) nodes."""
+        # TODO(FlowFrame): Verify that {self.framework}.col() expressions work correctly
+        # when the input DataFrame may have been converted to pl.LazyFrame (e.g., after
+        # pivot .collect().lazy() or right join .collect().lazy() chains).
+        input_df = input_vars.get("main", "df")
+        text_input = settings.text_to_rows_input
+
+        split_col = self._py_str(text_input.column_to_split)
+        split_sep = self._py_str(text_input.split_fixed_value)
+        split_expr = f"{self.framework}.col({split_col}).str.split({split_sep})"
+        if text_input.output_column_name and text_input.output_column_name != text_input.column_to_split:
+            split_expr = f"{split_expr}.alias({self._py_str(text_input.output_column_name)})"
+            explode_col = text_input.output_column_name
+        else:
+            explode_col = text_input.column_to_split
+
+        self._add_code(f"{var_name} = {input_df}.with_columns({split_expr}).explode({self._py_str(explode_col)})")
+        self._add_code("")
+
+    # .with_columns(
+    #     (pl.cum_count(record_id_settings.output_column_name)
+    #      .over(record_id_settings.group_by_columns) + record_id_settings.offset - 1)
+    #     .alias(record_id_settings.output_column_name)
+    # )
+    def _handle_record_id(self, settings: input_schema.NodeRecordId, var_name: str, input_vars: dict[str, str]) -> None:
+        """Handle record ID nodes."""
+        input_df = input_vars.get("main", "df")
+        record_input = settings.record_id_input
+        out_lit = self._py_str(record_input.output_column_name)
+        if record_input.group_by and record_input.group_by_columns:
+            self._add_code(f"{var_name} = ({input_df}")
+            self._add_code(f"    .with_columns({self.framework}.lit(1).alias({out_lit}))")
+            self._add_code("    .with_columns([")
+            # cum_count is 1-indexed, so the net shift is (offset - 1); emit it only
+            # when it does not cancel out (default offset=1 -> bare cum_count).
+            delta = record_input.offset - 1
+            offset_expr = "" if delta == 0 else (f" + {delta}" if delta > 0 else f" - {abs(delta)}")
+            self._add_code(
+                f"    ({self.framework}.cum_count({out_lit}).over({record_input.group_by_columns}){offset_expr})"
+            )
+            self._add_code(f"    .alias({out_lit})")
+            self._add_code("])")
+            self._add_code(f".select([{out_lit}] + [col for col in {input_df}.columns if col != {out_lit}])")
+            self._add_code(")")
+        else:
+            self._add_code(f"{var_name} = {input_df}.with_row_count(name={out_lit}, offset={record_input.offset})")
+        self._add_code("")
+
+    def _handle_cross_join(
+        self, settings: input_schema.NodeCrossJoin, var_name: str, input_vars: dict[str, str]
+    ) -> None:
+        """Handle cross join nodes."""
+        left_df = input_vars.get("main", input_vars.get("main_0", "df_left"))
+        right_df = input_vars.get("right", input_vars.get("main_1", "df_right"))
+
+        self._add_code(f"{var_name} = {left_df}.join({right_df}, how='cross')")
+        self._add_code("")

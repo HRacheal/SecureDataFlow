@@ -1,0 +1,8791 @@
+import ast
+import json
+import re
+import string
+from datetime import date, datetime
+from pathlib import Path
+from uuid import uuid4
+
+import polars as pl
+import pytest
+from pl_fuzzy_frame_match.models import FuzzyMapping
+from polars.testing import assert_frame_equal
+
+from flowfile_core.flowfile.code_generator.code_generator import export_flow_to_flowframe, export_flow_to_polars, UnsupportedNodeError
+from flowfile_core.flowfile.flow_data_engine.flow_data_engine import FlowDataEngine
+from flowfile_frame.flow_frame import FlowFrame
+from flowfile_core.flowfile.flow_graph import FlowGraph, add_connection
+from flowfile_core.schemas import cloud_storage_schemas as cloud_ss
+from flowfile_core.schemas import input_schema, schemas, transform_schema
+from flowfile_core.types import DataType
+from flowfile_core.flowfile.param_types import FlowParameter
+from tests.flowfile_core_test_utils import exec_script
+
+try:
+    import os
+
+    from tests.flowfile_core_test_utils import ensure_password_is_available, is_docker_available
+    from tests.utils import ensure_cloud_storage_connection_is_available_and_get_connection, get_cloud_connection
+except ModuleNotFoundError:
+    import os
+    import sys
+    sys.path.append(os.path.dirname(os.path.abspath("flowfile_core/tests/flowfile_core_test_utils.py")))
+    sys.path.append(os.path.dirname(os.path.abspath("flowfile_core/tests/utils.py")))
+    # noinspection PyUnresolvedReferences
+    from flowfile_core_test_utils import is_docker_available
+
+    from tests.utils import ensure_cloud_storage_connection_is_available_and_get_connection, get_cloud_connection
+
+
+def create_flow_settings(flow_id: int = 1) -> schemas.FlowSettings:
+    """Create basic flow settings for tests"""
+    return schemas.FlowSettings(
+        flow_id=flow_id,
+        execution_mode="Performance",
+        execution_location="local",
+        path="/tmp/test_flow"
+    )
+
+
+def find_parent_directory(target_dir_name, start_path=None):
+    """Navigate up directories until finding the target directory"""
+    current_path = Path(start_path) if start_path else Path.cwd()
+
+    while current_path != current_path.parent:
+        if current_path.name == target_dir_name:
+            return current_path
+        if current_path.name == target_dir_name:
+            return current_path
+        current_path = current_path.parent
+
+    raise FileNotFoundError(f"Directory '{target_dir_name}' not found")
+
+
+def verify_if_execute(code: str):
+    exec_globals = {}
+    try:
+        exec_script(code, exec_globals)
+        _ = exec_globals['run_etl_pipeline']()
+    except Exception as e:
+        raise Exception(f"Code execution should not raise an exception:\n {e}\n\n could not execute {code}")
+
+
+def get_result_from_generated_code(code: str) -> pl.DataFrame | pl.LazyFrame | list[pl.DataFrame | pl.LazyFrame] | None:
+    return exec_script(code)['run_etl_pipeline']()
+
+
+def normalize_result(result):
+    """Convert FlowFrame/LazyFrame results to pl.DataFrame for comparison."""
+    if hasattr(result, "data") and hasattr(result, "collect"):
+        return result.collect()
+    if hasattr(result, "collect"):
+        return result.collect()
+    return result
+
+
+def create_basic_flow(flow_id: int = 1, name: str = "test_flow") -> FlowGraph:
+    """Create a basic flow graph for testing"""
+    return FlowGraph(flow_settings=create_flow_settings(flow_id), name=name)
+
+
+def generate_parameterized_join_tests():
+    """Generate parameterized test cases with descriptive names"""
+
+    test_cases = []
+
+    join_types = ["inner", "left", "right", "outer"]
+    rename_configs = [
+        ("no_rename", False, False),
+        ("left_rename", True, False),
+        ("right_rename", False, True),
+        ("both_rename", True, True)
+    ]
+    keep_configs = [
+        ("all_keep", True, True),
+        ("left_no_keep", False, True),
+        ("right_no_keep", True, False),
+        ("both_no_keep", False, False)
+    ]
+
+    for join_type in join_types:
+        for rename_name, left_rename, right_rename in rename_configs:
+            for keep_name, left_keep, right_keep in keep_configs:
+                test_name = f"{join_type}_{rename_name}_{keep_name}"
+
+                scenario = input_schema.NodeJoin(
+                    flow_id=1,
+                    node_id=3,
+                    depending_on_ids=[1, 2],
+                    join_input=transform_schema.JoinInput(
+                        join_mapping=[transform_schema.JoinMap("id", "id")],
+                        left_select=[
+                            transform_schema.SelectInput(
+                                "id",
+                                "left_id" if left_rename else "id",
+                                keep=left_keep
+                            ),
+                            transform_schema.SelectInput(
+                                "name",
+                                "left_name" if left_rename else "name"
+                            )
+                        ],
+                        right_select=[
+                            transform_schema.SelectInput(
+                                "id",
+                                "right_id" if right_rename else "id",
+                                keep=right_keep
+                            ),
+                            transform_schema.SelectInput(
+                                "city",
+                                "right_city" if right_rename else "city"
+                            )
+                        ],
+                        how=join_type
+                    )
+                )
+
+                test_cases.append((test_name, scenario))
+
+    return test_cases
+
+
+def generate_parameterized_join_tests_same_df():
+    """Generate parameterized test cases with descriptive names"""
+
+    test_cases = []
+
+    join_types = ["inner", "left", "right", "outer"]
+    rename_configs = [
+        ("no_rename", False, False),
+        ("left_rename", True, False),
+        ("right_rename", False, True),
+        ("both_rename", True, True)
+    ]
+    keep_configs = [
+        ("all_keep", True, True),
+        ("left_no_keep", False, True),
+        ("right_no_keep", True, False),
+        ("both_no_keep", False, False)
+    ]
+
+    for join_type in join_types:
+        for rename_name, left_rename, right_rename in rename_configs:
+            for keep_name, left_keep, right_keep in keep_configs:
+                test_name = f"{join_type}_{rename_name}_{keep_name}"
+
+                scenario = input_schema.NodeJoin(
+                    flow_id=1,
+                    node_id=2,
+                    depending_on_ids=[1, 1],
+                    join_input=transform_schema.JoinInput(
+                        join_mapping=[transform_schema.JoinMap("id", "id")],
+                        left_select=[
+                            transform_schema.SelectInput(
+                                "id",
+                                "left_id" if left_rename else "id",
+                                keep=left_keep
+                            ),
+                            transform_schema.SelectInput(
+                                "category",
+                                "left_category" if left_rename else "category"
+                            ),
+                            transform_schema.SelectInput(
+                                "value",
+                                "left_value" if left_rename else "value",
+                            )
+                        ],
+                        right_select=[
+                            transform_schema.SelectInput(
+                                "id",
+                                "right_id" if right_rename else "id",
+                                keep=right_keep
+                            ),
+                            transform_schema.SelectInput(
+                                "category",
+                                "right_category" if right_rename else "category"
+                            ),
+                            transform_schema.SelectInput(
+                                "value",
+                                "right_value" if right_rename else "value"
+                            )
+                        ],
+                        how=join_type
+                    )
+                )
+
+                test_cases.append((test_name, scenario))
+
+    return test_cases
+
+
+@pytest.fixture
+def join_input_dataset() -> tuple[input_schema.NodeManualInput, input_schema.NodeManualInput]:
+    left_data = input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=1,
+        raw_data_format=input_schema.RawData(
+            columns=[
+                input_schema.MinimalFieldInfo(name="id", data_type="Integer"),
+                input_schema.MinimalFieldInfo(name="name", data_type="String")
+            ],
+            data=[[1, 2, 3], ["Alice", "Bob", "Charlie"]]
+        )
+    )
+
+    right_data = input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=2,
+        raw_data_format=input_schema.RawData(
+            columns=[
+                input_schema.MinimalFieldInfo(name="id", data_type="Integer"),
+                input_schema.MinimalFieldInfo(name="city", data_type="String")
+            ],
+            data=[[1, 2, 4], ["NYC", "LA", "Chicago"]]
+        )
+    )
+    return left_data, right_data
+
+
+@pytest.fixture
+def fuzzy_join_left_data() -> input_schema.NodeManualInput:
+    return input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=1,
+        raw_data_format=input_schema.RawData(
+            columns=[
+                input_schema.MinimalFieldInfo(name="id", data_type="Integer"),
+                input_schema.MinimalFieldInfo(name="name", data_type="String"),
+                input_schema.MinimalFieldInfo(name="address", data_type="String"),
+            ],
+            data=[[1, 2, 3, 4, 5], ["Edward", "Eduward", "Edvard", "Charles", "Charlie"],
+                  ["123 Main Str", "123 Main Street", "456 Elm Str", "789 Oak Str", "789 Oak Street"]]
+        )
+    )
+
+
+@pytest.fixture
+def fuzzy_join_right_data() -> input_schema.NodeManualInput:
+    return input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=2,
+        raw_data_format=input_schema.RawData(
+            columns=[
+                input_schema.MinimalFieldInfo(name="first_name", data_type="String"),
+                input_schema.MinimalFieldInfo(name="street", data_type="String"),
+            ],
+            data=[[1, 2, 3, 4, 5], ["Edward", "Eduward", "Edvard", "Charles", "Charlie"],
+                  ["main street 123", "main street 123", "elm street 456", "oak street 789", "oak street 789"]]
+        )
+    )
+
+
+@pytest.fixture
+def join_input_large_dataset() -> tuple[input_schema.NodeManualInput, input_schema.NodeManualInput]:
+    data_engine = FlowDataEngine.create_random(100)
+    data_engine_2 = FlowDataEngine.create_random(10)
+    left_data = input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=1,
+        raw_data_format=data_engine.select_columns(['ID', "Name", "Address", "Zipcode"]).to_raw_data()
+    )
+    right_data = input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=2,
+        raw_data_format=data_engine.get_sample(50, random=True).concat(data_engine_2).select_columns(["ID", "Name", "City"]).to_raw_data()
+        )
+    return left_data, right_data
+
+
+@pytest.fixture
+def join_input_same_df() -> input_schema.NodeManualInput:
+    return input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=1,
+        raw_data_format=input_schema.RawData(
+            columns=[input_schema.MinimalFieldInfo(name='id', data_type='Int64'),
+                     input_schema.MinimalFieldInfo(name='category', data_type='String'),
+                     input_schema.MinimalFieldInfo(name='value', data_type='Int64')],
+            data=[[1, 2], ['A', 'B'], [100, 200]])
+
+    )
+
+
+def get_reference_polars_dataframe() -> pl.LazyFrame:
+    return pl.LazyFrame([
+        [1, 2, 3, 4, 5],
+        ["Alice", "Bob", "Charlie", "David", "Eve"],
+        [25, 30, 35, 40, 28],
+        ["NYC", "LA", "Chicago", "Houston", "NYC"],
+        [50000, 75000, 90000, 85000, 65000]
+    ], schema=['id', 'name', 'age', 'city', 'salary'])
+
+
+def create_sample_dataframe_node(flow: FlowGraph, node_id: int = 1) -> FlowGraph:
+    """Add a standard sample dataframe to the flow"""
+    manual_input = input_schema.NodeManualInput(
+        flow_id=flow.flow_id,
+        node_id=node_id,
+        raw_data_format=input_schema.RawData(
+            columns=[
+                input_schema.MinimalFieldInfo(name="id", data_type="Integer"),
+                input_schema.MinimalFieldInfo(name="name", data_type="String"),
+                input_schema.MinimalFieldInfo(name="age", data_type="Integer"),
+                input_schema.MinimalFieldInfo(name="city", data_type="String"),
+                input_schema.MinimalFieldInfo(name="salary", data_type="Integer")
+            ],
+            data=[
+                [1, 2, 3, 4, 5],
+                ["Alice", "Bob", "Charlie", "David", "Eve"],
+                [25, 30, 35, 40, 28],
+                ["NYC", "LA", "Chicago", "Houston", "NYC"],
+                [50000.0, 75000.0, 90000.0, 85000.0, 65000.0]
+            ]
+        )
+    )
+    flow.add_manual_input(manual_input)
+    return flow
+
+
+def create_sample_dataframe_for_graph_solver(flow: FlowGraph, node_id: int = 1) -> FlowGraph:
+    input_data = input_schema.RawData.from_pylist([{'from': 'a', 'to': 'b'}, {'from': 'b', 'to': 'c'}, {'from': 'g', 'to': 'd'}])
+    flow.add_manual_input(input_schema.NodeManualInput(flow_id=flow.flow_id, node_id=node_id, raw_data_format=input_data))
+    return flow
+
+
+def create_sales_dataframe_node(flow: FlowGraph, node_id: int = 1) -> FlowGraph:
+    """Add a sales-focused dataframe to the flow"""
+    sales_data = input_schema.NodeManualInput(
+        flow_id=flow.flow_id,
+        node_id=node_id,
+        raw_data_format=input_schema.RawData(
+            columns=[
+                input_schema.MinimalFieldInfo(name="date", data_type="String"),
+                input_schema.MinimalFieldInfo(name="product", data_type="String"),
+                input_schema.MinimalFieldInfo(name="quantity", data_type="Integer"),
+                input_schema.MinimalFieldInfo(name="price", data_type="Double"),
+                input_schema.MinimalFieldInfo(name="region", data_type="String")
+            ],
+            data=[
+                ["2024-01-01", "2024-01-01", "2024-01-02", "2024-01-02", "2024-01-03"],
+                ["A", "B", "A", "B", "C"],
+                [10, 20, 15, 25, 30],
+                [100.0, 200.0, 100.0, 200.0, 150.0],
+                ["North", "North", "South", "South", "East"]
+            ]
+        )
+    )
+    flow.add_manual_input(sales_data)
+    return flow
+
+
+def get_csv_df() -> pl.DataFrame:
+    return pl.DataFrame({
+        "name": ["Alice", "Bob", "Charlie", "David"],
+        "age": [25, 30, 35, 40],
+        "city": ["NYC", "LA", "Chicago", "Houston"]
+    })
+
+
+def create_csv_file_node(flow: FlowGraph, tmp_path: Path, node_id: int = 1,
+                         df: pl.DataFrame = None, filename: str = "test_data.csv") -> FlowGraph:
+    """Create a CSV file and add a read node to the flow"""
+    if df is None:
+        df = get_csv_df()
+    csv_path = tmp_path / filename
+    df.write_csv(csv_path)
+    read_node = input_schema.NodeRead(
+        flow_id=flow.flow_id,
+        node_id=node_id,
+        received_file=input_schema.ReceivedTable(
+            name=filename,
+            path=str(csv_path),
+            file_type="csv",
+            table_settings=input_schema.InputCsvTable(
+                delimiter=",",
+                has_headers=True,
+                encoding="utf-8"
+            )
+        )
+    )
+
+    flow.add_read(read_node)
+    return flow
+
+
+def verify_code_contains(code: str, *snippets: str) -> None:
+    """Verify that all snippets are present in the code"""
+    for snippet in snippets:
+        if snippet not in code:
+            if '"' in snippet and "'" in snippet:
+                assert False, f"Expected '{snippet}' to be in generated code"
+            elif '"' in snippet:
+                alt_snippet = snippet.replace('"', "'")
+                if alt_snippet not in code:
+                    assert False, f"Expected '{snippet}' (or '{alt_snippet}') to be in generated code"
+            elif "'" in snippet:
+                alt_snippet = snippet.replace("'", '"')
+                if alt_snippet not in code:
+                    assert False, f"Expected '{snippet}' (or '{alt_snippet}') to be in generated code"
+            else:
+                assert False, f"Expected '{snippet}' to be in generated code"
+
+
+def verify_code_ordering(code: str, *ordered_snippets: str) -> None:
+    """Verify that snippets appear in the correct order in the code"""
+    lines = code.split('\n')
+    indices = []
+
+    for snippet in ordered_snippets:
+        found_index = -1
+        for i, line in enumerate(lines):
+            if snippet in line:
+                found_index = i
+                break
+        assert found_index != -1, f"Could not find '{snippet}' in code"
+        indices.append(found_index)
+
+    for i in range(1, len(indices)):
+        assert indices[i - 1] < indices[i], f"'{ordered_snippets[i - 1]}' should appear before '{ordered_snippets[i]}'"
+
+
+@pytest.mark.parametrize("export_func", [
+    export_flow_to_polars,
+    export_flow_to_flowframe,
+], ids=["polars", "flowframe"])
+@pytest.mark.parametrize("test_name,join_scenario",  generate_parameterized_join_tests())
+def test_join_operation(test_name, join_scenario, join_input_dataset, export_func):
+    """Parameterized test for all join operation combinations"""
+    flow = create_basic_flow()
+    left_data, right_data = join_input_dataset
+    flow.add_manual_input(left_data)
+    flow.add_manual_input(right_data)
+    flow.add_join(join_scenario)
+    left_connection = input_schema.NodeConnection.create_from_simple_input(1, 3, 'main')
+    right_connection = input_schema.NodeConnection.create_from_simple_input(2, 3, 'right')
+    add_connection(flow, left_connection)
+    add_connection(flow, right_connection)
+
+    code = export_func(flow)
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(3).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected_df, check_column_order=False, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [
+    export_flow_to_polars,
+    export_flow_to_flowframe,
+], ids=["polars", "flowframe"])
+@pytest.mark.parametrize("test_name,join_scenario",  generate_parameterized_join_tests_same_df())
+def test_join_operation_same_df(test_name, join_scenario, join_input_same_df, export_func):
+    """Parameterized test for all join operation combinations"""
+    flow = create_basic_flow()
+    flow.add_manual_input(join_input_same_df)
+    flow.add_join(join_scenario)
+
+    left_connection = input_schema.NodeConnection.create_from_simple_input(1, 2, 'main')
+    right_connection = input_schema.NodeConnection.create_from_simple_input(1, 2, 'right')
+    add_connection(flow, left_connection)
+    add_connection(flow, right_connection)
+    code = export_func(flow)
+    from flowfile_core.schemas.input_schema import RawData
+    import flowfile as ff
+
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected_df, check_column_order=False, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_simple_manual_input(export_func):
+    flow = create_basic_flow()
+    flow = create_sample_dataframe_node(flow)
+    code = export_func(flow)
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected = normalize_result(get_reference_polars_dataframe())
+    assert_frame_equal(result, expected)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_simple_csv_read_and_filter(tmp_path, export_func):
+    """Test converting a simple CSV read and filter flow"""
+    flow = create_basic_flow()
+    flow = create_csv_file_node(flow, tmp_path)
+    filter_node = input_schema.NodeFilter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        filter_input=transform_schema.FilterInput(
+            filter_type="advanced",
+            advanced_filter="[age]>30"
+        )
+    )
+    flow.add_filter(filter_node)
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(1, 2))
+    code = export_func(flow)
+
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_manual_input_with_select(export_func):
+    """Test manual data input with column selection and renaming"""
+    flow = create_basic_flow()
+    flow = create_sample_dataframe_node(flow)
+    select_node = input_schema.NodeSelect(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        select_input=[
+            transform_schema.SelectInput("name", "full_name", keep=True),
+            transform_schema.SelectInput("age", "age", keep=True),
+            transform_schema.SelectInput("city", "city", keep=False),
+            transform_schema.SelectInput("salary", "salary", keep=True, data_type="Float64", is_altered=True)
+        ]
+    )
+    flow.add_select(select_node)
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(1, 2))
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code,
+                             'pl.col("name").alias("full_name")',
+                             'pl.col("age")',
+                             'pl.col("salary").cast(pl.Float64)'
+                             )
+        assert 'pl.col("city")' not in code
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    # keep_missing (the default) passes the unlisted id column through
+    expected_result = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert "id" in expected_result.columns
+    assert_frame_equal(result, expected_result)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_number_of_records(export_func):
+    """Test manual data input with column selection and renaming"""
+    flow = create_basic_flow()
+    flow = create_sample_dataframe_node(flow)
+    record_count_node = input_schema.NodeRecordCount(flow_id=1, node_id=2, depending_on_id=1)
+
+    flow.add_record_count(record_count_node)
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(1, 2))
+    code = export_func(flow)
+
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected_result = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected_result)
+
+
+@pytest.mark.parametrize("export_func", [
+    export_flow_to_polars,
+    export_flow_to_flowframe,
+], ids=["polars", "flowframe"])
+def test_graph_solver(export_func):
+    flow = create_basic_flow()
+    create_sample_dataframe_for_graph_solver(flow)
+    graph_solver_input = transform_schema.GraphSolverInput(col_from='from', col_to='to', output_column_name='g')
+    flow.add_graph_solver(input_schema.NodeGraphSolver(flow_id=1, node_id=2, graph_solver_input=graph_solver_input))
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(1, 2))
+    code = export_func(flow)
+
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected_result = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected_result)
+
+
+BIKE_BOM_LINES = [
+    ("bike", "frame", 1.0), ("bike", "wheel", 2.0), ("bike", "screw", 10.0), ("bike", "handlebar", 1.0),
+    ("ebike", "frame", 1.0), ("ebike", "wheel", 2.0), ("ebike", "battery", 1.0), ("ebike", "motor", 1.0),
+    ("ebike", "screw", 12.0), ("frame", "steel_tube", 3.5), ("frame", "screw", 6.0), ("wheel", "rim", 1.0),
+    ("wheel", "spoke", 32.0), ("wheel", "tyre", 1.0), ("wheel", "screw", 2.0), ("rim", "aluminium", 0.75),
+    ("handlebar", "steel_tube", 0.5), ("handlebar", "grip", 2.0), ("motor", "copper_wire", 12.0),
+    ("motor", "screw", 4.0),
+]
+
+
+INTEGER_ID_SOURCES = {
+    "int16_ids": ("Int16", "Int16"),
+    "int64_int32_ids": ("Int64", "Int32"),
+    "int32_int16_ids": ("Int32", "Int16"),
+    "uint64_int64_ids": ("UInt64", "Int64"),
+}
+
+
+def bike_bom_source(source: str) -> tuple[dict[str, str], dict[str, list], tuple[str, str, str]]:
+    """(dtypes, columns, (parent, child, quantity) names) for one variant of the bike-factory BOM."""
+    assemblies, components, quantities = (list(c) for c in zip(*BIKE_BOM_LINES))
+    names = ("assembly", "component", "qty")
+    id_dtype, qty_dtype = "String", "Float64"
+    child_dtype = None
+    if source == "int32_qty":
+        quantities, qty_dtype = [max(1, int(q)) for q in quantities], "Int32"
+    elif source in INTEGER_ID_SOURCES:
+        codes = {item: i for i, item in enumerate(sorted(set(assemblies) | set(components)), start=1)}
+        assemblies, components = [codes[a] for a in assemblies], [codes[c] for c in components]
+        id_dtype, child_dtype = INTEGER_ID_SOURCES[source]
+    elif source == "quoted":
+        names = ('assembly "top"', "component's", 'qty "per" \\ unit')
+    elif source != "bom":
+        raise ValueError(source)
+    dtypes = dict(zip(names, (id_dtype, child_dtype or id_dtype, qty_dtype)))
+    columns = dict(zip(names, (assemblies, components, quantities)))
+    return dtypes, columns, names
+
+
+def create_explode_hierarchy_flow(source: str = "bom", **settings) -> FlowGraph:
+    """manual_input(bike BOM variant) -> explode_hierarchy, quantity column on unless overridden."""
+    dtypes, columns, (parent, child, qty) = bike_bom_source(source)
+    flow = create_basic_flow()
+    flow.add_manual_input(input_schema.NodeManualInput(
+        flow_id=1, node_id=1,
+        raw_data_format=input_schema.RawData(
+            columns=[input_schema.MinimalFieldInfo(name=n, data_type=t) for n, t in dtypes.items()],
+            data=[columns[n] for n in dtypes],
+        ),
+    ))
+    hierarchy_input = transform_schema.ExplodeHierarchyInput(
+        **{"parent_column": parent, "child_column": child, "quantity_column": qty, **settings}
+    )
+    flow.add_explode_hierarchy(input_schema.NodeExplodeHierarchy(
+        flow_id=1, node_id=2, depending_on_id=1, explode_hierarchy_input=hierarchy_input,
+    ))
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(1, 2))
+    return flow
+
+
+EXPLODE_HIERARCHY_CASES = [
+    ("totals_with_quantity", "bom", {}),
+    ("no_quantity", "bom", {"quantity_column": None}),
+    ("levels", "bom", {"output_detail": "levels"}),
+    ("paths", "bom", {"output_detail": "paths"}),
+    ("top_level_only", "bom", {"top_level_only": True}),
+    ("include_self", "bom", {"include_self": True, "output_detail": "paths"}),
+    ("max_depth", "bom", {"max_depth": 1, "output_detail": "levels"}),
+    ("max_depth_zero", "bom", {"max_depth": 0, "include_self": True}),
+    ("int32_quantity", "int32_qty", {}),
+    ("int16_ids", "int16_ids", {"output_detail": "paths", "top_level_only": True}),
+    ("int64_int32_ids", "int64_int32_ids", {"output_detail": "paths"}),
+    ("int32_int16_ids", "int32_int16_ids", {}),
+    ("uint64_int64_ids", "uint64_int64_ids", {"output_detail": "levels"}),
+    ("quoted_column_names", "quoted", {"output_detail": "levels"}),
+]
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+@pytest.mark.parametrize("source,settings", [c[1:] for c in EXPLODE_HIERARCHY_CASES],
+                         ids=[c[0] for c in EXPLODE_HIERARCHY_CASES])
+def test_explode_hierarchy(source, settings, export_func):
+    """The exported code must produce exactly what the flow produces, casts and all."""
+    flow = create_explode_hierarchy_flow(source, **settings)
+    code = export_func(flow)
+
+    if export_func is export_flow_to_polars:
+        function_name = f"hierarchy_{settings.get('output_detail', 'totals')}"
+        verify_code_contains(code, f"from polars_grouper import {function_name}", '.unnest("hierarchy")')
+    else:
+        verify_code_contains(code, ".explode_hierarchy(")
+        assert "polars_grouper" not in code
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected = flow.get_node(2).get_resulting_data().data_frame.collect()
+    assert expected.height > 0
+    assert_frame_equal(result, expected)
+
+
+def test_explode_hierarchy_polars_export_emits_engine_casts_and_only_non_default_kwargs():
+    flow = create_explode_hierarchy_flow("bom", top_level_only=True)
+    verify_code_contains(
+        export_flow_to_polars(flow),
+        '.select(hierarchy_totals(pl.col("assembly"), pl.col("component"), pl.col("qty").cast(pl.Float64), '
+        'top_level_only=True).alias("hierarchy")).unnest("hierarchy")',
+    )
+
+    code = export_flow_to_polars(create_explode_hierarchy_flow("int16_ids", quantity_column=None))
+    verify_code_contains(
+        code, 'hierarchy_totals(pl.col("assembly").cast(pl.Int64), pl.col("component").cast(pl.Int64)).alias("hierarchy")'
+    )
+    assert "include_self" not in code and "max_depth" not in code
+
+    code = export_flow_to_polars(create_explode_hierarchy_flow("int64_int32_ids", quantity_column=None))
+    verify_code_contains(
+        code, 'hierarchy_totals(pl.col("assembly"), pl.col("component").cast(pl.Int64)).alias("hierarchy")'
+    )
+
+
+@pytest.mark.parametrize(
+    "source,id_dtype",
+    [("int64_int32_ids", pl.Int64), ("int32_int16_ids", pl.Int32), ("uint64_int64_ids", pl.String)],
+)
+def test_explode_hierarchy_mixed_integer_ids_share_one_type(source, id_dtype):
+    """Integer ids of different widths come out as their common integer type, predicted and run alike."""
+    node = create_explode_hierarchy_flow(source, output_detail="paths").get_node(2)
+    predicted = {c.column_name: c.data_type for c in node.get_predicted_schema()}
+    result = node.get_resulting_data().data_frame.collect()
+    assert predicted["ancestor"] == predicted["descendant"] == str(id_dtype)
+    assert result.schema["ancestor"] == result.schema["descendant"] == id_dtype
+    assert result.schema["path"] == pl.List(id_dtype)
+
+
+HIERARCHY_ID_DTYPES = [
+    pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64,
+    pl.Int128, pl.String, pl.Float64, pl.Boolean,
+]
+
+
+@pytest.mark.parametrize("child", HIERARCHY_ID_DTYPES, ids=str)
+@pytest.mark.parametrize("parent", HIERARCHY_ID_DTYPES, ids=str)
+def test_explode_hierarchy_run_time_id_helper_matches_the_engine(parent, child):
+    """The exported run-time cast helper casts every dtype pair exactly as ``hierarchy_node_id_casts`` does."""
+    from flowfile_core.flowfile.code_generator.code_generator import _HIERARCHY_ID_HELPER
+    from flowfile_core.flowfile.flow_data_engine.hierarchy import hierarchy_node_id_casts
+
+    namespace = {"pl": pl}
+    exec(_HIERARCHY_ID_HELPER, namespace)
+    lf = pl.LazyFrame(schema={"p": parent, "c": child})
+    exported = lf.select(*namespace["_flowfile_hierarchy_ids"](lf, "p", "c")).collect_schema()
+    casts = hierarchy_node_id_casts(parent, child)
+    assert list(exported.values()) == [cast or dtype for cast, dtype in zip(casts, (parent, child))]
+
+
+def test_explode_hierarchy_flowframe_export_calls_the_native_method():
+    flow = create_explode_hierarchy_flow(
+        "bom", output_detail="levels", top_level_only=True, include_self=True, max_depth=3
+    )
+    verify_code_contains(
+        export_flow_to_flowframe(flow),
+        '.explode_hierarchy("assembly", "component", quantity="qty", output_detail="levels", '
+        "top_level_only=True, include_self=True, max_depth=3)",
+    )
+
+    code = export_flow_to_flowframe(create_explode_hierarchy_flow("bom", quantity_column=None))
+    verify_code_contains(code, '.explode_hierarchy("assembly", "component")')
+
+
+def test_explode_hierarchy_flowframe_export_rebuilds_the_native_node():
+    code = export_flow_to_flowframe(create_explode_hierarchy_flow("bom", output_detail="paths"))
+    result = get_result_from_generated_code(code)
+    assert isinstance(result, FlowFrame)
+    node_types = [node.node_type for node in result.flow_graph.nodes]
+    assert node_types.count("explode_hierarchy") == 1
+    assert "polars_code" not in node_types
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_explode_hierarchy_column_names_from_flow_parameters(export_func):
+    """``${param}`` column names become function arguments that default to the parameter's value."""
+    flow = create_explode_hierarchy_flow("bom", parent_column="${parent}", child_column="${child}")
+    flow.flow_settings.parameters = [
+        FlowParameter(name="parent", default_value="assembly"),
+        FlowParameter(name="child", default_value="component"),
+    ]
+    code = export_func(flow)
+
+    assert "${" not in code and "__FF_PARAM_" not in code
+    if export_func is export_flow_to_polars:
+        verify_code_contains(
+            code, "hierarchy_totals(*_flowfile_hierarchy_ids(source, parent, child),"
+        )
+    else:
+        verify_code_contains(code, '.explode_hierarchy(parent, child, quantity="qty")')
+    result = normalize_result(get_result_from_generated_code(code))
+    expected = create_explode_hierarchy_flow("bom").get_node(2).get_resulting_data().data_frame.collect()
+    assert_frame_equal(result, expected)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_explode_hierarchy_parameterised_small_int_ids_are_cast_at_run_time(export_func):
+    """With a ``${param}`` name the dtype is unknown at export time, so the cast must happen when the code runs."""
+    flow = create_explode_hierarchy_flow("int16_ids", parent_column="${parent}", output_detail="paths")
+    flow.flow_settings.parameters = [FlowParameter(name="parent", default_value="assembly")]
+    code = export_func(flow)
+
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    unparameterised = create_explode_hierarchy_flow("int16_ids", output_detail="paths")
+    expected = unparameterised.get_node(2).get_resulting_data().data_frame.collect()
+    assert expected["ancestor"].dtype == pl.Int64
+    assert_frame_equal(result, expected)
+
+
+@pytest.mark.parametrize("source", ["int16_ids", "int64_int32_ids", "int32_int16_ids", "uint64_int64_ids"])
+def test_explode_hierarchy_unpredictable_input_schema_casts_at_run_time(monkeypatch, source):
+    """Without a predicted input schema the Polars export still casts ids like the engine does."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToPolarsConverter
+
+    monkeypatch.setattr(FlowGraphToPolarsConverter, "_input_column_types", lambda self, node_id: None)
+    flow = create_explode_hierarchy_flow(source, output_detail="paths")
+    code = export_flow_to_polars(flow)
+
+    verify_code_contains(
+        code,
+        "def _flowfile_hierarchy_ids(frame, parent, child):",
+        '_flowfile_hierarchy_ids(source, "assembly", "component")',
+    )
+    result = normalize_result(get_result_from_generated_code(code))
+    assert_frame_equal(result, flow.get_node(2).get_resulting_data().data_frame.collect())
+
+
+def test_input_column_lookups_share_one_main_input_schema(monkeypatch):
+    """Names and dtypes come from the same single-main-input lookup and fail to None together."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToPolarsConverter
+    from flowfile_core.flowfile.flow_node.flow_node import FlowNode
+
+    converter = FlowGraphToPolarsConverter(create_explode_hierarchy_flow("int64_int32_ids"))
+    types = converter._input_column_types(2)
+    assert types is not None and types["assembly"] == "Int64"
+    assert converter._input_column_names(2) == list(types)
+
+    for missing in (1, 99):
+        assert converter._input_column_types(missing) is None
+        assert converter._input_column_names(missing) is None
+
+    for predicted in (lambda self, force=False: [], lambda self, force=False: 1 / 0):
+        monkeypatch.setattr(FlowNode, "get_predicted_schema", predicted)
+        assert converter._input_column_types(2) is None
+        assert converter._input_column_names(2) is None
+
+
+@pytest.mark.parametrize("export_func", [
+    export_flow_to_polars,
+    export_flow_to_flowframe,
+], ids=["polars", "flowframe"])
+def test_join_operation_left(join_input_dataset, export_func):
+    """Test join operation between two datasets"""
+    flow = create_basic_flow()
+    left_data, right_data = join_input_dataset
+    flow.add_manual_input(left_data)
+    flow.add_manual_input(right_data)
+
+    join_node = input_schema.NodeJoin(
+        flow_id=1,
+        node_id=3,
+        depending_on_ids=[1, 2],
+        join_input=transform_schema.JoinInput(
+            join_mapping=[transform_schema.JoinMap("id", "id")],
+            left_select=[transform_schema.SelectInput("id"), transform_schema.SelectInput("name")],
+            right_select=[transform_schema.SelectInput("id"), transform_schema.SelectInput("city")],
+            how="left"
+        )
+    )
+    flow.add_join(join_node)
+    left_connection = input_schema.NodeConnection.create_from_simple_input(1, 3, 'main')
+    right_connection = input_schema.NodeConnection.create_from_simple_input(2, 3, 'right')
+    add_connection(flow, left_connection)
+    add_connection(flow, right_connection)
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code,
+                             "source_1.join(",
+                             "_join_3_right,",
+                             'left_on=["id"]',
+                             'right_on=["id"]',
+                             'how="left"'
+                             )
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(3).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected_df)
+
+
+@pytest.mark.parametrize("export_func", [
+    export_flow_to_polars,
+    export_flow_to_flowframe,
+], ids=["polars", "flowframe"])
+def test_join_operation_right(join_input_dataset, export_func):
+    """Test join operation between two datasets"""
+    flow = create_basic_flow()
+    left_data, right_data = join_input_dataset
+
+    flow.add_manual_input(left_data)
+    flow.add_manual_input(right_data)
+    join_node = input_schema.NodeJoin(
+        flow_id=1,
+        node_id=3,
+        depending_on_ids=[1, 2],
+        join_input=transform_schema.JoinInput(
+            join_mapping=[transform_schema.JoinMap("id", "id")],
+            left_select=[transform_schema.SelectInput("id"), transform_schema.SelectInput("name")],
+            right_select=[transform_schema.SelectInput("id"), transform_schema.SelectInput("city")],
+            how="right"
+        )
+    )
+    flow.add_join(join_node)
+    left_connection = input_schema.NodeConnection.create_from_simple_input(1, 3, 'main')
+    right_connection = input_schema.NodeConnection.create_from_simple_input(2, 3, 'right')
+    add_connection(flow, left_connection)
+    add_connection(flow, right_connection)
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code,
+                             "_join_3_left.join(",
+                             "_join_3_right,",
+                             'left_on=["__jk_id"]',
+                             'right_on=["id_right"]',
+                             'how="right"'
+                             )
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(3).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected_df, check_column_order=False, check_row_order=False)
+
+
+def create_comprehensive_join_scenarios() -> list[tuple[str, input_schema.NodeJoin]]:
+    """Generate comprehensive join test scenarios including complex cases"""
+
+    join_scenarios: list[tuple[str, input_schema.NodeJoin]] = []
+    how_options: list[transform_schema.JoinStrategy] = ["left", "right", "inner", "outer"]
+
+    def add_scenario(name: str, join_input: transform_schema.JoinInput) -> None:
+        join_scenarios.append((
+            name,
+            input_schema.NodeJoin(
+                flow_id=1,
+                node_id=3,
+                depending_on_ids=[1, 2],
+                join_input=join_input
+            )
+        ))
+
+    # Test data columns for reference:
+    # Left: ID, Name, Address, Zipcode
+    # Right: ID, Name, City
+
+    for how in how_options:
+        add_scenario(
+            f"{how}_basic_single_join",
+            transform_schema.JoinInput(
+                join_mapping=[transform_schema.JoinMap("ID", "ID")],
+                left_select=[
+                    transform_schema.SelectInput("ID"),
+                    transform_schema.SelectInput("Address"),
+                    transform_schema.SelectInput("Zipcode"),
+                    transform_schema.SelectInput("Name")
+                ],
+                right_select=[
+                    transform_schema.SelectInput("ID"),
+                    transform_schema.SelectInput("City"),
+                    transform_schema.SelectInput("Name")
+                ],
+                how=how
+            )
+        )
+        add_scenario(
+            f"{how}_unselect_all_right_overlapping_col_left",
+            transform_schema.JoinInput(
+                join_mapping=[transform_schema.JoinMap("ID", "ID")],
+                left_select=[
+                    transform_schema.SelectInput("ID"),
+                    transform_schema.SelectInput("Address"),
+                    transform_schema.SelectInput("Zipcode"),
+                    transform_schema.SelectInput("Name", keep=False)
+                ],
+                right_select=[
+                    transform_schema.SelectInput("ID", keep=False),
+                    transform_schema.SelectInput("City", keep=False),
+                    transform_schema.SelectInput("Name", keep=False)
+                ],
+                how=how
+            )
+        )
+
+        add_scenario(
+            f"{how}_unselect_all_right_overlapping_col_left_multi_join",
+            transform_schema.JoinInput(
+                join_mapping=[
+                    transform_schema.JoinMap("ID", "ID"),
+                    transform_schema.JoinMap("Name", "Name")
+                ],
+                left_select=[
+                    transform_schema.SelectInput("ID"),
+                    transform_schema.SelectInput("Address"),
+                    transform_schema.SelectInput("Zipcode"),
+                    transform_schema.SelectInput("Name", keep=False)
+                ],
+                right_select=[
+                    transform_schema.SelectInput("ID", keep=False),
+                    transform_schema.SelectInput("City", keep=False),
+                    transform_schema.SelectInput("Name", keep=False)
+                ],
+                how=how
+            )
+        )
+
+        add_scenario(
+            f"{how}_unselect_all_right_overlapping_col_left_rename",
+            transform_schema.JoinInput(
+                join_mapping=[
+                    transform_schema.JoinMap("ID", "ID"),
+                    transform_schema.JoinMap("Name", "Name")
+                ],
+                left_select=[
+                    transform_schema.SelectInput("ID"),
+                    transform_schema.SelectInput("Address"),
+                    transform_schema.SelectInput("Zipcode"),
+                    transform_schema.SelectInput("Name", new_name="LeftName", keep=True)
+                ],
+                right_select=[
+                    transform_schema.SelectInput("ID", keep=False),
+                    transform_schema.SelectInput("City", keep=False),
+                    transform_schema.SelectInput("Name", keep=False)
+                ],
+                how=how
+            )
+        )
+
+        add_scenario(
+            f"{how}_rename_right_overlapping_col",
+            transform_schema.JoinInput(
+                join_mapping=[transform_schema.JoinMap("ID", "ID")],
+                left_select=[
+                    transform_schema.SelectInput("ID"),
+                    transform_schema.SelectInput("Address"),
+                    transform_schema.SelectInput("Zipcode"),
+                    transform_schema.SelectInput("Name")
+                ],
+                right_select=[
+                    transform_schema.SelectInput("ID", new_name="RightID"),
+                    transform_schema.SelectInput("City"),
+                    transform_schema.SelectInput("Name", new_name="RightName")
+                ],
+                how=how
+            )
+        )
+
+        add_scenario(
+            f"{how}_rename_both_overlapping_cols",
+            transform_schema.JoinInput(
+                join_mapping=[transform_schema.JoinMap("ID", "ID")],
+                left_select=[
+                    transform_schema.SelectInput("ID", new_name="LeftID"),
+                    transform_schema.SelectInput("Address"),
+                    transform_schema.SelectInput("Zipcode"),
+                    transform_schema.SelectInput("Name", new_name="LeftName")
+                ],
+                right_select=[
+                    transform_schema.SelectInput("ID", new_name="RightID"),
+                    transform_schema.SelectInput("City"),
+                    transform_schema.SelectInput("Name", new_name="RightName")
+                ],
+                how=how
+            )
+        )
+
+        add_scenario(
+            f"{how}_keep_only_join_cols",
+            transform_schema.JoinInput(
+                join_mapping=[transform_schema.JoinMap("ID", "ID")],
+                left_select=[
+                    transform_schema.SelectInput("ID"),
+                    transform_schema.SelectInput("Address", keep=False),
+                    transform_schema.SelectInput("Zipcode", keep=False),
+                    transform_schema.SelectInput("Name", keep=False)
+                ],
+                right_select=[
+                    transform_schema.SelectInput("ID", keep=False),
+                    transform_schema.SelectInput("City", keep=False),
+                    transform_schema.SelectInput("Name", keep=False)
+                ],
+                how=how
+            )
+        )
+
+        add_scenario(
+            f"{how}_drop_all_join_cols",
+            transform_schema.JoinInput(
+                join_mapping=[transform_schema.JoinMap("ID", "ID")],
+                left_select=[
+                    transform_schema.SelectInput("ID", keep=False),
+                    transform_schema.SelectInput("Address"),
+                    transform_schema.SelectInput("Zipcode"),
+                    transform_schema.SelectInput("Name")
+                ],
+                right_select=[
+                    transform_schema.SelectInput("ID", keep=False),
+                    transform_schema.SelectInput("City"),
+                    transform_schema.SelectInput("Name", new_name="RightName")
+                ],
+                how=how
+            )
+        )
+
+        add_scenario(
+            f"{how}_complex_multi_join_mixed_strategy",
+            transform_schema.JoinInput(
+                join_mapping=[
+                    transform_schema.JoinMap("ID", "ID"),
+                    transform_schema.JoinMap("Name", "Name")
+                ],
+                left_select=[
+                    transform_schema.SelectInput("ID", new_name="JoinID"),
+                    transform_schema.SelectInput("Address"),
+                    transform_schema.SelectInput("Zipcode", keep=False),
+                    transform_schema.SelectInput("Name", new_name="JoinName")
+                ],
+                right_select=[
+                    transform_schema.SelectInput("ID", keep=False),
+                    transform_schema.SelectInput("City", new_name="RightCity"),
+                    transform_schema.SelectInput("Name", keep=False)
+                ],
+                how=how
+            )
+        )
+
+        add_scenario(
+            f"{how}_minimal_output_non_join_cols",
+            transform_schema.JoinInput(
+                join_mapping=[transform_schema.JoinMap("ID", "ID")],
+                left_select=[
+                    transform_schema.SelectInput("ID", keep=False),
+                    transform_schema.SelectInput("Address"),
+                    transform_schema.SelectInput("Zipcode", keep=False),
+                    transform_schema.SelectInput("Name", keep=False)
+                ],
+                right_select=[
+                    transform_schema.SelectInput("ID", keep=False),
+                    transform_schema.SelectInput("City"),
+                    transform_schema.SelectInput("Name", keep=False)
+                ],
+                how=how
+            )
+        )
+
+        add_scenario(
+            f"{how}_complex_multi_join_mixed_rename_left_strategy",
+            transform_schema.JoinInput(
+                join_mapping=[
+                    transform_schema.JoinMap("ID", "ID"),
+                    transform_schema.JoinMap("Name", "Name")
+                ],
+                left_select=[
+                    transform_schema.SelectInput("ID"),
+                    transform_schema.SelectInput("Address"),
+                    transform_schema.SelectInput("Zipcode", keep=False),
+                    transform_schema.SelectInput("Name", new_name="JoinName")
+                ],
+                right_select=[
+                    transform_schema.SelectInput("ID", keep=False),
+                    transform_schema.SelectInput("City", new_name="RightCity"),
+                    transform_schema.SelectInput("Name", keep=False)
+                ],
+                how=how
+            )
+        )
+
+        add_scenario(
+            f"{how}_complex_multi_join_mixed_rename_right_strategy",
+            transform_schema.JoinInput(
+                join_mapping=[
+                    transform_schema.JoinMap("ID", "ID"),
+                    transform_schema.JoinMap("Name", "Name")
+                ],
+                left_select=[
+                    transform_schema.SelectInput("ID"),
+                    transform_schema.SelectInput("Address"),
+                    transform_schema.SelectInput("Zipcode", keep=False),
+                    transform_schema.SelectInput("Name", new_name="JoinName")
+                ],
+                right_select=[
+                    transform_schema.SelectInput("ID", keep=False),
+                    transform_schema.SelectInput("City", new_name="RightCity"),
+                    transform_schema.SelectInput("Name", new_name="new_name", keep=False)
+                ],
+                how=how
+            )
+        )
+
+        add_scenario(
+            f"{how}_all_columns_renamed",
+            transform_schema.JoinInput(
+                join_mapping=[transform_schema.JoinMap("ID", "ID")],
+                left_select=[
+                    transform_schema.SelectInput("ID", new_name="L_ID"),
+                    transform_schema.SelectInput("Address", new_name="L_Address"),
+                    transform_schema.SelectInput("Zipcode", new_name="L_Zipcode"),
+                    transform_schema.SelectInput("Name", new_name="L_Name")
+                ],
+                right_select=[
+                    transform_schema.SelectInput("ID", new_name="R_ID"),
+                    transform_schema.SelectInput("City", new_name="R_City"),
+                    transform_schema.SelectInput("Name", new_name="R_Name")
+                ],
+                how=how
+            )
+        )
+
+    return join_scenarios
+
+
+def create_comprehensive_anti_semi_join_scenarios() -> list[tuple[str, input_schema.NodeJoin]]:
+    """Generate comprehensive join test scenarios including complex cases"""
+
+    join_scenarios: list[tuple[str, input_schema.NodeJoin]] = []
+    how_options: list[transform_schema.JoinStrategy] = ["semi", "anti"]
+
+    def add_scenario(name: str, join_input: transform_schema.JoinInput) -> None:
+        join_scenarios.append((
+            name,
+            input_schema.NodeJoin(
+                flow_id=1,
+                node_id=3,
+                depending_on_ids=[1, 2],
+                join_input=join_input
+            )
+        ))
+
+
+    for how in how_options:
+        add_scenario(
+            f"{how}_basic_single_join",
+            transform_schema.JoinInput(
+                join_mapping=[transform_schema.JoinMap("ID", "ID")],
+                left_select=[
+                    transform_schema.SelectInput("ID"),
+                    transform_schema.SelectInput("Address"),
+                    transform_schema.SelectInput("Zipcode"),
+                    transform_schema.SelectInput("Name")
+                ],
+                right_select=[
+                    transform_schema.SelectInput("ID"),
+                    transform_schema.SelectInput("City"),
+                    transform_schema.SelectInput("Name")
+                ],
+                how=how
+            )
+        )
+
+        add_scenario(
+            f"{how}_unselect_all_right_overlapping_col_left_multi_join",
+            transform_schema.JoinInput(
+                join_mapping=[
+                    transform_schema.JoinMap("ID", "ID"),
+                    transform_schema.JoinMap("Name", "Name")
+                ],
+                left_select=[
+                    transform_schema.SelectInput("ID"),
+                    transform_schema.SelectInput("Address"),
+                    transform_schema.SelectInput("Zipcode"),
+                    transform_schema.SelectInput("Name")
+                ],
+                right_select=[
+                    transform_schema.SelectInput("ID"),
+                    transform_schema.SelectInput("City"),
+                    transform_schema.SelectInput("Name")
+                ],
+                how=how
+            )
+        )
+
+    return join_scenarios
+
+
+@pytest.mark.parametrize("export_func", [
+    export_flow_to_polars,
+    export_flow_to_flowframe,
+], ids=["polars", "flowframe"])
+@pytest.mark.parametrize("test_name, join_scenario", create_comprehensive_join_scenarios())
+def test_join_operation_complex(test_name, join_scenario, join_input_large_dataset, export_func):
+    flow = create_basic_flow()
+    left_data, right_data = join_input_large_dataset
+    flow.add_manual_input(left_data)
+    flow.add_manual_input(right_data)
+    flow.add_join(join_scenario)
+    left_connection = input_schema.NodeConnection.create_from_simple_input(1, 3, 'main')
+    right_connection = input_schema.NodeConnection.create_from_simple_input(2, 3, 'right')
+    add_connection(flow, left_connection)
+    add_connection(flow, right_connection)
+
+    code = export_func(flow)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(3).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected_df, check_column_order=False, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+@pytest.mark.parametrize("test_name, join_scenario", create_comprehensive_anti_semi_join_scenarios())
+def test_semi_and_anti_join(test_name, join_scenario, join_input_large_dataset, export_func):
+    flow = create_basic_flow()
+    left_data, right_data = join_input_large_dataset
+    flow.add_manual_input(left_data)
+    flow.add_manual_input(right_data)
+    flow.add_join(join_scenario)
+    left_connection = input_schema.NodeConnection.create_from_simple_input(1, 3, 'main')
+    right_connection = input_schema.NodeConnection.create_from_simple_input(2, 3, 'right')
+    add_connection(flow, left_connection)
+    add_connection(flow, right_connection)
+
+    code = export_func(flow)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(3).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected_df, check_column_order=False, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_join_operation_left_rename(join_input_dataset, export_func):
+    """Test join operation between two datasets"""
+    flow = create_basic_flow()
+    left_data, right_data = join_input_dataset
+    flow.add_manual_input(left_data)
+    flow.add_manual_input(right_data)
+    join_node = input_schema.NodeJoin(
+        flow_id=1,
+        node_id=3,
+        depending_on_ids=[1, 2],
+        join_input=transform_schema.JoinInput(
+            join_mapping=[transform_schema.JoinMap("id", "id")],
+            left_select=[transform_schema.SelectInput("id", "left_id"),
+                         transform_schema.SelectInput("name", "left_name")],
+            right_select=[transform_schema.SelectInput("id", "right_id"),
+                          transform_schema.SelectInput("city", "right_city")],
+            how="left"
+        )
+    )
+    flow.add_join(join_node)
+    left_connection = input_schema.NodeConnection.create_from_simple_input(1, 3, 'main')
+    right_connection = input_schema.NodeConnection.create_from_simple_input(2, 3, 'right')
+    add_connection(flow, left_connection)
+    add_connection(flow, right_connection)
+
+    code = export_func(flow)
+
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(3).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected_df, check_column_order=False, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_window_functions_rolling_and_cumulative(export_func):
+    """Test window-functions node generating rolling + cumulative columns."""
+    flow = create_basic_flow()
+    flow = create_sales_dataframe_node(flow)
+
+    window_node = input_schema.NodeWindowFunctions(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        window_input=transform_schema.WindowFunctionsInput(
+            partition_by=["region"],
+            order_by=[transform_schema.SortByInput(column="date", how="asc")],
+            window_functions=[
+                transform_schema.WindowFunctionInput(
+                    column="quantity",
+                    function="rolling_sum",
+                    new_column_name="qty_rolling_sum",
+                    window_size=2,
+                    min_periods=1,
+                ),
+                transform_schema.WindowFunctionInput(
+                    column="price",
+                    function="cum_sum",
+                    new_column_name="price_cum",
+                ),
+            ],
+        ),
+    )
+    flow.add_window_functions(window_node)
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(
+            code,
+            'rolling_sum(window_size=2, min_samples=1)',
+            'cum_sum()',
+            ".over(['region'])",
+        )
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False, check_column_order=False)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_window_functions_partition_aggregate(export_func):
+    """Test window-functions node generating partition-wide aggregate columns (no order_by)."""
+    flow = create_basic_flow()
+    flow = create_sales_dataframe_node(flow)
+
+    window_node = input_schema.NodeWindowFunctions(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        window_input=transform_schema.WindowFunctionsInput(
+            partition_by=["region"],
+            window_functions=[
+                transform_schema.WindowFunctionInput(column="quantity", function="mean", new_column_name="qty_mean"),
+                transform_schema.WindowFunctionInput(column="price", function="count", new_column_name="n_rows"),
+            ],
+        ),
+    )
+    flow.add_window_functions(window_node)
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code, 'pl.col("quantity").mean().over([\'region\'])', 'pl.col("price").count().over([\'region\'])')
+    assert ".sort(" not in code
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False, check_column_order=False)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_window_functions_tile(export_func):
+    """Test window-functions node generating a tile column."""
+    flow = create_basic_flow()
+    flow = create_sales_dataframe_node(flow)
+
+    window_node = input_schema.NodeWindowFunctions(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        window_input=transform_schema.WindowFunctionsInput(
+            partition_by=[],
+            order_by=[transform_schema.SortByInput(column="quantity", how="asc")],
+            window_functions=[
+                transform_schema.WindowFunctionInput(
+                    function="tile",
+                    new_column_name="qty_quartile",
+                    number_of_groups=3,
+                )
+            ],
+        ),
+    )
+    flow.add_window_functions(window_node)
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False, check_column_order=False)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_group_by_aggregation(export_func):
+    """Test group by with multiple aggregations"""
+    flow = create_basic_flow()
+    flow = create_sales_dataframe_node(flow)
+
+    groupby_node = input_schema.NodeGroupBy(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        groupby_input=transform_schema.GroupByInput(
+            agg_cols=[
+                transform_schema.AggColl("product", "groupby"),
+                transform_schema.AggColl("region", "groupby"),
+                transform_schema.AggColl("quantity", "sum", "total_quantity"),
+                transform_schema.AggColl("price", "mean", "avg_price"),
+                transform_schema.AggColl("quantity", "count", "num_transactions")
+            ]
+        )
+    )
+    flow.add_group_by(groupby_node)
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code,
+                             'group_by(["product", "region"])',
+                             'pl.col("quantity").sum().alias("total_quantity")',
+                             'pl.col("price").mean().alias("avg_price")',
+                             'pl.col("quantity").count().alias("num_transactions")'
+                             )
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_group_by_key_renamed_onto_a_dropped_column(export_func):
+    """A key renamed to the name of a non-grouped column must not collide with it — the
+    aggregation drops that column anyway (regression: 'column X is duplicate')."""
+    flow = create_basic_flow()
+    flow = create_sales_dataframe_node(flow)
+
+    groupby_node = input_schema.NodeGroupBy(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        groupby_input=transform_schema.GroupByInput(
+            agg_cols=[
+                transform_schema.AggColl("product", "groupby", "region"),
+                transform_schema.AggColl("quantity", "sum", "total_quantity"),
+            ]
+        ),
+    )
+    flow.add_group_by(groupby_node)
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert sorted(result_df.columns) == ["region", "total_quantity"]
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [
+    export_flow_to_polars,
+    export_flow_to_flowframe,
+], ids=["polars", "flowframe"])
+def test_formula_node_cast(export_func):
+    """Test formula/expression node"""
+    flow = create_basic_flow()
+    flow = create_sales_dataframe_node(flow)
+
+    formula_node = input_schema.NodeFormula(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        function=transform_schema.FunctionInput(
+            field=transform_schema.FieldInput(name="total", data_type="Integer"),
+            function="[price] * [quantity]"
+        )
+    )
+    flow.add_formula(formula_node)
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code,
+                             "with_columns",
+                             "computed = (",
+                             'alias("total")',
+                             'cast(pl.Int64)'
+                             )
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df)
+
+
+@pytest.mark.parametrize("export_func", [
+    export_flow_to_polars,
+    export_flow_to_flowframe,
+], ids=["polars", "flowframe"])
+def test_non_convertable_formula_node_cast(export_func):
+    # test to validate that if code can not be converted to polars code it still works by falling back on
+    # to the original code
+    flow = create_basic_flow()
+    flow = create_sales_dataframe_node(flow)
+    flow.get_node(1).get_resulting_data().collect()
+    formula_node = input_schema.NodeFormula(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        function=transform_schema.FunctionInput(
+            field=transform_schema.FieldInput(name="total", data_type="Double"),
+            function="string_similarity([region], 'Noorden')"
+        )
+    )
+    flow.add_formula(formula_node)
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(1, 2))
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code,
+                             "with_columns",
+                             "computed = (",
+                             'alias("total")',
+                             "simple_function_to_expr"
+                             )
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df)
+
+@pytest.mark.parametrize("export_func", [
+    export_flow_to_polars,
+    export_flow_to_flowframe,
+], ids=["polars", "flowframe"])
+def test_formula_node(export_func):
+    """Test formula/expression node"""
+    flow = create_basic_flow()
+    flow = create_sales_dataframe_node(flow)
+    formula_node = input_schema.NodeFormula(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        function=transform_schema.FunctionInput(
+            field=transform_schema.FieldInput(name="total", data_type="Auto"),
+            function="[price] * [quantity]"
+        )
+    )
+    flow.add_formula(formula_node)
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code,
+                             "with_columns",
+                             "computed = (",
+                             'alias("total")',
+                             )
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df)
+
+
+def test_flowframe_formula_native_expression():
+    """FlowFrame export prefers native ff expressions over the flowfile_formulas parameter."""
+    flow = create_basic_flow()
+    flow = create_sales_dataframe_node(flow)
+    formula_node = input_schema.NodeFormula(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        function=transform_schema.FunctionInput(
+            field=transform_schema.FieldInput(name="total", data_type="Auto"),
+            function="[price] * [quantity]"
+        )
+    )
+    flow.add_formula(formula_node)
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_flow_to_flowframe(flow)
+    verify_code_contains(code, 'ff.col("price")', 'ff.col("quantity")', 'alias("total")')
+    assert "flowfile_formulas" not in code
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df)
+
+
+def test_flowframe_typed_formula_keeps_keyword_form():
+    """A formula with an explicit output data type keeps the keyword form that stores the type."""
+    flow = create_basic_flow()
+    flow = create_sales_dataframe_node(flow)
+    formula_node = input_schema.NodeFormula(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        function=transform_schema.FunctionInput(
+            field=transform_schema.FieldInput(name="total", data_type="Integer"),
+            function="[price] * [quantity]"
+        )
+    )
+    flow.add_formula(formula_node)
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_flow_to_flowframe(flow)
+    verify_code_contains(
+        code,
+        ".with_columns(flowfile_formulas=['[price] * [quantity]'], output_column_names=['total'], "
+        "output_column_datatypes=['Integer'])",
+    )
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df)
+
+
+def _add_multi_entry_formula_node(flow: FlowGraph, specs: list[tuple[str, str, str]]) -> FlowGraph:
+    """One formula node (id 2) holding every ``(name, formula, data_type)`` spec as an entry."""
+    flow.add_formula(input_schema.NodeFormula(
+        flow_id=flow.flow_id,
+        node_id=2,
+        depending_on_id=1,
+        functions=[
+            transform_schema.FunctionInput(
+                field=transform_schema.FieldInput(name=name, data_type=data_type),
+                function=formula,
+            )
+            for name, formula, data_type in specs
+        ],
+    ))
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(1, 2))
+    return flow
+
+
+@pytest.mark.parametrize("export_func", [
+    export_flow_to_polars,
+    export_flow_to_flowframe,
+], ids=["polars", "flowframe"])
+def test_to_boolean_formula_export_matches_the_canvas(export_func):
+    """to_boolean exports as native code that turns null into false and parses "yes", never as a Boolean cast."""
+    flow = create_basic_flow()
+    flow.add_manual_input(input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=1,
+        raw_data_format=input_schema.RawData(
+            columns=[
+                input_schema.MinimalFieldInfo(name="n", data_type="Integer"),
+                input_schema.MinimalFieldInfo(name="answer", data_type="String"),
+            ],
+            data=[[0, 2, None], ["yes", "no", None]],
+        ),
+    ))
+    for node_id, (name, formula) in enumerate([("n_flag", "to_boolean([n])"), ("answer_flag", "to_boolean([answer])")], 2):
+        flow.add_formula(input_schema.NodeFormula(
+            flow_id=1,
+            node_id=node_id,
+            depending_on_id=node_id - 1,
+            function=transform_schema.FunctionInput(
+                field=transform_schema.FieldInput(name=name, data_type="Auto"), function=formula
+            ),
+        ))
+        add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(node_id - 1, node_id))
+
+    code = export_func(flow)
+    assert ".cast(pl.Boolean)" not in code and ".cast(ff.Boolean)" not in code
+    assert "simple_function_to_expr" not in code and "flowfile_formula" not in code
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(3).get_resulting_data().data_frame)
+    assert expected_df["n_flag"].to_list() == [False, True, False]
+    assert expected_df["answer_flag"].to_list() == [True, False, False]
+    assert_frame_equal(result_df, expected_df)
+
+
+@pytest.mark.parametrize("export_func", [
+    export_flow_to_polars,
+    export_flow_to_flowframe,
+], ids=["polars", "flowframe"])
+def test_to_date_and_to_datetime_formula_exports_match_the_canvas(export_func):
+    """to_date/to_datetime export as a non-strict parse of the default format, giving null where it fails."""
+    flow = create_basic_flow()
+    flow.add_manual_input(input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=1,
+        raw_data_format=input_schema.RawData(
+            columns=[
+                input_schema.MinimalFieldInfo(name="d_text", data_type="String"),
+                input_schema.MinimalFieldInfo(name="t_text", data_type="String"),
+            ],
+            data=[
+                ["2024-01-02", "2024/01/03", "bad", None],
+                ["2024-01-02 03:04:05", "2024-01-02T03:04:05", "bad", None],
+            ],
+        ),
+    ))
+    for node_id, (name, formula) in enumerate([("d", "to_date([d_text])"), ("t", "to_datetime([t_text])")], 2):
+        flow.add_formula(input_schema.NodeFormula(
+            flow_id=1,
+            node_id=node_id,
+            depending_on_id=node_id - 1,
+            function=transform_schema.FunctionInput(
+                field=transform_schema.FieldInput(name=name, data_type="Auto"), function=formula
+            ),
+        ))
+        add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(node_id - 1, node_id))
+
+    code = export_func(flow)
+    assert '.str.to_date("%Y-%m-%d", strict=False)' in code
+    assert '.str.to_datetime("%Y-%m-%d %H:%M:%S", strict=False)' in code
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(3).get_resulting_data().data_frame)
+    assert expected_df["d"].to_list() == [date(2024, 1, 2), None, None, None]
+    assert expected_df["t"].to_list() == [datetime(2024, 1, 2, 3, 4, 5), None, None, None]
+    assert_frame_equal(result_df, expected_df)
+
+
+@pytest.mark.parametrize("export_func", [
+    export_flow_to_polars,
+    export_flow_to_flowframe,
+], ids=["polars", "flowframe"])
+def test_to_date_advanced_filter_export_matches_the_canvas(export_func):
+    """An advanced filter calling to_date exports a non-strict parse: a strict one raises on "2024/01/03" and "bad"."""
+    flow = create_basic_flow()
+    flow.add_manual_input(input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=1,
+        raw_data_format=input_schema.RawData(
+            columns=[input_schema.MinimalFieldInfo(name="d_text", data_type="String")],
+            data=[["2024-01-02", "2024/01/03", "bad", None, "2019-05-06"]],
+        ),
+    ))
+    flow.add_filter(input_schema.NodeFilter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        filter_input=transform_schema.FilterInput(mode="advanced", advanced_filter='to_date([d_text]) > to_date("2020-01-01")'),
+    ))
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    assert '.str.to_date("%Y-%m-%d", strict=False)' in code
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert expected_df["d_text"].to_list() == ["2024-01-02"]
+    assert_frame_equal(result_df, expected_df)
+
+
+INDEPENDENT_ENTRIES = [
+    ("total", "[price] * [quantity]", "Auto"),
+    ("region_upper", "uppercase([region])", "String"),
+    ("marker", "1", "Integer"),
+]
+
+# Each entry reads the previous entry's output, so the node's sequential semantics are load-bearing.
+DEPENDENT_ENTRIES = [
+    ("base", "[price] * [quantity]", "Auto"),
+    ("with_tax", "[base] * 1.21", "Auto"),
+    ("rounded", "round([with_tax], 0)", "Auto"),
+    ("label", 'concat("eur ", [rounded])', "String"),
+    ("label_len", "length([label])", "Integer"),
+]
+
+MIXED_INDEPENDENT_ENTRIES = [
+    ("total", "[price] * [quantity]", "Auto"),
+    ("sim", "string_similarity([region], 'Noorden')", "Double"),
+]
+
+
+def _assert_chained_in_entry_order(code: str, specs: list[tuple[str, str, str]]) -> None:
+    """One `with_columns` call per entry, each carrying its own output name, in entry order."""
+    chunks = code.split(".with_columns(")[1:]
+    assert len(chunks) == len(specs), f"expected {len(specs)} chained calls:\n{code}"
+    for chunk, (name, _, _) in zip(chunks, specs, strict=True):
+        assert f'"{name}"' in chunk or f"'{name}'" in chunk, f"entry {name!r} out of order:\n{code}"
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_independent_formula_entries_still_chain_one_call_each(export_func):
+    """Export always chains, even when the entries could have shared a single call."""
+    flow = _add_multi_entry_formula_node(create_sales_dataframe_node(create_basic_flow()), INDEPENDENT_ENTRIES)
+    code = export_func(flow)
+
+    _assert_chained_in_entry_order(code, INDEPENDENT_ENTRIES)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(
+            code,
+            '.with_columns([(pl.col("price") * pl.col("quantity")).alias("total")])',
+            '.with_columns([(pl.col("region").str.to_uppercase()).alias("region_upper").cast(pl.String)])',
+            '.with_columns([(pl.lit(1)).alias("marker").cast(pl.Int64)])',
+        )
+    else:
+        verify_code_contains(
+            code,
+            '.with_columns((ff.col("price") * ff.col("quantity")).alias("total"))',
+            ".with_columns(flowfile_formulas=['uppercase([region])'], output_column_names=['region_upper'], "
+            "output_column_datatypes=['String'])",
+        )
+
+    verify_if_execute(code)
+    assert_frame_equal(
+        normalize_result(get_result_from_generated_code(code)),
+        normalize_result(flow.get_node(2).get_resulting_data().data_frame),
+    )
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_dependent_formula_entries_keep_sequential_semantics(export_func):
+    """Both dialects chain one step per entry, which is what makes the chain readable."""
+    flow = _add_multi_entry_formula_node(create_sales_dataframe_node(create_basic_flow()), DEPENDENT_ENTRIES)
+    code = export_func(flow)
+
+    _assert_chained_in_entry_order(code, DEPENDENT_ENTRIES)
+
+    verify_if_execute(code)
+    assert_frame_equal(
+        normalize_result(get_result_from_generated_code(code)),
+        normalize_result(flow.get_node(2).get_resulting_data().data_frame),
+    )
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_entries_mixing_native_and_fallback_chain_with_the_fallback_alone(export_func):
+    """An untranslatable entry falls back on its own step; the native entry keeps its expression."""
+    flow = _add_multi_entry_formula_node(create_sales_dataframe_node(create_basic_flow()), MIXED_INDEPENDENT_ENTRIES)
+    flow.get_node(1).get_resulting_data().collect()
+    code = export_func(flow)
+
+    _assert_chained_in_entry_order(code, MIXED_INDEPENDENT_ENTRIES)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(
+            code,
+            '.with_columns([(pl.col("price") * pl.col("quantity")).alias("total")])',
+            "simple_function_to_expr(\"string_similarity([region], 'Noorden')\").alias(\"sim\")",
+        )
+    else:
+        verify_code_contains(
+            code,
+            '.with_columns((ff.col("price") * ff.col("quantity")).alias("total"))',
+            ".with_columns(flowfile_formulas=[\"string_similarity([region], 'Noorden')\"], "
+            "output_column_names=['sim'], output_column_datatypes=['Double'])",
+        )
+
+    verify_if_execute(code)
+    assert_frame_equal(
+        normalize_result(get_result_from_generated_code(code)),
+        normalize_result(flow.get_node(2).get_resulting_data().data_frame),
+    )
+
+
+def test_flowframe_formula_fallback_untranslatable():
+    """Untranslatable formulas fall back to the flowfile_formulas parameter."""
+    flow = create_basic_flow()
+    flow = create_sales_dataframe_node(flow)
+    flow.get_node(1).get_resulting_data().collect()
+    formula_node = input_schema.NodeFormula(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        function=transform_schema.FunctionInput(
+            field=transform_schema.FieldInput(name="total", data_type="Double"),
+            function="string_similarity([region], 'Noorden')"
+        )
+    )
+    flow.add_formula(formula_node)
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_flow_to_flowframe(flow)
+    verify_code_contains(code, "flowfile_formulas=")
+    assert 'ff.col("region")' not in code
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df)
+
+
+def test_flowframe_filter_advanced_native():
+    """FlowFrame export translates advanced filters to native ff predicates."""
+    flow = create_basic_flow()
+    flow = create_sample_dataframe_node(flow)
+    filter_node = input_schema.NodeFilter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        filter_input=transform_schema.FilterInput(
+            mode="advanced",
+            advanced_filter="[age] > 25 AND [salary] > 60000"
+        )
+    )
+    flow.add_filter(filter_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_flow_to_flowframe(flow)
+    verify_code_contains(code, '.filter((ff.col("age")', 'ff.col("salary")')
+    assert "flowfile_formula=" not in code
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df)
+
+
+def test_flowframe_filter_advanced_fallback():
+    """Untranslatable advanced filters fall back to the flowfile_formula parameter."""
+    flow = create_basic_flow()
+    flow = create_sample_dataframe_node(flow)
+    filter_node = input_schema.NodeFilter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        filter_input=transform_schema.FilterInput(
+            mode="advanced",
+            advanced_filter="string_similarity([name], 'Alice') > 0.8"
+        )
+    )
+    flow.add_filter(filter_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_flow_to_flowframe(flow)
+    verify_code_contains(code, "flowfile_formula=")
+    assert 'ff.col("name")' not in code
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df)
+
+
+def test_flowframe_filter_split_native_and_fallback():
+    """filter_split translates advanced filters natively and falls back when untranslatable."""
+    flow = create_basic_flow()
+    flow = create_sample_dataframe_node(flow)
+    flow.add_filter(
+        input_schema.NodeFilter(
+            flow_id=1,
+            node_id=2,
+            depending_on_id=1,
+            filter_input=transform_schema.FilterInput(
+                advanced_filter="[age] > 30",
+                filter_type="advanced",
+            ),
+            split_mode=True,
+        )
+    )
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+    flow.add_record_count(input_schema.NodeRecordCount(flow_id=1, node_id=3, depending_on_id=2))
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(2, 3, output_handle="output-1"))
+
+    code = export_flow_to_flowframe(flow)
+    verify_code_contains(code, 'filter_split(ff.col("age")', "split_pass", "split_fail", "counted = split_fail.select(")
+    assert "flowfile_formula=" not in code
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(3).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+
+    fallback_flow = create_basic_flow()
+    fallback_flow = create_sample_dataframe_node(fallback_flow)
+    fallback_flow.add_filter(
+        input_schema.NodeFilter(
+            flow_id=1,
+            node_id=2,
+            depending_on_id=1,
+            filter_input=transform_schema.FilterInput(
+                advanced_filter="string_similarity([name], 'Alice') > 0.8",
+                filter_type="advanced",
+            ),
+            split_mode=True,
+        )
+    )
+    add_connection(fallback_flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    fallback_code = export_flow_to_flowframe(fallback_flow)
+    verify_code_contains(fallback_code, "filter_split(flowfile_formula=")
+    verify_if_execute(fallback_code)
+
+
+def test_translate_registers_snippet_imports(monkeypatch):
+    """Validated snippets referencing datetime/pl must register those imports for the script.
+
+    The validation namespace includes pl and datetime, so the transpiler may
+    emit references to them (e.g. today() -> ff.lit(datetime.datetime.today()));
+    without the imports the exported script raises NameError.
+    """
+    from flowfile_core.flowfile.code_generator import code_generator as cg
+
+    converter = cg.FlowGraphToFlowFrameConverter(create_basic_flow())
+    monkeypatch.setattr(
+        cg, "_try_translate_to_ff_code", lambda formula: "ff.lit(datetime.date(2024, 1, 1)) + pl.len()"
+    )
+    assert converter._translate_to_ff_code("anything") is not None
+    assert "import datetime" in converter.imports
+    assert "import polars as pl" in converter.imports
+
+
+def test_flowframe_formula_datetime_emission_is_runnable():
+    """A today() formula must produce runnable code: either the fallback emission,
+    or (if the native translation validates) code that imports datetime."""
+    flow = create_basic_flow()
+    flow = create_sales_dataframe_node(flow)
+    formula_node = input_schema.NodeFormula(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        function=transform_schema.FunctionInput(
+            field=transform_schema.FieldInput(name="exported_at", data_type="Auto"),
+            function="today()"
+        )
+    )
+    flow.add_formula(formula_node)
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_flow_to_flowframe(flow)
+    if "datetime." in code:
+        verify_code_contains(code, "import datetime")
+    # The result is time-dependent, so only assert the script runs.
+    verify_if_execute(code)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_formula_hashing_function_imports_hashlib(export_func):
+    """A hashing formula emits a `hashlib.<algo>` lambda, so the export must import hashlib."""
+    flow = create_basic_flow()
+    flow = create_sales_dataframe_node(flow)
+    formula_node = input_schema.NodeFormula(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        function=transform_schema.FunctionInput(
+            field=transform_schema.FieldInput(name="product_hash", data_type="Auto"),
+            function="md5([product])"
+        )
+    )
+    flow.add_formula(formula_node)
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    assert "hashlib." in code, f"expected a hashlib call in the generated code:\n{code}"
+    verify_code_contains(code, "import hashlib")
+
+    result = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected_df, check_column_order=False, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_formula_encoding_function_round_trips(export_func):
+    """encode/decode translate to native str.encode/str.decode, so they need no stdlib import."""
+    flow = create_basic_flow()
+    flow = create_sales_dataframe_node(flow)
+    formula_node = input_schema.NodeFormula(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        function=transform_schema.FunctionInput(
+            field=transform_schema.FieldInput(name="product_b64", data_type="Auto"),
+            function="base64_encode([product])"
+        )
+    )
+    flow.add_formula(formula_node)
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected_df, check_column_order=False, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_pivot_operation(export_func):
+    """Test pivot operation"""
+    flow = create_basic_flow()
+    flow = create_sales_dataframe_node(flow)
+
+    pivot_node = input_schema.NodePivot(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        pivot_input=transform_schema.PivotInput(
+            index_columns=["date"],
+            pivot_column="product",
+            value_col="quantity",
+            aggregations=["sum"]
+        )
+    )
+    flow.add_pivot(pivot_node)
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code,
+                             "pivot(",
+                             "values='quantity'",
+                             'index=["date"]',
+                             "on='product'",
+                             "aggregate_function='sum'"
+                             )
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_pivot_no_index_operation(export_func):
+    """Test pivot operation"""
+    flow = create_basic_flow()
+    flow = create_sales_dataframe_node(flow)
+    pivot_node = input_schema.NodePivot(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        pivot_input=transform_schema.PivotInput(
+            index_columns=[],
+            pivot_column="product",
+            value_col="quantity",
+            aggregations=["sum"]
+        )
+    )
+    flow.add_pivot(pivot_node)
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(1, 2))
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code,
+                             "pivot(",
+                             "values='quantity'",
+                             'index=["_temp_index_"]',
+                             "on='product'",
+                             "aggregate_function='sum'"
+                             )
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_union_multiple_dataframes(export_func):
+    """Test union of multiple dataframes"""
+    flow = create_basic_flow()
+    for i in range(1, 4):
+        data = input_schema.NodeManualInput(
+            flow_id=1,
+            node_id=i,
+            raw_data_format=input_schema.RawData(
+                columns=[
+                    input_schema.MinimalFieldInfo(name="id", data_type="Integer"),
+                    input_schema.MinimalFieldInfo(name="value", data_type="String")
+                ],
+                data=[[i, i + 10, i + 20], [f"A{i}", f"B{i}", f"C{i}"]]
+            )
+        )
+        flow.add_manual_input(data)
+
+    union_node = input_schema.NodeUnion(
+        flow_id=1,
+        node_id=4,
+        depending_on_ids=[1, 2, 3],
+        union_input=transform_schema.UnionInput(mode="relaxed")
+    )
+    flow.add_union(union_node)
+    for i in range(1, 4):
+        connection = input_schema.NodeConnection.create_from_simple_input(i, 4, 'main')
+        add_connection(flow, connection)
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code,
+                             "pl.concat([",
+                             "source_1,",
+                             "source_2,",
+                             "source_3,",
+                             "how='diagonal_relaxed'"
+                             )
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(4).get_resulting_data().data_frame)
+    assert_frame_equal(expected_df, result_df, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [
+    export_flow_to_polars,
+    export_flow_to_flowframe,
+], ids=["polars", "flowframe"])
+def test_custom_polars_code(export_func):
+    """Test custom Polars code node with single input"""
+    flow = create_basic_flow()
+    flow = create_sample_dataframe_node(flow)
+    polars_code_node = input_schema.NodePolarsCode(
+        flow_id=1,
+        node_id=2,
+        depending_on_ids=[1],
+        polars_code_input=transform_schema.PolarsCodeInput(
+            polars_code="input_df.with_columns((pl.col('age') * 2).alias('double_age'))"
+        )
+    )
+    flow.add_polars_code(polars_code_node)
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code,
+                             "def _polars_code_2(input_df: pl.LazyFrame):",
+                             "return input_df.with_columns((pl.col('age') * 2).alias('double_age'))",
+                             "transformed = _polars_code_2(source)"
+                             )
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(expected_df, result_df, check_row_order=False)
+
+
+polars_test_cases = [
+    (
+        "input_df.filter(pl.col('salary') >= 50001)",
+        "filter_greater_than"
+    ),
+    (
+        "output_df = input_df.filter(pl.col('salary') >= 50001)",
+        "filter_greater_than_with_output"
+    ),
+    (
+        "input_df.select(['city', 'name'])",
+        "select_columns"
+    ),
+    (
+        "output_df = input_df.select(['city', 'name'])",
+        "select_columns"
+    ),
+    (
+        "input_df.with_columns((pl.col('salary') * 1.1).alias('value_plus_10_percent'))",
+        "with_columns"
+    ),
+    (
+        "output_df = input_df.group_by('city').agg(pl.col('salary').sum().alias('total_value'))",
+        "group_by_and_aggregate"
+    ),
+    (
+        "# A multi-line example with comments\n"
+        "temp_df = input_df.sort('salary', descending=True)\noutput_df = temp_df.limit(3)",
+        "sort_and_limit_with"
+    )
+]
+
+
+@pytest.mark.parametrize("export_func", [
+    export_flow_to_polars,
+    export_flow_to_flowframe,
+], ids=["polars", "flowframe"])
+@pytest.mark.parametrize("polars_code, test_id", polars_test_cases)
+def test_code(polars_code, test_id, export_func):
+    """Test custom Polars code node with single input when the polars code only contains input_df"""
+    flow = create_basic_flow()
+    flow = create_sample_dataframe_node(flow)
+    polars_code_node = input_schema.NodePolarsCode(
+        flow_id=1,
+        node_id=2,
+        depending_on_ids=[1],
+        polars_code_input=transform_schema.PolarsCodeInput(
+            polars_code=polars_code
+        )
+    )
+    flow.add_polars_code(polars_code_node)
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(expected_df, result_df, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [
+    export_flow_to_polars,
+    export_flow_to_flowframe,
+], ids=["polars", "flowframe"])
+def test_formula_with_string(export_func):
+    """Test custom Polars code node with single input"""
+    flow = create_basic_flow()
+    flow = create_sample_dataframe_node(flow)
+    formula_node = input_schema.NodeFormula(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        function=transform_schema.FunctionInput(
+            field=transform_schema.FieldInput(name="total", data_type="String"),
+            function='"This is a string"'
+        )
+    )
+    flow.add_formula(formula_node)
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(expected_df, result_df, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [
+    export_flow_to_polars,
+    export_flow_to_flowframe,
+], ids=["polars", "flowframe"])
+def test_custom_polars_code_multiple_inputs(export_func):
+    """Test custom Polars code node with multiple inputs"""
+    flow = create_basic_flow()
+
+    for i in range(1, 3):
+        data = input_schema.NodeManualInput(
+            flow_id=1,
+            node_id=i,
+            raw_data_format=input_schema.RawData(
+                columns=[input_schema.MinimalFieldInfo(name=f"col{i}", data_type="Integer")],
+                data=[[1, 2, 3]]
+            )
+        )
+        flow.add_manual_input(data)
+
+    polars_code_node = input_schema.NodePolarsCode(
+        flow_id=1,
+        node_id=3,
+        depending_on_ids=[1, 2],
+        polars_code_input=transform_schema.PolarsCodeInput(
+            polars_code="output_df = input_df_1.join(input_df_2, how='cross')\nreturn output_df"
+        )
+    )
+    flow.add_polars_code(polars_code_node)
+    for i in [1, 2]:
+        add_connection(flow, input_schema.NodeConnection.create_from_simple_input(i, 3))
+    code = export_func(flow)
+
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code,
+                             "def _polars_code_3(input_df_1: pl.LazyFrame, input_df_2: pl.LazyFrame):",
+                             "output_df = input_df_1.join(input_df_2, how='cross')",
+                             "return output_df",
+                             "transformed = _polars_code_3(source_1, source_2)"
+                             )
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(3).get_resulting_data().data_frame)
+    assert_frame_equal(expected_df, result_df, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [
+    export_flow_to_polars,
+    export_flow_to_flowframe,
+], ids=["polars", "flowframe"])
+def test_custom_polars_no_inputs(export_func):
+    """Test custom Polars code node with multiple inputs"""
+    flow = create_basic_flow()
+    polars_code_node = input_schema.NodePolarsCode(
+        flow_id=1,
+        node_id=1,
+        depending_on_ids=[],
+        polars_code_input=transform_schema.PolarsCodeInput(
+            polars_code="output_df = pl.LazyFrame({'a': [1,2,3]})\nreturn output_df"
+        )
+    )
+    flow.add_polars_code(polars_code_node)
+    code = export_func(flow)
+
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(1).get_resulting_data().data_frame)
+    assert_frame_equal(expected_df, result_df, check_row_order=False)
+
+
+def _sql_query_flow(sql_code: str, *columns: tuple[str, list]) -> FlowGraph:
+    """One manual input per ``(name, values)`` column (node ids 1..n) feeding SQL Query node 10, in order."""
+    flow = create_basic_flow()
+    for node_id, (name, values) in enumerate(columns, start=1):
+        flow.add_manual_input(
+            input_schema.NodeManualInput(
+                flow_id=1,
+                node_id=node_id,
+                raw_data_format=input_schema.RawData(
+                    columns=[input_schema.MinimalFieldInfo(name=name, data_type="Integer")], data=[values]
+                ),
+            )
+        )
+    input_ids = list(range(1, len(columns) + 1))
+    flow.add_sql_query(
+        input_schema.NodeSqlQuery(
+            flow_id=1,
+            node_id=10,
+            depending_on_ids=input_ids,
+            sql_query_input=transform_schema.SqlQueryInput(sql_code=sql_code),
+        )
+    )
+    for node_id in input_ids:
+        add_connection(flow, input_schema.NodeConnection.create_from_simple_input(node_id, 10))
+    return flow
+
+
+def _assert_sql_query_parity(flow: FlowGraph, code: str) -> None:
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(10).get_resulting_data().data_frame)
+    assert_frame_equal(expected_df, result_df, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_sql_query_single_input(export_func):
+    flow = _sql_query_flow("SELECT a * 2 AS doubled FROM input_1 WHERE a > 1", ("a", [1, 2, 3]))
+    code = export_func(flow)
+
+    if export_func is export_flow_to_polars:
+        verify_code_contains(
+            code, "df = pl.SQLContext(input_1=source).execute(", '"SELECT a * 2 AS doubled FROM input_1 WHERE a > 1"'
+        )
+    else:
+        verify_code_contains(code, "df = ff.sql(", '"SELECT a * 2 AS doubled FROM input_1 WHERE a > 1",', "source,")
+    _assert_sql_query_parity(flow, code)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_sql_query_multiple_inputs_keep_their_order(export_func):
+    sql_code = (
+        "WITH left_side AS (SELECT * FROM input_1),\n"
+        "     right_side AS (SELECT * FROM input_2)\n"
+        "SELECT l.a, r.b FROM left_side l JOIN right_side r ON l.a = r.b"
+    )
+    flow = _sql_query_flow(sql_code, ("a", [1, 2, 3]), ("b", [2, 3, 4]))
+    code = export_func(flow)
+
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code, "pl.SQLContext(input_1=source_1, input_2=source_2).execute(")
+    else:
+        verify_code_ordering(code, "ff.sql(", "source_1,", "source_2,")
+    verify_code_ordering(code, '"WITH left_side AS (SELECT * FROM input_1),\\n"', '"     right_side AS', '"SELECT l.a')
+    _assert_sql_query_parity(flow, code)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_sql_query_literals_with_quotes_backslashes_and_braces(export_func):
+    sql_code = (
+        "SELECT a,\n"
+        "  'say \"hi\"' AS dq,\n"
+        "  'back\\slash' AS bs,\n"
+        "  '\"\"\"' AS triple,\n"
+        "  'it''s {a}' AS sq\n"
+        "FROM input_1"
+    )
+    flow = _sql_query_flow(sql_code, ("a", [1, 2]))
+    code = export_func(flow)
+
+    ast.parse(code)
+    _assert_sql_query_parity(flow, code)
+    result = normalize_result(get_result_from_generated_code(code))
+    assert result.row(0) == (1, 'say "hi"', "back\\slash", '"""', "it's {a}")
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_sql_query_flow_parameter_becomes_a_pipeline_argument(export_func):
+    flow = _sql_query_flow("SELECT a FROM input_1\nWHERE a >= ${min_a}\nORDER BY a", ("a", [1, 2, 3, 4]))
+    flow.flow_settings.parameters = [FlowParameter(name="min_a", default_value="3", type="integer")]
+    code = export_func(flow)
+
+    verify_code_contains(code, 'f"WHERE a >= {min_a}\\n"')
+    assert "${min_a}" not in code and "__FF_PARAM_" not in code
+    exec_globals = {}
+    exec(code, exec_globals)
+    at_default = normalize_result(exec_globals["run_etl_pipeline"]())
+    at_two = normalize_result(exec_globals["run_etl_pipeline"](min_a=2))
+    assert at_default["a"].to_list() == [3, 4]
+    assert at_two["a"].to_list() == [2, 3, 4]
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+@pytest.mark.parametrize(
+    "sql_code, default",
+    [("SELECT a FROM input_1\n${where_clause}", "WHERE a > 2"), ("${where_clause}", "SELECT a FROM input_1 WHERE a > 2")],
+    ids=["last_line", "whole"],
+)
+def test_sql_query_line_that_is_only_a_parameter_still_compiles(export_func, sql_code, default):
+    flow = _sql_query_flow(sql_code, ("a", [1, 2, 3, 4]))
+    flow.flow_settings.parameters = [FlowParameter(name="where_clause", default_value=default, type="string")]
+    code = export_func(flow)
+
+    ast.parse(code)
+    assert "${where_clause}" not in code
+    assert sorted(normalize_result(get_result_from_generated_code(code))["a"].to_list()) == [3, 4]
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_sql_query_without_inputs(export_func):
+    flow = _sql_query_flow("SELECT 1 AS x")
+    code = export_func(flow)
+
+    _assert_sql_query_parity(flow, code)
+    assert normalize_result(get_result_from_generated_code(code)).to_dicts() == [{"x": 1}]
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_sql_query_multi_line_literal_keeps_its_whitespace(export_func):
+    flow = _sql_query_flow("SELECT a, 'x\n   \ny' AS s,\n  'p\n    q' AS t\nFROM input_1", ("a", [1]))
+    code = export_func(flow)
+
+    _assert_sql_query_parity(flow, code)
+    assert normalize_result(get_result_from_generated_code(code)).row(0) == (1, "x\n   \ny", "p\n    q")
+
+
+@pytest.mark.parametrize("export_func", [
+    export_flow_to_polars,
+    export_flow_to_flowframe,
+], ids=["polars", "flowframe"])
+def test_complex_workflow(tmp_path, export_func):
+    """Test a complex workflow with multiple operations"""
+    flow = create_basic_flow()
+    flow = create_csv_file_node(flow, tmp_path,
+                                df=pl.DataFrame({
+                                    "date": ["2024-01-01", "2024-01-01", "2024-01-02", "2024-01-02"],
+                                    "product": ["A", "B", "A", "B"],
+                                    "quantity": [10, 20, 15, 25],
+                                    "price": [100.0, 200.0, 100.0, 200.0]
+                                }),
+                                filename="sales_data.csv"
+                                )
+
+    formula_node = input_schema.NodeFormula(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        function=transform_schema.FunctionInput(
+            field=transform_schema.FieldInput(name="total", data_type="Double"),
+            function="[quantity] * [price]"
+        )
+    )
+    flow.add_formula(formula_node)
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    filter_node = input_schema.NodeFilter(
+        flow_id=1,
+        node_id=3,
+        depending_on_id=2,
+        filter_input=transform_schema.FilterInput(
+            filter_type="advanced",
+            advanced_filter="[total]>1500"
+        )
+    )
+    flow.add_filter(filter_node)
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(2, 3))
+    group_by_node = input_schema.NodeGroupBy(
+        flow_id=1,
+        node_id=4,
+        depending_on_id=3,
+        groupby_input=transform_schema.GroupByInput(
+            agg_cols=[
+                transform_schema.AggColl("product", "groupby"),
+                transform_schema.AggColl("total", "sum", "total_revenue"),
+                transform_schema.AggColl("quantity", "sum", "total_quantity")
+            ]
+        )
+    )
+    flow.add_group_by(group_by_node)
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(3, 4))
+    output_node = input_schema.NodeOutput(
+        flow_id=1,
+        node_id=5,
+        depending_on_id=4,
+        output_settings=input_schema.OutputSettings(
+            name="output.parquet",
+            directory=str(tmp_path),
+            file_type="parquet",
+            table_settings=input_schema.OutputParquetTable()
+        )
+    )
+    flow.add_output(output_node)
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(4, 5))
+    code = export_func(flow)
+
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code,
+                             "pl.scan_csv(",
+                             "with_columns",
+                             "filter(",
+                             "group_by",
+                             "sink_parquet"
+                             )
+
+        verify_code_ordering(code,
+                             "grouped = (",
+                             "pl.scan_csv(",
+                             ".with_columns(",
+                             ".filter(",
+                             ".group_by(",
+                             "sink_parquet"
+                             )
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(4).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [
+    export_flow_to_polars,
+    export_flow_to_flowframe,
+], ids=["polars", "flowframe"])
+def test_complex_workflow_unordered(tmp_path, export_func):
+    """Test a complex workflow with multiple operations"""
+    flow = create_basic_flow()
+    flow = create_csv_file_node(flow, tmp_path,
+                                df=pl.DataFrame({
+                                    "date": ["2024-01-01", "2024-01-01", "2024-01-02", "2024-01-02"],
+                                    "product": ["A", "B", "A", "B"],
+                                    "quantity": [10, 20, 15, 25],
+                                    "price": [100.0, 200.0, 100.0, 200.0]
+                                }),
+                                filename="sales_data.csv"
+                                )
+
+    group_by_node = input_schema.NodeGroupBy(
+        flow_id=1,
+        node_id=4,
+        groupby_input=transform_schema.GroupByInput(
+            agg_cols=[
+                transform_schema.AggColl("product", "groupby"),
+                transform_schema.AggColl("total", "sum", "total_revenue"),
+                transform_schema.AggColl("quantity", "sum", "total_quantity")
+            ]
+        )
+    )
+    flow.add_group_by(group_by_node)
+    output_node = input_schema.NodeOutput(
+        flow_id=1,
+        node_id=5,
+        depending_on_id=4,
+        output_settings=input_schema.OutputSettings(
+            name="output.parquet",
+            directory=str(tmp_path),
+            file_type="parquet",
+            table_settings=input_schema.OutputParquetTable()
+        )
+    )
+    flow.add_output(output_node)
+
+    formula_node = input_schema.NodeFormula(
+        flow_id=1,
+        node_id=2,
+        function=transform_schema.FunctionInput(
+            field=transform_schema.FieldInput(name="total", data_type="Double"),
+            function="[quantity] * [price]"
+        )
+    )
+    flow.add_formula(formula_node)
+
+    filter_node = input_schema.NodeFilter(
+        flow_id=1,
+        node_id=3,
+        filter_input=transform_schema.FilterInput(
+            filter_type="advanced",
+            advanced_filter="[total]>1500"
+        )
+    )
+    flow.add_filter(filter_node)
+
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(4, 5))
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(3, 4))
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(2, 3))
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code,
+                             "pl.scan_csv(",
+                             "with_columns",
+                             "filter(",
+                             "group_by",
+                             "sink_parquet"
+                             )
+
+        verify_code_ordering(code,
+                             "grouped = (",
+                             "pl.scan_csv(",
+                             ".with_columns(",
+                             ".filter(",
+                             ".group_by(",
+                             "sink_parquet"
+                             )
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(4).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [
+    export_flow_to_polars,
+    export_flow_to_flowframe,
+], ids=["polars", "flowframe"])
+def test_text_to_rows_operation(export_func):
+    """Test text to rows (explode) operation"""
+    flow = create_basic_flow()
+    data = input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=1,
+        raw_data_format=input_schema.RawData(
+            columns=[
+                input_schema.MinimalFieldInfo(name="id", data_type="Integer"),
+                input_schema.MinimalFieldInfo(name="tags", data_type="String")
+            ],
+            data=[[1, 2, 3], ["python,data,analysis", "machine,learning", "etl,pipeline,flowfile"]]
+        )
+    )
+    flow.add_manual_input(data)
+
+    text_to_rows_node = input_schema.NodeTextToRows(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        text_to_rows_input=transform_schema.TextToRowsInput(
+            column_to_split="tags",
+            output_column_name="tag",
+            split_fixed_value=","
+        )
+    )
+    flow.add_text_to_rows(text_to_rows_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+    code = export_func(flow)
+
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code,
+                             'str.split(",")',
+                             'alias("tag")',
+                             "explode('tag')"
+                             )
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df)
+
+
+@pytest.mark.parametrize("export_func", [
+    export_flow_to_polars,
+    export_flow_to_flowframe,
+], ids=["polars", "flowframe"])
+def test_text_to_rows_operation_no_rename(export_func):
+    """Test text to rows (explode) operation"""
+    flow = create_basic_flow()
+
+    data = input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=1,
+        raw_data_format=input_schema.RawData(
+            columns=[
+                input_schema.MinimalFieldInfo(name="id", data_type="Integer"),
+                input_schema.MinimalFieldInfo(name="tags", data_type="String")
+            ],
+            data=[[1, 2, 3], ["python,data,analysis", "machine,learning", "etl,pipeline,flowfile"]]
+        )
+    )
+    flow.add_manual_input(data)
+
+    text_to_rows_node = input_schema.NodeTextToRows(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        text_to_rows_input=transform_schema.TextToRowsInput(
+            column_to_split="tags",
+            split_fixed_value=","
+        )
+    )
+    flow.add_text_to_rows(text_to_rows_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+    code = export_func(flow)
+
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code,
+                             'str.split(",")',
+                             "explode('tags')"
+                             )
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_sort_operation(export_func):
+    """Test sort and unique operations"""
+    flow = create_basic_flow()
+    data = input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=1,
+        raw_data_format=input_schema.RawData(
+            columns=[
+                input_schema.MinimalFieldInfo(name="name", data_type="String"),
+                input_schema.MinimalFieldInfo(name="score", data_type="Integer")
+            ],
+            data=[["Alice", "Bob", "Alice", "Charlie", "Bob"], [85, 90, 85, 75, 95]]
+        )
+    )
+    flow.add_manual_input(data)
+
+    sort_node = input_schema.NodeSort(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        sort_input=[
+            transform_schema.SortByInput(column="score", how="desc"),
+            transform_schema.SortByInput(column="name", how="asc")
+        ]
+    )
+    flow.add_sort(sort_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code,
+                             'sort(["score", "name"], descending=[True, False])',
+                             )
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_sort_descending_ui_convention(export_func):
+    """Sort nodes built in the visual editor store how='Descending'/'Ascending', not 'desc'/'asc'.
+
+    Regression for the code generator emitting descending=[False] for a 'Descending'
+    sort, silently inverting the order relative to the executed graph.
+    """
+    flow = create_basic_flow()
+    data = input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=1,
+        raw_data_format=input_schema.RawData(
+            columns=[
+                input_schema.MinimalFieldInfo(name="name", data_type="String"),
+                input_schema.MinimalFieldInfo(name="score", data_type="Integer")
+            ],
+            data=[["Alice", "Bob", "Alice", "Charlie", "Bob"], [85, 90, 85, 75, 95]]
+        )
+    )
+    flow.add_manual_input(data)
+
+    sort_node = input_schema.NodeSort(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        sort_input=[
+            transform_schema.SortByInput(column="score", how="Descending"),
+            transform_schema.SortByInput(column="name", how="Ascending")
+        ]
+    )
+    flow.add_sort(sort_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code,
+                             'sort(["score", "name"], descending=[True, False])',
+                             )
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_window_functions_descending_order_by(export_func):
+    """Window-function order_by accepts the 'Descending' direction the engine honors.
+
+    The generated ordering sort must match the executed graph rather than silently
+    falling back to ascending.
+    """
+    flow = create_basic_flow()
+    flow = create_sales_dataframe_node(flow)
+
+    window_node = input_schema.NodeWindowFunctions(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        window_input=transform_schema.WindowFunctionsInput(
+            partition_by=["region"],
+            order_by=[transform_schema.SortByInput(column="date", how="Descending")],
+            window_functions=[
+                transform_schema.WindowFunctionInput(
+                    column="quantity",
+                    function="cum_sum",
+                    new_column_name="qty_cum_sum",
+                ),
+            ],
+        ),
+    )
+    flow.add_window_functions(window_node)
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+
+    # The ordering sort is emitted identically for both frameworks.
+    verify_code_contains(code, 'sort(["date"], descending=[True])')
+    verify_if_execute(code)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_sort_and_unique_operations(export_func):
+    """Test sort and unique operations"""
+    flow = create_basic_flow()
+    data = input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=1,
+        raw_data_format=input_schema.RawData(
+            columns=[
+                input_schema.MinimalFieldInfo(name="name", data_type="String"),
+                input_schema.MinimalFieldInfo(name="score", data_type="Integer")
+            ],
+            data=[["Alice", "Bob", "Alice", "Charlie", "Bob"], [85, 90, 85, 75, 95]]
+        )
+    )
+    flow.add_manual_input(data)
+
+    sort_node = input_schema.NodeSort(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        sort_input=[
+            transform_schema.SortByInput(column="score", how="desc"),
+            transform_schema.SortByInput(column="name", how="asc")
+        ]
+    )
+    flow.add_sort(sort_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    unique_node = input_schema.NodeUnique(
+        flow_id=1,
+        node_id=3,
+        depending_on_id=2,
+        unique_input=transform_schema.UniqueInput(
+            columns=["name"],
+            strategy="first"
+        )
+    )
+    flow.add_unique(unique_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(2, 3))
+
+    code = export_func(flow)
+
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code,
+                             'sort(["score", "name"], descending=[True, False])',
+                             "unique(subset=['name'], keep='first')"
+                             )
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(3).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+
+
+def add_cleansing_source(flow: FlowGraph, node_id: int, columns: list[tuple[str, str]], data: list[list]) -> None:
+    """Add a manual input with explicit per-column dtypes.
+
+    RawData.from_pylist would stringify any column mixing None with numbers, which
+    would silently hide the numeric-only cleansing rules.
+    """
+    flow.add_manual_input(
+        input_schema.NodeManualInput(
+            flow_id=flow.flow_id,
+            node_id=node_id,
+            raw_data_format=input_schema.RawData(
+                columns=[input_schema.MinimalFieldInfo(name=name, data_type=data_type) for name, data_type in columns],
+                data=data,
+            ),
+        )
+    )
+
+
+def add_data_cleansing(flow: FlowGraph, node_id: int, depending_on_id: int, **kwargs) -> None:
+    flow.add_data_cleansing(
+        input_schema.NodeDataCleansing(
+            flow_id=flow.flow_id,
+            node_id=node_id,
+            depending_on_id=depending_on_id,
+            cleansing_input=transform_schema.DataCleansingInput(**kwargs),
+        )
+    )
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(depending_on_id, node_id))
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_data_cleansing_defaults(export_func):
+    """Data cleansing with its default settings: blank-fill, zero-fill and trim."""
+    flow = create_basic_flow()
+    add_cleansing_source(
+        flow,
+        node_id=1,
+        columns=[("name", "String"), ("score", "Integer"), ("flag", "Boolean")],
+        data=[["  Alice ", None, "Bob\t"], [85, None, 95], [True, None, False]],
+    )
+    add_data_cleansing(flow, node_id=2, depending_on_id=1)
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(
+            code,
+            'pl.col(["name"]).fill_null("").str.strip_chars()',
+            'pl.col(["score"]).fill_null(strategy="zero")',
+        )
+    else:
+        verify_code_contains(code, ".data_cleansing(", "trim_whitespace=True", "case_mode='none'")
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+    assert result_df["name"].to_list() == ["Alice", "", "Bob"]
+    assert result_df["score"].to_list() == [85, 0, 95]
+    assert result_df["flag"].to_list() == [True, None, False]
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_data_cleansing_every_string_rule(export_func):
+    """Every character/whitespace/case rule at once, on unicode and full ASCII punctuation."""
+    flow = create_basic_flow()
+    add_cleansing_source(
+        flow,
+        node_id=1,
+        columns=[("messy", "String"), ("amount", "Float"), ("ok", "Boolean")],
+        data=[
+            ["  Héllo,\tW0rld!  ", f"À1{string.punctuation}é", None],
+            [1.5, None, 2.5],
+            [True, None, False],
+        ],
+    )
+    add_data_cleansing(
+        flow,
+        node_id=2,
+        depending_on_id=1,
+        remove_numbers=True,
+        remove_punctuation=True,
+        normalize_whitespace=True,
+        trim_whitespace=True,
+        case_mode="lowercase",
+    )
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(
+            code,
+            f'.str.replace_all({transform_schema.CLEANSING_NUMBERS_REGEX!r}, "")',
+            f'.str.replace_all({transform_schema.CLEANSING_PUNCTUATION_REGEX!r}, "")',
+            f'.str.replace_all({transform_schema.CLEANSING_WHITESPACE_RUN_REGEX!r}, " ")',
+            ".str.strip_chars().str.to_lowercase()",
+            'pl.col(["amount"]).fill_null(strategy="zero")',
+        )
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+    cleaned = result_df["messy"].to_list()
+    assert all(not any(char.isdigit() or char in string.punctuation for char in value) for value in cleaned)
+    assert cleaned[0] == "héllo wrld"
+    assert cleaned[2] == ""
+    assert result_df["amount"].to_list() == [1.5, 0.0, 2.5]
+    assert result_df["ok"].to_list() == [True, None, False]
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_data_cleansing_remove_letters(export_func):
+    """Letter removal is unicode-aware and runs before the whitespace clean-up."""
+    flow = create_basic_flow()
+    add_cleansing_source(flow, node_id=1, columns=[("mixed", "String")], data=[["Àbé ö9! x", None]])
+    add_data_cleansing(flow, node_id=2, depending_on_id=1, remove_letters=True)
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code, f'.str.replace_all({transform_schema.CLEANSING_LETTERS_REGEX!r}, "")')
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+    assert result_df["mixed"].to_list() == ["9!", ""]
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_data_cleansing_remove_all_whitespace_supersedes_trim_and_normalize(export_func):
+    """remove_all_whitespace replaces trimming and normalising, and casing still runs."""
+    flow = create_basic_flow()
+    add_cleansing_source(flow, node_id=1, columns=[("text", "String")], data=[["  hello   wORLD \t", None]])
+    add_data_cleansing(
+        flow,
+        node_id=2,
+        depending_on_id=1,
+        trim_whitespace=True,
+        normalize_whitespace=True,
+        remove_all_whitespace=True,
+        case_mode="titlecase",
+    )
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code, f'.str.replace_all({transform_schema.CLEANSING_WHITESPACE_REGEX!r}, "")')
+        assert ".str.strip_chars()" not in code
+        assert repr(transform_schema.CLEANSING_WHITESPACE_RUN_REGEX) not in code
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+    assert result_df["text"].to_list() == ["Helloworld", ""]
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_data_cleansing_null_rows_and_columns_with_column_list(export_func):
+    """remove_null_rows + remove_null_columns + string rules on a column list.
+
+    The generated Polars code must resolve its target columns at runtime here: the
+    export-time candidates can be dropped by the (data-dependent) null-column rule.
+    """
+    flow = create_basic_flow()
+    add_cleansing_source(
+        flow,
+        node_id=1,
+        columns=[("name", "String"), ("nickname", "String"), ("empty", "String"), ("score", "Integer")],
+        data=[
+            ["  alice ", None, "  bob  ", None],
+            ["  ali ", None, "  bo  ", None],
+            [None, None, None, None],
+            [85, None, 95, None],
+        ],
+    )
+    add_data_cleansing(
+        flow,
+        node_id=2,
+        depending_on_id=1,
+        remove_null_rows=True,
+        remove_null_columns=True,
+        selection_mode="list",
+        selected_columns=["name", "empty"],
+        case_mode="uppercase",
+    )
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(
+            code,
+            ".filter(~pl.all_horizontal(pl.all().is_null()))",
+            ".select(pl.all().null_count()).collect().to_dicts()[0]",
+            '[c for c in ["name", "empty"] if c in _dc_2_cols]',
+        )
+    else:
+        verify_code_contains(code, "columns=['name', 'empty']", "remove_null_columns=True")
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+    assert result_df.columns == ["name", "nickname", "score"]
+    assert result_df["name"].to_list() == ["ALICE", "BOB"]
+    assert result_df["nickname"].to_list() == ["  ali ", "  bo  "]
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_data_cleansing_all_null_frame_drops_every_column(export_func):
+    """A frame that is null everywhere loses every column, matching the engine.
+
+    The engine profiles null counts on the *incoming* frame, so the exported code
+    must too — profiling after the null-row filter would see height 0 and keep
+    every column.
+    """
+    flow = create_basic_flow()
+    add_cleansing_source(
+        flow,
+        node_id=1,
+        columns=[("a", "String"), ("b", "String")],
+        data=[[None, None], [None, None]],
+    )
+    add_data_cleansing(flow, node_id=2, depending_on_id=1, remove_null_rows=True, remove_null_columns=True)
+
+    code = export_func(flow)
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+    assert result_df.shape == (0, 0)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_data_cleansing_chained_nodes(export_func):
+    """Two cleansing nodes in one flow keep their runtime helper variables apart."""
+    flow = create_basic_flow()
+    add_cleansing_source(
+        flow,
+        node_id=1,
+        columns=[("a", "String"), ("b", "String")],
+        data=[["  x! ", "y"], [None, None]],
+    )
+    add_data_cleansing(flow, node_id=2, depending_on_id=1, remove_null_columns=True, remove_punctuation=True)
+    add_data_cleansing(flow, node_id=3, depending_on_id=2, remove_null_columns=True, case_mode="uppercase")
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code, "_dc_2_drop", "_dc_3_drop", "_dc_2_cols", "_dc_3_cols")
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(3).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+    assert result_df.columns == ["a"]
+    assert result_df["a"].to_list() == ["X", "Y"]
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_data_cleansing_downstream_of_a_null_column_drop(export_func):
+    """A node that drops no columns itself still must not target an upstream drop.
+
+    Schema prediction is static, so node 3's export-time candidates still contain the
+    column node 2 removed at run time; the generated code has to filter them against
+    the live schema or the script dies with ColumnNotFoundError.
+    """
+    flow = create_basic_flow()
+    add_cleansing_source(
+        flow,
+        node_id=1,
+        columns=[("a", "String"), ("gone", "String")],
+        data=[["  x! ", "y"], [None, None]],
+    )
+    add_data_cleansing(flow, node_id=2, depending_on_id=1, remove_null_columns=True)
+    add_data_cleansing(flow, node_id=3, depending_on_id=2, case_mode="uppercase")
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code, '[c for c in ["a", "gone"] if c in _dc_3_cols]')
+        assert "_dc_3_drop" not in code
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(3).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+    assert result_df.columns == ["a"]
+    assert result_df["a"].to_list() == ["X!", "Y"]
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_data_cleansing_without_any_rule_is_a_passthrough(export_func):
+    """Every rule off: the node still exports, and changes nothing."""
+    flow = create_basic_flow()
+    add_cleansing_source(flow, node_id=1, columns=[("a", "String")], data=[["  x  ", None]])
+    add_data_cleansing(
+        flow,
+        node_id=2,
+        depending_on_id=1,
+        replace_nulls_with_blank=False,
+        replace_nulls_with_zero=False,
+        trim_whitespace=False,
+    )
+
+    code = export_func(flow)
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+    assert result_df["a"].to_list() == ["  x  ", None]
+
+
+def test_data_cleansing_project_export():
+    """The project exporter inherits the FlowFrame handler — no override needed."""
+    from flowfile_core.flowfile.code_generator.project_exporter import export_flow_to_project
+
+    flow = create_basic_flow(name="cleansing_flow")
+    add_cleansing_source(flow, node_id=1, columns=[("a", "String")], data=[["  x  ", None]])
+    add_data_cleansing(flow, node_id=2, depending_on_id=1, selection_mode="list", selected_columns=["a"])
+
+    manifest = export_flow_to_project(flow)
+    pipeline = next(file.content for file in manifest.files if file.path == "pipeline.py")
+    assert ".data_cleansing(" in pipeline
+    assert "columns=['a']" in pipeline
+    assert manifest.warnings == []
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_record_id_generation_with_grouping(export_func):
+    """Test record ID generation with grouping"""
+    flow = create_basic_flow()
+
+    data = input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=1,
+        raw_data_format=input_schema.RawData(
+            columns=[
+                input_schema.MinimalFieldInfo(name="category", data_type="String"),
+                input_schema.MinimalFieldInfo(name="value", data_type="Integer")
+            ],
+            data=[["A", "B", "A", "B", "A"], [10, 20, 30, 40, 50]]
+        )
+    )
+    flow.add_manual_input(data)
+
+    record_id_node = input_schema.NodeRecordId(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        record_id_input=transform_schema.RecordIdInput(
+            output_column_name="row_num",
+            offset=1,
+            group_by=True,
+            group_by_columns=["category"]
+        )
+    )
+    flow.add_record_id(record_id_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_record_id_generation_without_grouping(export_func):
+    """Test record ID generation without grouping"""
+    flow = create_basic_flow()
+    data = input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=1,
+        raw_data_format=input_schema.RawData(
+            columns=[
+                input_schema.MinimalFieldInfo(name="category", data_type="String"),
+                input_schema.MinimalFieldInfo(name="value", data_type="Integer")
+            ],
+            data=[["A", "B", "A", "B", "A"], [10, 20, 30, 40, 50]]
+        )
+    )
+    flow.add_manual_input(data)
+
+    record_id_node = input_schema.NodeRecordId(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        record_id_input=transform_schema.RecordIdInput(
+            output_column_name="row_num",
+            offset=1,
+        )
+    )
+    flow.add_record_id(record_id_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_sample_operation(export_func):
+    """Test sample operation"""
+    flow = create_basic_flow()
+    flow = create_sample_dataframe_node(flow)
+
+    sample_node = input_schema.NodeSample(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        sample_size=3
+    )
+    flow.add_sample(sample_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code, "head(n=3)")
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_sample_random_rows_operation(export_func):
+    """A seeded random sample must export to code that picks the same rows as the flow."""
+    flow = create_basic_flow()
+    flow = create_sample_dataframe_node(flow)
+
+    sample_node = input_schema.NodeSample(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        sample_method="random",
+        sample_size=3,
+        seed=42,
+    )
+    flow.add_sample(sample_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code, "pl.int_range(0, pl.len()).shuffle(seed=42) < 3")
+    else:
+        verify_code_contains(code, ".sample(3, seed=42)")
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_sample_random_fraction_operation(export_func):
+    """A seeded fractional sample must export to code that picks the same rows as the flow."""
+    flow = create_basic_flow()
+    flow = create_sample_dataframe_node(flow)
+
+    sample_node = input_schema.NodeSample(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        sample_method="random_fraction",
+        fraction=50.0,
+        seed=7,
+    )
+    flow.add_sample(sample_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code, "(pl.len() * 0.5).round().cast(pl.Int64)")
+    else:
+        verify_code_contains(code, ".sample(fraction=0.5, seed=7)")
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+
+
+def test_empty_flow():
+    """Test converting an empty flow"""
+    flow = create_basic_flow()
+
+    code = export_flow_to_polars(flow)
+
+    verify_code_contains(code,
+                         "import polars as pl",
+                         "def run_etl_pipeline():",
+                         'if __name__ == "__main__":'
+                         )
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_cross_join_operation(export_func):
+    """Test cross join with multiple inputs"""
+    flow = create_basic_flow()
+
+    data1 = input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=1,
+        raw_data_format=input_schema.RawData(
+            columns=[input_schema.MinimalFieldInfo(name="x", data_type="Integer")],
+            data=[[1, 2, 3]]
+        )
+    )
+    flow.add_manual_input(data1)
+
+    data2 = input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=2,
+        raw_data_format=input_schema.RawData(
+            columns=[input_schema.MinimalFieldInfo(name="y", data_type="String")],
+            data=[["A", "B"]]
+        )
+    )
+    flow.add_manual_input(data2)
+    cross_join_node = input_schema.NodeCrossJoin(
+        flow_id=1,
+        node_id=3,
+        depending_on_ids=[1, 2],
+        cross_join_input=transform_schema.CrossJoinInput(
+            left_select=[transform_schema.SelectInput("x")],
+            right_select=[transform_schema.SelectInput("y")]
+        )
+    )
+    flow.add_cross_join(cross_join_node)
+    left_connection = input_schema.NodeConnection.create_from_simple_input(1, 3, 'main')
+    right_connection = input_schema.NodeConnection.create_from_simple_input(2, 3, 'right')
+    add_connection(flow, left_connection)
+    add_connection(flow, right_connection)
+    code = export_func(flow)
+
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code,
+                             "join(",
+                             "how='cross'"
+                             )
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(3).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_cross_join_operation_equal_column(export_func):
+    """Test cross join with multiple inputs"""
+    flow = create_basic_flow()
+
+    data1 = input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=1,
+        raw_data_format=input_schema.RawData(
+            columns=[input_schema.MinimalFieldInfo(name="x", data_type="Integer")],
+            data=[[1, 2, 3]]
+        )
+    )
+    flow.add_manual_input(data1)
+
+    data2 = input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=2,
+        raw_data_format=input_schema.RawData(
+            columns=[input_schema.MinimalFieldInfo(name="x", data_type="String")],
+            data=[["A", "B"]]
+        )
+    )
+    flow.add_manual_input(data2)
+    cross_join_node = input_schema.NodeCrossJoin(
+        flow_id=1,
+        node_id=3,
+        depending_on_ids=[1, 2],
+        cross_join_input=transform_schema.CrossJoinInput(
+            left_select=[transform_schema.SelectInput("x")],
+            right_select=[transform_schema.SelectInput("x")]
+        )
+    )
+    flow.add_cross_join(cross_join_node)
+    left_connection = input_schema.NodeConnection.create_from_simple_input(1, 3, 'main')
+    right_connection = input_schema.NodeConnection.create_from_simple_input(2, 3, 'right')
+    add_connection(flow, left_connection)
+    add_connection(flow, right_connection)
+    code = export_func(flow)
+
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code,
+                             "join(",
+                             "how='cross'"
+                             )
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(3).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_unpivot_operation(export_func):
+    """Test unpivot/melt operation"""
+    flow = create_basic_flow()
+
+    data = input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=1,
+        raw_data_format=input_schema.RawData(
+            columns=[
+                input_schema.MinimalFieldInfo(name="id", data_type="Integer"),
+                input_schema.MinimalFieldInfo(name="jan", data_type="Double"),
+                input_schema.MinimalFieldInfo(name="feb", data_type="Double"),
+                input_schema.MinimalFieldInfo(name="mar", data_type="Double")
+            ],
+            data=[[1, 2], [100.0, 150.0], [110.0, 160.0], [120.0, 170.0]]
+        )
+    )
+    flow.add_manual_input(data)
+
+    unpivot_node = input_schema.NodeUnpivot(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        unpivot_input=transform_schema.UnpivotInput(
+            index_columns=["id"],
+            value_columns=["jan", "feb", "mar"]
+        )
+    )
+    flow.add_unpivot(unpivot_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+    code = export_func(flow)
+
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code,
+                             "unpivot(",
+                             'index=["id"]',
+                             'on=["jan", "feb", "mar"]',
+                             "variable_name='variable'",
+                             "value_name='value'"
+                             )
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+
+
+def _unpivot_by_data_type_flow(
+    data_type_selector: str | None, with_date: bool = False, mode: str = "data_type"
+) -> FlowGraph:
+    flow = create_basic_flow()
+    columns = [
+        input_schema.MinimalFieldInfo(name="base", data_type="String"),
+        input_schema.MinimalFieldInfo(name="amount", data_type="Integer"),
+        input_schema.MinimalFieldInfo(name="gbp", data_type="Double"),
+        input_schema.MinimalFieldInfo(name="jpy", data_type="Double"),
+    ]
+    data = [["EUR", "USD"], [1, 2], [0.7, 0.8], [150.0, 160.0]]
+    if with_date:
+        columns.append(input_schema.MinimalFieldInfo(name="day", data_type="Date"))
+        data.append([date(2026, 10, 28), date(2026, 10, 29)])
+    flow.add_manual_input(input_schema.NodeManualInput(
+        flow_id=1, node_id=1, raw_data_format=input_schema.RawData(columns=columns, data=data)
+    ))
+    flow.add_unpivot(input_schema.NodeUnpivot(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        unpivot_input=transform_schema.UnpivotInput(
+            index_columns=["amount"],
+            data_type_selector=data_type_selector,
+            data_type_selector_mode=mode,
+        ),
+    ))
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+    return flow
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_unpivot_by_data_type(export_func):
+    """A data-type unpivot exports its selector, so the code unpivots the columns the canvas does."""
+    flow = _unpivot_by_data_type_flow("float")
+    code = export_func(flow)
+
+    verify_code_contains(code, "on=cs.float()" if export_func is export_flow_to_polars else "on=ff.float_()")
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert sorted(expected_df["variable"].unique()) == ["gbp", "jpy"]
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+
+
+@pytest.mark.parametrize("data_type_selector", ["all", "date", "float", "numeric", "string", None])
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_unpivot_every_data_type_option_matches_the_canvas(export_func, data_type_selector):
+    flow = _unpivot_by_data_type_flow(data_type_selector, with_date=True)
+    code = export_func(flow)
+
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert expected_df.height > 0
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_unpivot_without_value_columns_unpivots_every_other_column(export_func):
+    """A column unpivot with only index keys unpivots every other column, like Polars' ``on=None``."""
+    flow = _unpivot_by_data_type_flow(None, mode="column")
+    code = export_func(flow)
+
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert sorted(expected_df["variable"].unique()) == ["base", "gbp", "jpy"]
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+
+
+def test_unpivot_settings_hold_only_the_active_mode():
+    by_type = transform_schema.UnpivotInput(data_type_selector_mode="data_type", value_columns=["a"])
+    assert (by_type.data_type_selector, by_type.value_columns) == ("all", [])
+    by_columns = transform_schema.UnpivotInput(value_columns=["a"], data_type_selector="numeric")
+    assert (by_columns.data_type_selector, by_columns.value_columns) == (None, ["a"])
+
+
+def test_unpivot_of_columns_without_a_common_type_fails_with_a_value_error(protocol_on):
+    engine = FlowDataEngine(pl.LazyFrame({"g": ["a"], "n": [1], "tags": [[1, 2]]}))
+    with pytest.raises(ValueError, match="no common type"):
+        engine.unpivot(transform_schema.UnpivotInput(index_columns=["g"]))
+
+
+@pytest.mark.parametrize("export_func", [
+    export_flow_to_polars,
+    export_flow_to_flowframe,
+], ids=["polars", "flowframe"])
+def test_multiple_output_formats(tmp_path, export_func):
+    """Test different output formats"""
+    flow = create_basic_flow()
+    flow = create_sample_dataframe_node(flow)
+    csv_output = input_schema.NodeOutput(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        output_settings=input_schema.OutputSettings(
+            name="output.csv",
+            directory=str(tmp_path),
+            file_type="csv",
+            table_settings=input_schema.OutputCsvTable(delimiter="|")
+        )
+    )
+    flow.add_output(csv_output)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code,
+                             "sink_csv(",
+                             'separator="|"'
+                             )
+
+    excel_output = input_schema.NodeOutput(
+        flow_id=1,
+        node_id=3,
+        depending_on_id=1,
+        output_settings=input_schema.OutputSettings(
+            name="output.xlsx",
+            directory=str(tmp_path),
+            file_type="excel",
+            table_settings=input_schema.OutputExcelTable(sheet_name="Results")
+        )
+    )
+    flow.add_output(excel_output)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 3))
+
+    parquet_output = input_schema.NodeOutput(
+        flow_id=1,
+        node_id=4,
+        depending_on_id=1,
+        output_settings=input_schema.OutputSettings(
+            name="output.parquet",
+            directory=str(tmp_path),
+            file_type="parquet",
+            table_settings=input_schema.OutputParquetTable()
+        )
+    )
+    flow.add_output(parquet_output)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 4))
+    code = export_func(flow)
+    verify_if_execute(code)
+    if export_func is export_flow_to_polars:
+        try:
+            pl.read_csv(str(tmp_path) + os.sep + "output.csv", separator="|")
+        except Exception:
+            raise Exception("Could not read the CSV file that should have been written")
+        try:
+            pl.read_excel(str(tmp_path) + os.sep + "output.xlsx", sheet_name='Results')
+        except Exception:
+            raise Exception("Could not read the xlsx file that should have been written")
+        try:
+            pl.read_parquet(str(tmp_path) + os.sep + "output.parquet")
+        except Exception:
+            raise Exception("Could not read the parquet file that should have been written")
+
+
+def create_excel_output_flow(tmp_path, write_mode: str) -> FlowGraph:
+    """Build a manual_input -> excel output flow carrying the given write_mode"""
+    flow = create_basic_flow()
+    flow = create_sample_dataframe_node(flow)
+    excel_output = input_schema.NodeOutput(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        output_settings=input_schema.OutputSettings(
+            name="output.xlsx",
+            directory=str(tmp_path),
+            file_type="excel",
+            write_mode=write_mode,
+            table_settings=input_schema.OutputExcelTable(sheet_name="Results")
+        )
+    )
+    flow.add_output(excel_output)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+    return flow
+
+
+def test_excel_update_mode_export(tmp_path):
+    """Excel 'update' survives the FlowFrame export, stays out of overwrite exports, and blocks the Polars export"""
+    update_code = export_flow_to_flowframe(create_excel_output_flow(tmp_path, "update"))
+    verify_code_contains(update_code,
+                         "write_excel(",
+                         'worksheet="Results"',
+                         'write_mode="update"'
+                         )
+    verify_if_execute(update_code)
+
+    overwrite_code = export_flow_to_flowframe(create_excel_output_flow(tmp_path, "overwrite"))
+    assert "write_mode=" not in overwrite_code
+
+    with pytest.raises(UnsupportedNodeError):
+        export_flow_to_polars(create_excel_output_flow(tmp_path, "update"))
+
+
+def test_excel_create_mode_export(tmp_path):
+    """Excel 'create' refuses an existing file in both exports instead of overwriting it"""
+    flow = create_excel_output_flow(tmp_path, "create")
+    output_path = flow.get_node(2).setting_input.output_settings.abs_file_path
+
+    polars_code = export_flow_to_polars(flow)
+    verify_code_contains(polars_code,
+                         "import os",
+                         f"if os.path.exists({json.dumps(str(output_path), ensure_ascii=False)}):",
+                         "raise FileExistsError(",
+                         "write_excel("
+                         )
+    verify_if_execute(polars_code)
+
+    original_bytes = Path(output_path).read_bytes()
+    with pytest.raises(FileExistsError):
+        get_result_from_generated_code(polars_code)
+    assert Path(output_path).read_bytes() == original_bytes
+
+    verify_code_contains(export_flow_to_flowframe(flow), 'write_mode="create"')
+
+
+def test_node_with_no_handler():
+    """Test behavior when encountering a node type with no handler"""
+    flow = create_basic_flow()
+
+    promise_node = input_schema.NodePromise(
+        flow_id=1,
+        node_id=1,
+        node_type="manual_input"
+    )
+    flow.add_node_promise(promise_node)
+
+    code = export_flow_to_polars(flow)
+    verify_if_execute(code)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_data_type_conversions(export_func):
+    """Test data type conversions in select nodes"""
+    flow = create_basic_flow()
+    flow = create_sample_dataframe_node(flow)
+
+    select_node = input_schema.NodeSelect(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        select_input=[
+            transform_schema.SelectInput("age", "age_float", keep=True, data_type="Float64", data_type_change=True),
+            transform_schema.SelectInput("salary", "salary_int", keep=True, data_type="Int32", data_type_change=True),
+            transform_schema.SelectInput("id", "id_str", keep=True, data_type="String", data_type_change=True),
+        ],
+        keep_missing=False
+    )
+    flow.add_select(select_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code,
+                             'pl.col("age").alias("age_float").cast(pl.Float64)',
+                             'pl.col("salary").alias("salary_int").cast(pl.Int32)',
+                             'pl.col("id").alias("id_str").cast(pl.Utf8)'
+                             )
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_csv_read_utf_8(export_func):
+    """Test reading parquet files"""
+    flow = create_basic_flow()
+    flowfile_core_path = find_parent_directory('Flowfile')
+
+    file_path = str(Path(flowfile_core_path) / 'flowfile_core' / 'tests' / 'support_files' / 'data' / 'fake_data.csv')
+    read_node = input_schema.NodeRead(
+        flow_id=1,
+        node_id=1,
+        received_file=input_schema.ReceivedTable(
+            name="fake_data.csv",
+            path=file_path,
+            file_type="csv",
+            table_settings=input_schema.InputCsvTable()
+        )
+    )
+
+    flow.add_read(read_node)
+    flow.get_node(1).get_resulting_data()
+    code = export_func(flow)
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    assert len(result) > 0
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_parquet_read(export_func):
+    """Test reading parquet files"""
+    flow = create_basic_flow()
+    flowfile_core_path = find_parent_directory('Flowfile')
+    file_path = str(
+        (
+                Path(flowfile_core_path) / 'flowfile_core' / 'tests' / 'support_files' / 'data' / 'fake_data.parquet'
+         ).absolute()
+    )
+    read_node = input_schema.NodeRead(
+        flow_id=1,
+        node_id=1,
+        received_file=input_schema.ReceivedTable(
+            name="fake_data.parquet",
+            path=file_path,
+            file_type="parquet",
+            table_settings=input_schema.InputParquetTable()
+        )
+    )
+
+    flow.add_read(read_node)
+    flow.get_node(1).get_resulting_data()
+    code = export_func(flow)
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    assert len(result) > 0
+
+
+@pytest.mark.parametrize("file_type,ext,settings", [
+    ("ndjson", "ndjson", input_schema.InputNdjsonTable()),
+    ("avro", "avro", input_schema.InputAvroTable()),
+    ("ipc_stream", "arrows", input_schema.InputIpcStreamTable()),
+], ids=["ndjson", "avro", "ipc_stream"])
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_ndjson_and_eager_format_read(tmp_path, file_type, ext, settings, export_func):
+    """These formats used to land in unsupported_nodes; both exports now emit a reader that runs.
+    NDJSON scans lazily; avro and the IPC stream format have no scan, so the polars export
+    wraps the eager read in ``.lazy()`` and the FlowFrame export imports the reader from
+    flowfile_frame (``flowfile`` does not re-export it)."""
+    path = tmp_path / f"data.{ext}"
+    getattr(pl.DataFrame({"id": [1, 2, 3], "name": ["a", "b", "c"]}), f"write_{file_type}")(str(path))
+    flow = create_basic_flow()
+    flow.add_read(input_schema.NodeRead(
+        flow_id=1,
+        node_id=1,
+        received_file=input_schema.ReceivedTable(name=path.name, path=str(path), file_type=file_type, table_settings=settings),
+    ))
+
+    code = export_func(flow)
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    assert result["name"].to_list() == ["a", "b", "c"]
+    if export_func is export_flow_to_flowframe:
+        reader = "scan_ndjson" if file_type == "ndjson" else f"read_{file_type}"
+        assert f"from flowfile_frame import {reader}" in code
+    elif file_type != "ndjson":
+        assert f"pl.read_{file_type}(" in code and ".lazy()" in code
+
+
+@pytest.mark.parametrize("export_func", [
+    export_flow_to_polars,
+    export_flow_to_flowframe,
+], ids=["polars", "flowframe"])
+def test_excel_read(export_func):
+    """Test reading Excel files"""
+    flow = create_basic_flow()
+    flowfile_core_path = find_parent_directory('Flowfile')
+
+    file_path = str(
+        Path(flowfile_core_path) / 'flowfile_core' / 'tests' / 'support_files' / 'data' / 'fake_data.xlsx')
+    read_node = input_schema.NodeRead(
+        flow_id=1,
+        node_id=1,
+        received_file=input_schema.ReceivedTable(
+            name="data.xlsx",
+            path=file_path,
+            file_type="excel",
+            table_settings=input_schema.InputExcelTable(sheet_name="Sheet1")
+        )
+    )
+    flow.add_read(read_node)
+
+    code = export_func(flow)
+
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code,
+                             "pl.read_excel(",
+                             'sheet_name="Sheet1"'
+                             )
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    assert len(result) > 0
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_aggregation_functions(export_func):
+    """Test various aggregation functions in group by"""
+    flow = create_basic_flow()
+    flow = create_sales_dataframe_node(flow)
+
+    groupby_node = input_schema.NodeGroupBy(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        groupby_input=transform_schema.GroupByInput(
+            agg_cols=[
+                transform_schema.AggColl("product", "groupby"),
+                transform_schema.AggColl("quantity", "min", "min_qty"),
+                transform_schema.AggColl("quantity", "max", "max_qty"),
+                transform_schema.AggColl("price", "std", "price_std"),
+                transform_schema.AggColl("price", "var", "price_var"),
+                transform_schema.AggColl("product", "n_unique", "unique_products"),
+                transform_schema.AggColl("region", "first", "first_region"),
+                transform_schema.AggColl("region", "last", "last_region"),
+            ]
+        )
+    )
+    flow.add_group_by(groupby_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code,
+                             'pl.col("quantity").min().alias("min_qty")',
+                             'pl.col("quantity").max().alias("max_qty")',
+                             'pl.col("price").std().alias("price_std")',
+                             'pl.col("price").var().alias("price_var")',
+                             'pl.col("product").n_unique().alias("unique_products")',
+                             'pl.col("region").first().alias("first_region")',
+                             'pl.col("region").last().alias("last_region")'
+                             )
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [
+    export_flow_to_polars,
+    export_flow_to_flowframe,
+], ids=["polars", "flowframe"])
+def test_flow_with_disconnected_nodes(export_func):
+    """Test a flow where some nodes might not be connected properly"""
+    flow = create_basic_flow()
+
+    data1 = input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=1,
+        raw_data_format=input_schema.RawData(
+            columns=[input_schema.MinimalFieldInfo(name="col1", data_type="Integer")],
+            data=[[1, 2, 3]]
+        )
+    )
+    flow.add_manual_input(data1)
+
+    data2 = input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=2,
+        raw_data_format=input_schema.RawData(
+            columns=[input_schema.MinimalFieldInfo(name="col2", data_type="String")],
+            data=[["A", "B", "C"]]
+        )
+    )
+    flow.add_manual_input(data2)
+
+    code = export_func(flow)
+
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code,
+                             "source_1 = pl.LazyFrame(",
+                             "source_2 = pl.LazyFrame("
+                             )
+
+
+@pytest.mark.parametrize("export_func", [
+    export_flow_to_polars,
+    export_flow_to_flowframe,
+], ids=["polars", "flowframe"])
+def test_custom_code_with_assignment(export_func):
+    """Test custom Polars code that includes variable assignments"""
+    flow = create_basic_flow()
+    flow = create_sample_dataframe_node(flow)
+    polars_code_node = input_schema.NodePolarsCode(
+        flow_id=1,
+        node_id=2,
+        depending_on_ids=[1],
+        polars_code_input=transform_schema.PolarsCodeInput(
+            polars_code="""filtered = input_df.filter(pl.col('age') > 25)
+sorted = filtered.sort('salary', descending=True)
+output_df = sorted.select(['name', 'salary'])"""
+        )
+    )
+    flow.add_polars_code(polars_code_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code,
+                             "def _polars_code_2(input_df: pl.LazyFrame):",
+                             "filtered = input_df.filter(pl.col('age') > 25)",
+                             "sorted = filtered.sort('salary', descending=True)",
+                             "output_df = sorted.select(['name', 'salary'])",
+                             "return output_df"
+                             )
+    verify_if_execute(code)
+    get_result_from_generated_code(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [
+    export_flow_to_polars,
+    export_flow_to_flowframe,
+], ids=["polars", "flowframe"])
+def test_text_to_rows_without_output_name(export_func):
+    """Test text to rows when output column name is not specified"""
+    flow = create_basic_flow()
+
+    data = input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=1,
+        raw_data_format=input_schema.RawData(
+            columns=[
+                input_schema.MinimalFieldInfo(name="items", data_type="String")
+            ],
+            data=[["a,b,c", "x,y,z"]]
+        )
+    )
+    flow.add_manual_input(data)
+
+    text_to_rows_node = input_schema.NodeTextToRows(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        text_to_rows_input=transform_schema.TextToRowsInput(
+            column_to_split="items",
+            split_fixed_value=","
+        )
+    )
+    flow.add_text_to_rows(text_to_rows_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code,
+                             'pl.col("items").str.split(",")',
+                             "explode('items')"
+                             )
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+
+
+@pytest.mark.skipif(not is_docker_available(), reason="Docker is not available or not running")
+def test_cloud_storage_reader():
+    conn = ensure_cloud_storage_connection_is_available_and_get_connection()
+
+    flow = create_basic_flow()
+    read_settings = cloud_ss.CloudStorageReadSettings(
+        resource_path="s3://test-bucket/single-file-parquet/data.parquet",
+        file_format="parquet",
+        scan_mode="single_file",
+        connection_name=conn.connection_name
+    )
+    node_settings = input_schema.NodeCloudStorageReader(flow_id=flow.flow_id, node_id=1, user_id=1,
+                                                        cloud_storage_settings=read_settings)
+    flow.add_cloud_storage_reader(node_settings)
+    record_count_node = input_schema.NodeRecordCount(flow_id=1, node_id=2, depending_on_id=1)
+
+    flow.add_record_count(record_count_node)
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(1, 2))
+    code = export_flow_to_flowframe(flow)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected_df, check_row_order=False)
+
+
+@pytest.mark.skipif(not is_docker_available(), reason="Docker is not available or not running")
+@pytest.mark.parametrize("file_format", ["csv", "parquet", "json", "delta"])
+def test_cloud_storage_writer(file_format):
+    if file_format != "delta":
+        output_file_name = f"s3://flowfile-test/flowfile_generated_data_{uuid4()}.{file_format}"
+    else:
+        output_file_name = f"s3://flowfile-test/flowfile_generated_data_{uuid4()}"
+    conn = ensure_cloud_storage_connection_is_available_and_get_connection()
+    write_settings = cloud_ss.CloudStorageWriteSettings(
+        resource_path=output_file_name,
+        file_format=file_format,
+        connection_name=conn.connection_name
+    )
+    read_settings = cloud_ss.CloudStorageReadSettings(
+        resource_path=output_file_name,
+        file_format=file_format,
+        connection_name=conn.connection_name
+    )
+    flow = create_basic_flow()
+    flow = create_sample_dataframe_node(flow)
+    record_count_node = input_schema.NodeRecordCount(flow_id=1, node_id=2, depending_on_id=1)
+    flow.add_record_count(record_count_node)
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    node_settings = input_schema.NodeCloudStorageWriter(flow_id=flow.flow_id, node_id=3, user_id=1,
+                                                        cloud_storage_settings=write_settings,)
+    flow.add_cloud_storage_writer(node_settings)
+
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(2, 3))
+    code = export_flow_to_flowframe(flow)
+    verify_if_execute(code)
+    fde = FlowDataEngine.from_cloud_storage_obj(
+        cloud_ss.CloudStorageReadSettingsInternal(read_settings=read_settings, connection=get_cloud_connection()),
+        user_id=1,
+    )
+    assert fde.collect()[0, 0] == 5
+
+
+@pytest.mark.parametrize("export_func", [
+    export_flow_to_polars,
+    export_flow_to_flowframe,
+], ids=["polars", "flowframe"])
+def test_fuzzy_match_single_file(fuzzy_join_left_data, export_func):
+    flow = create_basic_flow(1)
+    flow.add_manual_input(fuzzy_join_left_data)
+    settings = input_schema.NodeFuzzyMatch(flow_id=1, node_id=2, description='', auto_generate_selection=True,
+                                           join_input=transform_schema.FuzzyMatchInput(
+                                               join_mapping=[FuzzyMapping('name',threshold_score=75.0)],
+            left_select=[transform_schema.SelectInput(old_name='id', keep=True),
+                         transform_schema.SelectInput(old_name='name', keep=True),
+                         transform_schema.SelectInput(old_name='address', keep=True)],
+            right_select=[transform_schema.SelectInput(old_name='id', keep=True),
+                          transform_schema.SelectInput(old_name='name', keep=True),
+                          transform_schema.SelectInput(old_name='address', keep=True)],
+                                           ), auto_keep_all=True)
+    flow.add_fuzzy_match(settings)
+
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2, input_type="main"))
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2, input_type="right"))
+
+    code = export_func(flow)
+
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected_df, check_dtypes=False, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [
+    export_flow_to_polars,
+    export_flow_to_flowframe,
+], ids=["polars", "flowframe"])
+def test_fuzzy_match_single_multiple_columns_file(fuzzy_join_left_data, export_func):
+    flow = create_basic_flow(1)
+    flow.add_manual_input(fuzzy_join_left_data)
+    settings = input_schema.NodeFuzzyMatch(flow_id=1, node_id=2, description='', auto_generate_selection=True,
+                                           join_input=transform_schema.FuzzyMatchInput(
+                                               join_mapping=[FuzzyMapping('name',threshold_score=75.0)],
+            left_select=[transform_schema.SelectInput(old_name='name', keep=True),
+                         transform_schema.SelectInput(old_name='id', keep=True)],
+            right_select=[transform_schema.SelectInput(old_name='name', keep=True),
+                          transform_schema.SelectInput(old_name='id', keep=False)],
+                                           ), auto_keep_all=True)
+    flow.add_fuzzy_match(settings)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2, input_type="main"))
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2, input_type="right"))
+
+    code = export_func(flow)
+
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected_df, check_dtypes=False, check_row_order=False)
+
+
+def test_explore_data_node_skipped():
+    """explore_data is interactive-only: it is elided entirely (no dead passthrough line)."""
+    flow = create_basic_flow()
+
+    manual_input = input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=1,
+        raw_data_format=input_schema.RawData(
+            columns=[input_schema.MinimalFieldInfo(name="id", data_type="Integer")],
+            data=[[1, 2, 3]]
+        )
+    )
+    flow.add_manual_input(manual_input)
+
+    flow.add_node_promise(input_schema.NodePromise(node_id=2, flow_id=1, node_type="explore_data"))
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+    flow.add_explore_data(input_schema.NodeExploreData(flow_id=1, node_id=2, depending_on_id=1))
+
+    code = export_flow_to_polars(flow)
+    assert "Pass through" not in code
+    assert "Explore Data" not in code
+    assert "df_2" not in code
+    verify_if_execute(code)
+
+
+def test_database_reader_reference_mode_code_generation():
+    """Test database reader code generation with reference mode.
+
+    This test directly tests the code generator handler without going through
+    the full flow.add_database_reader() which tries to resolve connections.
+    """
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToPolarsConverter
+
+    flow = create_basic_flow()
+
+    db_settings = input_schema.DatabaseSettings(
+        connection_mode="reference",
+        database_connection_name="test_connection",
+        query_mode="table",
+        table_name="users",
+        schema_name="public",
+    )
+    db_reader = input_schema.NodeDatabaseReader(
+        flow_id=1,
+        node_id=1,
+        database_settings=db_settings,
+    )
+
+    converter = FlowGraphToPolarsConverter(flow)
+    converter._handle_database_reader(db_reader, "df_1", {})
+
+    code_output = "\n".join(converter.code_lines)
+    assert 'ff.read_database(' in code_output
+    assert '"test_connection"' in code_output
+    assert 'table_name="users"' in code_output
+    assert 'schema_name="public"' in code_output
+    assert "import flowfile as ff" in converter.imports
+
+
+def test_database_reader_query_mode_code_generation():
+    """Test database reader code generation with query mode."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToPolarsConverter
+
+    flow = create_basic_flow()
+
+    db_settings = input_schema.DatabaseSettings(
+        connection_mode="reference",
+        database_connection_name="test_connection",
+        query_mode="query",
+        query="SELECT id, name\nFROM users\nWHERE active = true",
+    )
+    db_reader = input_schema.NodeDatabaseReader(
+        flow_id=1,
+        node_id=1,
+        database_settings=db_settings,
+    )
+
+    converter = FlowGraphToPolarsConverter(flow)
+    converter._handle_database_reader(db_reader, "df_1", {})
+
+    code_output = "\n".join(converter.code_lines)
+    assert 'ff.read_database(' in code_output
+    assert 'query="""' in code_output
+    assert "SELECT id, name" in code_output
+    assert "FROM users" in code_output
+
+
+def test_database_reader_inline_mode_adds_to_unsupported():
+    """Test that database reader with inline mode is added to unsupported nodes."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToPolarsConverter
+
+    flow = create_basic_flow()
+
+    db_settings = input_schema.DatabaseSettings(
+        connection_mode="inline",
+        database_connection=input_schema.DatabaseConnection(
+            database_type="postgresql",
+            host="localhost",
+            port=5432,
+            database="test",
+            username="user",
+        ),
+        query_mode="table",
+        table_name="users",
+    )
+    db_reader = input_schema.NodeDatabaseReader(
+        flow_id=1,
+        node_id=1,
+        database_settings=db_settings,
+    )
+
+    converter = FlowGraphToPolarsConverter(flow)
+    converter._handle_database_reader(db_reader, "df_1", {})
+
+    assert len(converter.unsupported_nodes) == 1
+    assert "inline" in converter.unsupported_nodes[0][2].lower()
+
+
+def test_database_writer_reference_mode_code_generation():
+    """Test database writer code generation with reference mode."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToPolarsConverter
+
+    flow = create_basic_flow()
+
+    db_write_settings = input_schema.DatabaseWriteSettings(
+        connection_mode="reference",
+        database_connection_name="test_connection",
+        table_name="output_table",
+        schema_name="public",
+        if_exists="replace",
+    )
+    db_writer = input_schema.NodeDatabaseWriter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        database_write_settings=db_write_settings,
+    )
+
+    converter = FlowGraphToPolarsConverter(flow)
+    converter._handle_database_writer(db_writer, "df_2", {"main": "df_1"})
+
+    code_output = "\n".join(converter.code_lines)
+    assert "ff.write_database(" in code_output
+    assert '"test_connection"' in code_output
+    assert '"output_table"' in code_output
+    assert 'schema_name="public"' in code_output
+    assert 'if_exists="replace"' in code_output
+    assert "import flowfile as ff" in converter.imports
+
+
+def test_database_writer_inline_mode_adds_to_unsupported():
+    """Test that database writer with inline mode is added to unsupported nodes."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToPolarsConverter
+
+    flow = create_basic_flow()
+
+    db_write_settings = input_schema.DatabaseWriteSettings(
+        connection_mode="inline",
+        database_connection=input_schema.DatabaseConnection(
+            database_type="postgresql",
+            host="localhost",
+            port=5432,
+            database="test",
+            username="user",
+        ),
+        table_name="output_table",
+    )
+    db_writer = input_schema.NodeDatabaseWriter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        database_write_settings=db_write_settings,
+    )
+
+    converter = FlowGraphToPolarsConverter(flow)
+    converter._handle_database_writer(db_writer, "df_2", {"main": "df_1"})
+
+    assert len(converter.unsupported_nodes) == 1
+    assert "inline" in converter.unsupported_nodes[0][2].lower()
+
+
+# ==================== REST API Reader Tests ====================
+
+
+def _make_rest_api_reader(node_id: int = 1, **rest_api_settings) -> input_schema.NodeRestApiReader:
+    return input_schema.NodeRestApiReader(
+        flow_id=1,
+        node_id=node_id,
+        rest_api_settings=input_schema.RestApiSettings(**rest_api_settings),
+    )
+
+
+def test_rest_api_reader_basic_polars_code_generation():
+    """A minimal GET reader emits ff.read_api(...).data for the Polars target."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToPolarsConverter
+
+    flow = create_basic_flow()
+    reader = _make_rest_api_reader(url="https://api.example.com/users")
+
+    converter = FlowGraphToPolarsConverter(flow)
+    converter._handle_rest_api_reader(reader, "df_1", {})
+
+    code = "\n".join(converter.code_lines)
+    verify_code_contains(code, "ff.read_api(", "https://api.example.com/users", ").data")
+    assert "import flowfile as ff" in converter.imports
+    ast.parse(code)
+
+
+def test_rest_api_reader_flowframe_has_no_data_suffix():
+    """The FlowFrame target keeps the chain lazy: no .data suffix."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    flow = create_basic_flow()
+    reader = _make_rest_api_reader(url="https://api.example.com/users")
+
+    converter = FlowGraphToFlowFrameConverter(flow)
+    converter._handle_rest_api_reader(reader, "df_1", {})
+
+    code = "\n".join(converter.code_lines)
+    verify_code_contains(code, "ff.read_api(")
+    assert ").data" not in code
+    ast.parse(code)
+
+
+def test_rest_api_reader_defaults_omitted():
+    """Default method/timeout/retries are not emitted as keyword args."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    flow = create_basic_flow()
+    reader = _make_rest_api_reader(url="https://api.example.com/users")
+
+    converter = FlowGraphToFlowFrameConverter(flow)
+    converter._handle_rest_api_reader(reader, "df_1", {})
+
+    code = "\n".join(converter.code_lines)
+    assert "method=" not in code
+    assert "timeout_seconds=" not in code
+    assert "max_retries=" not in code
+    assert "auth=" not in code
+    assert "pagination=" not in code
+
+
+def test_rest_api_reader_post_with_body_and_params():
+    """POST requests emit method, headers, query params and json body."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    flow = create_basic_flow()
+    reader = _make_rest_api_reader(
+        url="https://api.example.com/search",
+        method="POST",
+        headers={"Accept": "application/json"},
+        query_params={"lang": "en"},
+        json_body={"query": "polars"},
+        record_path="data.items",
+        timeout_seconds=60.0,
+        max_retries=5,
+    )
+
+    converter = FlowGraphToFlowFrameConverter(flow)
+    converter._handle_rest_api_reader(reader, "df_1", {})
+
+    code = "\n".join(converter.code_lines)
+    verify_code_contains(
+        code,
+        'method="POST"',
+        "headers=",
+        "Accept",
+        "params=",
+        "lang",
+        "json_body=",
+        "query",
+        "record_path=",
+        "data.items",
+        "timeout_seconds=60.0",
+        "max_retries=5",
+    )
+    ast.parse(code)
+
+
+def test_rest_api_reader_emits_secret_name_not_plaintext():
+    """The stored secret is referenced by name; the inline plaintext never leaks."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    flow = create_basic_flow()
+    reader = _make_rest_api_reader(
+        url="https://api.example.com/users",
+        auth=input_schema.RestApiAuthSettings(
+            auth_type="bearer",
+            secret_name="my_api_token",
+            secret="THIS-MUST-NOT-LEAK",
+        ),
+    )
+
+    converter = FlowGraphToFlowFrameConverter(flow)
+    converter._handle_rest_api_reader(reader, "df_1", {})
+
+    code = "\n".join(converter.code_lines)
+    verify_code_contains(code, "auth=", "bearer", "secret_name", "my_api_token")
+    assert "THIS-MUST-NOT-LEAK" not in code
+    ast.parse(code)
+
+
+def test_rest_api_reader_api_key_and_offset_pagination():
+    """API-key auth and offset pagination round-trip into read_api dict literals."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    flow = create_basic_flow()
+    reader = _make_rest_api_reader(
+        url="https://api.example.com/users",
+        auth=input_schema.RestApiAuthSettings(
+            auth_type="api_key",
+            api_key_name="X-Custom-Key",
+            api_key_location="query",
+            secret_name="key_secret",
+        ),
+        pagination=input_schema.RestApiPaginationSettings(
+            pagination_type="offset",
+            page_size=250,
+            max_records=1000,
+        ),
+    )
+
+    converter = FlowGraphToFlowFrameConverter(flow)
+    converter._handle_rest_api_reader(reader, "df_1", {})
+
+    code = "\n".join(converter.code_lines)
+    verify_code_contains(
+        code,
+        "auth=",
+        "api_key",
+        "X-Custom-Key",
+        "query",
+        "key_secret",
+        "pagination=",
+        "offset",
+        "page_size",
+        "250",
+        "max_records",
+        "1000",
+    )
+    ast.parse(code)
+    # The generated auth/pagination dicts are valid and reconstruct the settings.
+    auth_arg = converter._build_rest_api_auth_arg(reader.rest_api_settings.auth)
+    pagination_arg = converter._build_rest_api_pagination_arg(reader.rest_api_settings.pagination)
+    assert input_schema.RestApiAuthSettings(**eval(auth_arg)).auth_type == "api_key"
+    assert input_schema.RestApiPaginationSettings(**eval(pagination_arg)).page_size == 250
+
+
+def test_rest_api_reader_cursor_pagination():
+    """Cursor pagination emits the cursor-specific keys only."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    flow = create_basic_flow()
+    reader = _make_rest_api_reader(
+        url="https://api.example.com/users",
+        pagination=input_schema.RestApiPaginationSettings(
+            pagination_type="cursor",
+            cursor_param="next_cursor",
+            cursor_response_path="meta.next",
+        ),
+    )
+
+    converter = FlowGraphToFlowFrameConverter(flow)
+    converter._handle_rest_api_reader(reader, "df_1", {})
+
+    code = "\n".join(converter.code_lines)
+    verify_code_contains(code, "pagination=", "cursor", "next_cursor", "meta.next")
+    assert "offset_param" not in code
+    assert "page_param" not in code
+    ast.parse(code)
+
+
+def test_rest_api_reader_dispatches_via_node_type():
+    """The dispatcher routes 'rest_api_reader' to the handler (no unsupported node)."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    flow = create_basic_flow()
+    reader = _make_rest_api_reader(url="https://api.example.com/users")
+    handler = getattr(FlowGraphToFlowFrameConverter(flow), "_handle_rest_api_reader", None)
+    assert handler is not None, "rest_api_reader must have a code generator handler"
+
+
+def test_external_source_adds_to_unsupported():
+    """Test that external_source nodes are added to unsupported nodes."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToPolarsConverter
+
+    flow = create_basic_flow()
+
+    sample_users_settings = input_schema.SampleUsers(SAMPLE_USERS=True, size=10)
+    external_source = input_schema.NodeExternalSource(
+        flow_id=1,
+        node_id=1,
+        identifier="test_source",
+        source_settings=sample_users_settings,
+    )
+
+    converter = FlowGraphToPolarsConverter(flow)
+    converter._handle_external_source(external_source, "df_1", {})
+
+    assert len(converter.unsupported_nodes) == 1
+    assert "external_source" in converter.unsupported_nodes[0][1].lower()
+
+
+# ==================== Node Reference Tests ====================
+
+
+def test_node_reference_basic():
+    """Test that node_reference is used as variable name in generated code when set."""
+    flow = create_basic_flow()
+
+    manual_input = input_schema.NodeManualInput(
+        flow_id=flow.flow_id,
+        node_id=1,
+        node_reference="my_data",
+        raw_data_format=input_schema.RawData(
+            columns=[
+                input_schema.MinimalFieldInfo(name="id", data_type="Integer"),
+                input_schema.MinimalFieldInfo(name="name", data_type="String"),
+            ],
+            data=[
+                [1, 2, 3],
+                ["Alice", "Bob", "Charlie"],
+            ]
+        )
+    )
+    flow.add_datasource(manual_input)
+
+    code = export_flow_to_polars(flow)
+
+    verify_code_contains(code, "my_data = pl.LazyFrame")
+    assert "df_1" not in code, "Should use node_reference instead of df_1"
+    verify_if_execute(code)
+
+
+def test_node_reference_in_formula():
+    """Test that node_reference is used in downstream node references."""
+    flow = create_basic_flow()
+
+    manual_input = input_schema.NodeManualInput(
+        flow_id=flow.flow_id,
+        node_id=1,
+        node_reference="source_data",
+        raw_data_format=input_schema.RawData(
+            columns=[
+                input_schema.MinimalFieldInfo(name="price", data_type="Integer"),
+                input_schema.MinimalFieldInfo(name="quantity", data_type="Integer"),
+            ],
+            data=[
+                [10, 20, 30],
+                [2, 3, 4],
+            ]
+        )
+    )
+    flow.add_datasource(manual_input)
+
+    formula_node = input_schema.NodeFormula(
+        flow_id=1,
+        node_id=2,
+        node_reference="calculated_data",
+        depending_on_id=1,
+        function=transform_schema.FunctionInput(
+            field=transform_schema.FieldInput(name="total", data_type="Auto"),
+            function="[price] * [quantity]"
+        )
+    )
+    flow.add_formula(formula_node)
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_flow_to_polars(flow)
+
+    verify_code_contains(code, "source_data = pl.LazyFrame")
+    verify_code_contains(code, "calculated_data = source_data.with_columns")
+    assert "df_1" not in code, "Should use source_data instead of df_1"
+    assert "df_2" not in code, "Should use calculated_data instead of df_2"
+    verify_if_execute(code)
+
+
+def test_node_reference_mixed():
+    """Test that nodes with and without node_reference work together."""
+    flow = create_basic_flow()
+    manual_input1 = input_schema.NodeManualInput(
+        flow_id=flow.flow_id,
+        node_id=1,
+        node_reference="custom_input",
+        raw_data_format=input_schema.RawData(
+            columns=[
+                input_schema.MinimalFieldInfo(name="id", data_type="Integer"),
+                input_schema.MinimalFieldInfo(name="value", data_type="Integer"),
+            ],
+            data=[
+                [1, 2],
+                [100, 200],
+            ]
+        )
+    )
+    flow.add_datasource(manual_input1)
+
+    filter_node = input_schema.NodeFilter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        filter_input=transform_schema.FilterInput(
+            mode="basic",
+            basic_filter=transform_schema.BasicFilter(
+                field="value",
+                filter_type=">=",
+                filter_value="100"
+            )
+        )
+    )
+    flow.add_filter(filter_node)
+    add_connection(flow, node_connection=input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_flow_to_polars(flow)
+
+    verify_code_contains(code, "custom_input = pl.LazyFrame")
+    verify_code_contains(code, "filtered = custom_input.filter")
+    assert "df_1" not in code, "Should use custom_input instead of df_1"
+    verify_if_execute(code)
+
+
+def test_node_reference_in_join():
+    """Test that node_reference works correctly in join operations."""
+    flow = create_basic_flow()
+
+    manual_input1 = input_schema.NodeManualInput(
+        flow_id=flow.flow_id,
+        node_id=1,
+        node_reference="left_table",
+        raw_data_format=input_schema.RawData(
+            columns=[
+                input_schema.MinimalFieldInfo(name="id", data_type="Integer"),
+                input_schema.MinimalFieldInfo(name="name", data_type="String"),
+            ],
+            data=[
+                [1, 2, 3],
+                ["Alice", "Bob", "Charlie"],
+            ]
+        )
+    )
+    flow.add_datasource(manual_input1)
+
+    manual_input2 = input_schema.NodeManualInput(
+        flow_id=flow.flow_id,
+        node_id=2,
+        node_reference="right_table",
+        raw_data_format=input_schema.RawData(
+            columns=[
+                input_schema.MinimalFieldInfo(name="id", data_type="Integer"),
+                input_schema.MinimalFieldInfo(name="city", data_type="String"),
+            ],
+            data=[
+                [1, 2, 3],
+                ["NYC", "LA", "Chicago"],
+            ]
+        )
+    )
+    flow.add_datasource(manual_input2)
+
+    join_node = input_schema.NodeJoin(
+        flow_id=1,
+        node_id=3,
+        node_reference="joined_result",
+        depending_on_ids=[1, 2],
+        join_input=transform_schema.JoinInput(
+            join_mapping=[transform_schema.JoinMap("id", "id")],
+            left_select=[
+                transform_schema.SelectInput("id", "id", keep=True),
+                transform_schema.SelectInput("name", "name")
+            ],
+            right_select=[
+                transform_schema.SelectInput("id", "id", keep=False),
+                transform_schema.SelectInput("city", "city")
+            ],
+            how="inner"
+        )
+    )
+    flow.add_join(join_node)
+    left_connection = input_schema.NodeConnection.create_from_simple_input(1, 3, 'main')
+    right_connection = input_schema.NodeConnection.create_from_simple_input(2, 3, 'right')
+    add_connection(flow, left_connection)
+    add_connection(flow, right_connection)
+
+    code = export_flow_to_polars(flow)
+
+    verify_code_contains(code, "left_table = pl.LazyFrame")
+    verify_code_contains(code, "right_table = pl.LazyFrame")
+    verify_code_contains(code, "joined_result = left_table")
+    assert "df_1" not in code, "Should use left_table instead of df_1"
+    assert "df_2" not in code, "Should use right_table instead of df_2"
+    assert "df_3" not in code, "Should use joined_result instead of df_3"
+    verify_if_execute(code)
+
+
+def test_node_reference_default_when_empty():
+    """Test that empty node_reference falls back to an operation-based name."""
+    flow = create_basic_flow()
+
+    manual_input = input_schema.NodeManualInput(
+        flow_id=flow.flow_id,
+        node_id=1,
+        node_reference="",
+        raw_data_format=input_schema.RawData(
+            columns=[
+                input_schema.MinimalFieldInfo(name="id", data_type="Integer"),
+            ],
+            data=[
+                [1, 2, 3],
+            ]
+        )
+    )
+    flow.add_datasource(manual_input)
+
+    code = export_flow_to_polars(flow)
+
+    verify_code_contains(code, "source = pl.LazyFrame")
+    verify_if_execute(code)
+
+
+def test_node_reference_none_uses_default():
+    """Test that None node_reference uses an operation-based name."""
+    flow = create_basic_flow()
+
+    manual_input = input_schema.NodeManualInput(
+        flow_id=flow.flow_id,
+        node_id=1,
+        node_reference=None,
+        raw_data_format=input_schema.RawData(
+            columns=[
+                input_schema.MinimalFieldInfo(name="id", data_type="Integer"),
+            ],
+            data=[
+                [1, 2, 3],
+            ]
+        )
+    )
+    flow.add_datasource(manual_input)
+
+    code = export_flow_to_polars(flow)
+
+    verify_code_contains(code, "source = pl.LazyFrame")
+    verify_if_execute(code)
+
+
+# Basic Filter Operator Tests
+
+@pytest.fixture
+def filter_test_data() -> input_schema.NodeManualInput:
+    """Create test data for filter tests with various data types."""
+    return input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=1,
+        raw_data_format=input_schema.RawData(
+            columns=[
+                input_schema.MinimalFieldInfo(name="id", data_type="Integer"),
+                input_schema.MinimalFieldInfo(name="name", data_type="String"),
+                input_schema.MinimalFieldInfo(name="score", data_type="Double"),
+                input_schema.MinimalFieldInfo(name="city", data_type="String"),
+            ],
+            data=[
+                [1, 2, 3, 4, 5],
+                ["Alice", "Bob", "Charlie", "David", None],
+                [85.5, 90.0, 75.5, 60.0, 95.5],
+                ["New York", "Los Angeles", "Chicago", "New York", "Boston"],
+            ]
+        )
+    )
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_basic_filter_equals_numeric(filter_test_data, export_func):
+    """Test basic filter with equals operator on numeric field."""
+    flow = create_basic_flow()
+    flow.add_manual_input(filter_test_data)
+
+    filter_node = input_schema.NodeFilter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        filter_input=transform_schema.FilterInput(
+            mode="basic",
+            basic_filter=transform_schema.BasicFilter(
+                field="id",
+                operator=transform_schema.FilterOperator.EQUALS,
+                value="3"
+            )
+        )
+    )
+    flow.add_filter(filter_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code, 'pl.col("id") == 3')
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_basic_filter_equals_string(filter_test_data, export_func):
+    """Test basic filter with equals operator on string field."""
+    flow = create_basic_flow()
+    flow.add_manual_input(filter_test_data)
+
+    filter_node = input_schema.NodeFilter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        filter_input=transform_schema.FilterInput(
+            mode="basic",
+            basic_filter=transform_schema.BasicFilter(
+                field="name",
+                operator=transform_schema.FilterOperator.EQUALS,
+                value="Alice"
+            )
+        )
+    )
+    flow.add_filter(filter_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code, 'pl.col("name") == "Alice"')
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_basic_filter_not_equals(filter_test_data, export_func):
+    """Test basic filter with not equals operator."""
+    flow = create_basic_flow()
+    flow.add_manual_input(filter_test_data)
+
+    filter_node = input_schema.NodeFilter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        filter_input=transform_schema.FilterInput(
+            mode="basic",
+            basic_filter=transform_schema.BasicFilter(
+                field="id",
+                operator=transform_schema.FilterOperator.NOT_EQUALS,
+                value="1"
+            )
+        )
+    )
+    flow.add_filter(filter_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code, 'pl.col("id") != 1')
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_basic_filter_greater_than(filter_test_data, export_func):
+    """Test basic filter with greater than operator."""
+    flow = create_basic_flow()
+    flow.add_manual_input(filter_test_data)
+
+    filter_node = input_schema.NodeFilter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        filter_input=transform_schema.FilterInput(
+            mode="basic",
+            basic_filter=transform_schema.BasicFilter(
+                field="score",
+                operator=transform_schema.FilterOperator.GREATER_THAN,
+                value="80"
+            )
+        )
+    )
+    flow.add_filter(filter_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code, 'pl.col("score") > 80')
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_basic_filter_greater_than_or_equals(filter_test_data, export_func):
+    """Test basic filter with greater than or equals operator."""
+    flow = create_basic_flow()
+    flow.add_manual_input(filter_test_data)
+
+    filter_node = input_schema.NodeFilter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        filter_input=transform_schema.FilterInput(
+            mode="basic",
+            basic_filter=transform_schema.BasicFilter(
+                field="score",
+                operator=transform_schema.FilterOperator.GREATER_THAN_OR_EQUALS,
+                value="90"
+            )
+        )
+    )
+    flow.add_filter(filter_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code, 'pl.col("score") >= 90')
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_basic_filter_less_than(filter_test_data, export_func):
+    """Test basic filter with less than operator."""
+    flow = create_basic_flow()
+    flow.add_manual_input(filter_test_data)
+
+    filter_node = input_schema.NodeFilter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        filter_input=transform_schema.FilterInput(
+            mode="basic",
+            basic_filter=transform_schema.BasicFilter(
+                field="score",
+                operator=transform_schema.FilterOperator.LESS_THAN,
+                value="80"
+            )
+        )
+    )
+    flow.add_filter(filter_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code, 'pl.col("score") < 80')
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_basic_filter_less_than_or_equals(filter_test_data, export_func):
+    """Test basic filter with less than or equals operator."""
+    flow = create_basic_flow()
+    flow.add_manual_input(filter_test_data)
+
+    filter_node = input_schema.NodeFilter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        filter_input=transform_schema.FilterInput(
+            mode="basic",
+            basic_filter=transform_schema.BasicFilter(
+                field="score",
+                operator=transform_schema.FilterOperator.LESS_THAN_OR_EQUALS,
+                value="75.5"
+            )
+        )
+    )
+    flow.add_filter(filter_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code, 'pl.col("score") <= 75.5')
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_basic_filter_contains(filter_test_data, export_func):
+    """Test basic filter with contains operator."""
+    flow = create_basic_flow()
+    flow.add_manual_input(filter_test_data)
+
+    filter_node = input_schema.NodeFilter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        filter_input=transform_schema.FilterInput(
+            mode="basic",
+            basic_filter=transform_schema.BasicFilter(
+                field="city",
+                operator=transform_schema.FilterOperator.CONTAINS,
+                value="New"
+            )
+        )
+    )
+    flow.add_filter(filter_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code, 'pl.col("city").str.contains("New")')
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_basic_filter_not_contains(filter_test_data, export_func):
+    """Test basic filter with not contains operator."""
+    flow = create_basic_flow()
+    flow.add_manual_input(filter_test_data)
+
+    filter_node = input_schema.NodeFilter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        filter_input=transform_schema.FilterInput(
+            mode="basic",
+            basic_filter=transform_schema.BasicFilter(
+                field="city",
+                operator=transform_schema.FilterOperator.NOT_CONTAINS,
+                value="New"
+            )
+        )
+    )
+    flow.add_filter(filter_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code, 'pl.col("city").str.contains("New").not_()')
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_basic_filter_starts_with(filter_test_data, export_func):
+    """Test basic filter with starts_with operator."""
+    flow = create_basic_flow()
+    flow.add_manual_input(filter_test_data)
+
+    filter_node = input_schema.NodeFilter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        filter_input=transform_schema.FilterInput(
+            mode="basic",
+            basic_filter=transform_schema.BasicFilter(
+                field="name",
+                operator=transform_schema.FilterOperator.STARTS_WITH,
+                value="A"
+            )
+        )
+    )
+    flow.add_filter(filter_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code, 'pl.col("name").str.starts_with("A")')
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_basic_filter_ends_with(filter_test_data, export_func):
+    """Test basic filter with ends_with operator."""
+    flow = create_basic_flow()
+    flow.add_manual_input(filter_test_data)
+
+    filter_node = input_schema.NodeFilter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        filter_input=transform_schema.FilterInput(
+            mode="basic",
+            basic_filter=transform_schema.BasicFilter(
+                field="name",
+                operator=transform_schema.FilterOperator.ENDS_WITH,
+                value="e"
+            )
+        )
+    )
+    flow.add_filter(filter_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code, 'pl.col("name").str.ends_with("e")')
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_basic_filter_is_null(filter_test_data, export_func):
+    """Test basic filter with is_null operator."""
+    flow = create_basic_flow()
+    flow.add_manual_input(filter_test_data)
+
+    filter_node = input_schema.NodeFilter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        filter_input=transform_schema.FilterInput(
+            mode="basic",
+            basic_filter=transform_schema.BasicFilter(
+                field="name",
+                operator=transform_schema.FilterOperator.IS_NULL,
+                value=""
+            )
+        )
+    )
+    flow.add_filter(filter_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code, 'pl.col("name").is_null()')
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_basic_filter_is_not_null(filter_test_data, export_func):
+    """Test basic filter with is_not_null operator."""
+    flow = create_basic_flow()
+    flow.add_manual_input(filter_test_data)
+
+    filter_node = input_schema.NodeFilter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        filter_input=transform_schema.FilterInput(
+            mode="basic",
+            basic_filter=transform_schema.BasicFilter(
+                field="name",
+                operator=transform_schema.FilterOperator.IS_NOT_NULL,
+                value=""
+            )
+        )
+    )
+    flow.add_filter(filter_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code, 'pl.col("name").is_not_null()')
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_basic_filter_in_numeric(filter_test_data, export_func):
+    """Test basic filter with in operator for numeric values."""
+    flow = create_basic_flow()
+    flow.add_manual_input(filter_test_data)
+
+    filter_node = input_schema.NodeFilter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        filter_input=transform_schema.FilterInput(
+            mode="basic",
+            basic_filter=transform_schema.BasicFilter(
+                field="id",
+                operator=transform_schema.FilterOperator.IN,
+                value="1, 3, 5"
+            )
+        )
+    )
+    flow.add_filter(filter_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code, 'pl.col("id").is_in([1, 3, 5])')
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_basic_filter_in_string(filter_test_data, export_func):
+    """Test basic filter with in operator for string values."""
+    flow = create_basic_flow()
+    flow.add_manual_input(filter_test_data)
+
+    filter_node = input_schema.NodeFilter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        filter_input=transform_schema.FilterInput(
+            mode="basic",
+            basic_filter=transform_schema.BasicFilter(
+                field="name",
+                operator=transform_schema.FilterOperator.IN,
+                value="Alice, Bob"
+            )
+        )
+    )
+    flow.add_filter(filter_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code, 'pl.col("name").is_in(["Alice", "Bob"])')
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_basic_filter_not_in(filter_test_data, export_func):
+    """Test basic filter with not_in operator."""
+    flow = create_basic_flow()
+    flow.add_manual_input(filter_test_data)
+
+    filter_node = input_schema.NodeFilter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        filter_input=transform_schema.FilterInput(
+            mode="basic",
+            basic_filter=transform_schema.BasicFilter(
+                field="id",
+                operator=transform_schema.FilterOperator.NOT_IN,
+                value="1, 2"
+            )
+        )
+    )
+    flow.add_filter(filter_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code, 'pl.col("id").is_in([1, 2]).not_()')
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_basic_filter_between(filter_test_data, export_func):
+    """Test basic filter with between operator."""
+    flow = create_basic_flow()
+    flow.add_manual_input(filter_test_data)
+
+    filter_node = input_schema.NodeFilter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        filter_input=transform_schema.FilterInput(
+            mode="basic",
+            basic_filter=transform_schema.BasicFilter(
+                field="score",
+                operator=transform_schema.FilterOperator.BETWEEN,
+                value="75",
+                value2="90"
+            )
+        )
+    )
+    flow.add_filter(filter_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code, '(pl.col("score") >= 75) & (pl.col("score") <= 90)')
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df)
+
+
+# Fuzzy Match Edge Case Tests
+
+@pytest.mark.parametrize("export_func", [
+    export_flow_to_polars,
+    export_flow_to_flowframe,
+], ids=["polars", "flowframe"])
+def test_fuzzy_match_with_multiple_columns(export_func):
+    """Test fuzzy match with multiple matching columns."""
+    flow = create_basic_flow()
+
+    left_data = input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=1,
+        raw_data_format=input_schema.RawData(
+            columns=[
+                input_schema.MinimalFieldInfo(name="id", data_type="Integer"),
+                input_schema.MinimalFieldInfo(name="first_name", data_type="String"),
+                input_schema.MinimalFieldInfo(name="last_name", data_type="String"),
+            ],
+            data=[
+                [1, 2, 3],
+                ["John", "Jane", "Bob"],
+                ["Smith", "Doe", "Johnson"]
+            ]
+        )
+    )
+
+    right_data = input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=2,
+        raw_data_format=input_schema.RawData(
+            columns=[
+                input_schema.MinimalFieldInfo(name="fname", data_type="String"),
+                input_schema.MinimalFieldInfo(name="lname", data_type="String"),
+                input_schema.MinimalFieldInfo(name="city", data_type="String"),
+            ],
+            data=[
+                ["Jon", "Janet", "Bobby"],
+                ["Smyth", "Dough", "Johnsen"],
+                ["NYC", "LA", "Chicago"]
+            ]
+        )
+    )
+
+    flow.add_manual_input(left_data)
+    flow.add_manual_input(right_data)
+
+    fuzzy_node = input_schema.NodeFuzzyMatch(
+        flow_id=1,
+        node_id=3,
+        depending_on_ids=[1, 2],
+        join_input=transform_schema.FuzzyMatchInput(
+            join_mapping=[
+                transform_schema.FuzzyMap(
+                    left_col="first_name",
+                    right_col="fname",
+                    fuzzy_type="levenshtein",
+                    threshold_score=0.6
+                ),
+                transform_schema.FuzzyMap(
+                    left_col="last_name",
+                    right_col="lname",
+                    fuzzy_type="levenshtein",
+                    threshold_score=0.6
+                )
+            ],
+            left_select=[
+                transform_schema.SelectInput("id"),
+                transform_schema.SelectInput("first_name"),
+                transform_schema.SelectInput("last_name"),
+            ],
+            right_select=[
+                transform_schema.SelectInput("fname"),
+                transform_schema.SelectInput("lname"),
+                transform_schema.SelectInput("city"),
+            ]
+        )
+    )
+    flow.add_fuzzy_match(fuzzy_node)
+    left_connection = input_schema.NodeConnection.create_from_simple_input(1, 3, 'main')
+    right_connection = input_schema.NodeConnection.create_from_simple_input(2, 3, 'right')
+    add_connection(flow, left_connection)
+    add_connection(flow, right_connection)
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(
+            code,
+            "from pl_fuzzy_frame_match import FuzzyMapping, fuzzy_match_dfs",
+            "fuzzy_match_dfs("
+        )
+    elif export_func is export_flow_to_flowframe:
+        verify_code_contains(code, ".fuzzy_join(", "ff.FuzzyMapping(")
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(3).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [
+    export_flow_to_polars,
+    export_flow_to_flowframe,
+], ids=["polars", "flowframe"])
+def test_fuzzy_match_with_column_drops(export_func):
+    """Test fuzzy match with columns marked as not keep."""
+    flow = create_basic_flow()
+
+    left_data = input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=1,
+        raw_data_format=input_schema.RawData(
+            columns=[
+                input_schema.MinimalFieldInfo(name="id", data_type="Integer"),
+                input_schema.MinimalFieldInfo(name="name", data_type="String"),
+                input_schema.MinimalFieldInfo(name="extra_col", data_type="String"),
+            ],
+            data=[
+                [1, 2, 3],
+                ["John", "Jane", "Bob"],
+                ["A", "B", "C"]
+            ]
+        )
+    )
+
+    right_data = input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=2,
+        raw_data_format=input_schema.RawData(
+            columns=[
+                input_schema.MinimalFieldInfo(name="full_name", data_type="String"),
+                input_schema.MinimalFieldInfo(name="city", data_type="String"),
+                input_schema.MinimalFieldInfo(name="extra_right", data_type="String"),
+            ],
+            data=[
+                ["Jon", "Janet", "Bobby"],
+                ["NYC", "LA", "Chicago"],
+                ["X", "Y", "Z"]
+            ]
+        )
+    )
+
+    flow.add_manual_input(left_data)
+    flow.add_manual_input(right_data)
+
+    fuzzy_node = input_schema.NodeFuzzyMatch(
+        flow_id=1,
+        node_id=3,
+        depending_on_ids=[1, 2],
+        join_input=transform_schema.FuzzyMatchInput(
+            join_mapping=[
+                transform_schema.FuzzyMap(
+                    left_col="name",
+                    right_col="full_name",
+                    fuzzy_type="levenshtein",
+                    threshold_score=0.6
+                )
+            ],
+            left_select=[
+                transform_schema.SelectInput("id"),
+                transform_schema.SelectInput("name"),
+                transform_schema.SelectInput("extra_col", keep=False),
+            ],
+            right_select=[
+                transform_schema.SelectInput("full_name"),
+                transform_schema.SelectInput("city"),
+                transform_schema.SelectInput("extra_right", keep=False),
+            ]
+        )
+    )
+    flow.add_fuzzy_match(fuzzy_node)
+    left_connection = input_schema.NodeConnection.create_from_simple_input(1, 3, 'main')
+    right_connection = input_schema.NodeConnection.create_from_simple_input(2, 3, 'right')
+    add_connection(flow, left_connection)
+    add_connection(flow, right_connection)
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code, ".drop(")
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(3).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [
+    export_flow_to_polars,
+    export_flow_to_flowframe,
+], ids=["polars", "flowframe"])
+def test_fuzzy_match_jaro_winkler(export_func):
+    """Test fuzzy match with jaro_winkler fuzzy type."""
+    flow = create_basic_flow()
+
+    left_data = input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=1,
+        raw_data_format=input_schema.RawData(
+            columns=[
+                input_schema.MinimalFieldInfo(name="company", data_type="String"),
+            ],
+            data=[["Apple Inc", "Microsoft Corp", "Google LLC"]]
+        )
+    )
+
+    right_data = input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=2,
+        raw_data_format=input_schema.RawData(
+            columns=[
+                input_schema.MinimalFieldInfo(name="firm", data_type="String"),
+            ],
+            data=[["Apple Inc.", "Microsft Corporation", "Googl LLC"]]
+        )
+    )
+
+    flow.add_manual_input(left_data)
+    flow.add_manual_input(right_data)
+
+    fuzzy_node = input_schema.NodeFuzzyMatch(
+        flow_id=1,
+        node_id=3,
+        depending_on_ids=[1, 2],
+        join_input=transform_schema.FuzzyMatchInput(
+            join_mapping=[
+                transform_schema.FuzzyMap(
+                    left_col="company",
+                    right_col="firm",
+                    fuzzy_type="jaro_winkler",
+                    threshold_score=0.8
+                )
+            ],
+            left_select=[transform_schema.SelectInput("company")],
+            right_select=[transform_schema.SelectInput("firm")]
+        )
+    )
+    flow.add_fuzzy_match(fuzzy_node)
+    left_connection = input_schema.NodeConnection.create_from_simple_input(1, 3, 'main')
+    right_connection = input_schema.NodeConnection.create_from_simple_input(2, 3, 'right')
+    add_connection(flow, left_connection)
+    add_connection(flow, right_connection)
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code, "fuzzy_type='jaro_winkler'")
+        verify_code_contains(code, "threshold_score=0.8")
+    elif export_func is export_flow_to_flowframe:
+        verify_code_contains(code, ".fuzzy_join(", "ff.FuzzyMapping(")
+    verify_if_execute(code)
+
+
+# CSV Encoding Tests
+
+@pytest.mark.parametrize("export_func", [
+    export_flow_to_polars,
+    export_flow_to_flowframe,
+], ids=["polars", "flowframe"])
+def test_csv_read_non_utf8_encoding(tmp_path, export_func):
+    """Test CSV read with non-UTF8 encoding uses read_csv instead of scan_csv."""
+    flow = create_basic_flow()
+
+    csv_path = tmp_path / "latin1_data.csv"
+    df = pl.DataFrame({
+        "name": ["José", "François", "Müller"],
+        "value": [1, 2, 3]
+    })
+    df.write_csv(csv_path)
+
+    read_node = input_schema.NodeRead(
+        flow_id=flow.flow_id,
+        node_id=1,
+        received_file=input_schema.ReceivedTable(
+            name="latin1_data.csv",
+            path=str(csv_path),
+            file_type="csv",
+            table_settings=input_schema.InputCsvTable(
+                delimiter=",",
+                has_headers=True,
+                encoding="latin-1"
+            )
+        )
+    )
+    flow.add_read(read_node)
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code, "pl.read_csv(")
+        verify_code_contains(code, 'encoding="latin-1"')
+        verify_code_contains(code, ".lazy()")
+    verify_if_execute(code)
+
+
+def test_csv_read_with_skip_rows(tmp_path):
+    """Test CSV read with skip_rows parameter."""
+    flow = create_basic_flow()
+
+    csv_path = tmp_path / "skip_rows_data.csv"
+    with open(csv_path, 'w') as f:
+        f.write("This is a comment line\n")
+        f.write("Another comment\n")
+        f.write("name,value\n")
+        f.write("Alice,1\n")
+        f.write("Bob,2\n")
+
+    read_node = input_schema.NodeRead(
+        flow_id=flow.flow_id,
+        node_id=1,
+        received_file=input_schema.ReceivedTable(
+            name="skip_rows_data.csv",
+            path=str(csv_path),
+            file_type="csv",
+            table_settings=input_schema.InputCsvTable(
+                delimiter=",",
+                has_headers=True,
+                encoding="utf-8",
+                starting_from_line=2
+            )
+        )
+    )
+    flow.add_read(read_node)
+
+    code = export_flow_to_polars(flow)
+    verify_code_contains(code, "skip_rows=2")
+    verify_if_execute(code)
+    result_df = get_result_from_generated_code(code)
+    assert len(result_df.collect()) == 2
+
+
+# Custom Node Input/Output contract: process() always receives LazyFrames and
+# the return is isinstance-normalized to lazy — no hint-sniffing. The dropped
+# _check_process_method_signature tests lived here; the current contract is
+# covered by test_code_generator_custom_nodes.py (TestReturnNormalization etc.).
+
+
+# Edge Cases and Error Handling Tests
+
+def test_filter_with_empty_basic_filter():
+    """Test filter with empty basic filter (no field specified) passes through unchanged."""
+    flow = create_basic_flow()
+    flow = create_sample_dataframe_node(flow)
+
+    filter_node = input_schema.NodeFilter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        filter_input=transform_schema.FilterInput(
+            mode="basic",
+            basic_filter=None  # Validator creates empty BasicFilter with field=''
+        )
+    )
+    flow.add_filter(filter_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_flow_to_polars(flow)
+    verify_code_contains(code, "# No filter applied")
+    verify_if_execute(code)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_filter_advanced_mode(export_func):
+    """Test filter with advanced mode expression generates correct code."""
+    flow = create_basic_flow()
+    flow = create_sample_dataframe_node(flow)
+
+    filter_node = input_schema.NodeFilter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        filter_input=transform_schema.FilterInput(
+            mode="advanced",
+            advanced_filter="[age] > 25 AND [salary] > 60000"
+        )
+    )
+    flow.add_filter(filter_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code, 'pl.col("age") > pl.lit(25)', 'pl.col("salary") > pl.lit(60000)')
+        assert "simple_function_to_expr" not in code
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_unique_without_columns(export_func):
+    """Test unique node without specifying columns (unique on all columns)."""
+    flow = create_basic_flow()
+
+    data = input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=1,
+        raw_data_format=input_schema.RawData(
+            columns=[
+                input_schema.MinimalFieldInfo(name="a", data_type="Integer"),
+                input_schema.MinimalFieldInfo(name="b", data_type="String")
+            ],
+            data=[[1, 1, 2, 2], ["x", "x", "y", "z"]]
+        )
+    )
+    flow.add_manual_input(data)
+
+    unique_node = input_schema.NodeUnique(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        unique_input=transform_schema.UniqueInput(
+            columns=[],
+            strategy="first"
+        )
+    )
+    flow.add_unique(unique_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code, "unique(keep='first')")
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    # Should have 3 unique rows: (1, x), (2, y), (2, z)
+    assert len(result_df) == 3
+
+
+def test_select_with_no_columns_kept():
+    """A select that unchecks every listed column keeps the unlisted ones (keep_missing), so it is a drop."""
+    flow = create_basic_flow()
+    flow = create_sample_dataframe_node(flow)
+
+    select_node = input_schema.NodeSelect(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        select_input=[
+            transform_schema.SelectInput("id", "id", keep=False),
+            transform_schema.SelectInput("name", "name", keep=False),
+        ]
+    )
+    flow.add_select(select_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_flow_to_polars(flow)
+    verify_code_contains(code, '.drop(["id", "name"])')
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_drop_shaped_select_exports_as_drop(export_func):
+    """A select that only unchecks columns — what FlowFrame.drop emits — exports as ``.drop([...])``."""
+    flow = create_basic_flow()
+    flow = create_sample_dataframe_node(flow)
+    select_node = input_schema.NodeSelect(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        select_input=[
+            transform_schema.SelectInput("id"),
+            transform_schema.SelectInput("name", keep=False),
+            transform_schema.SelectInput("age"),
+            transform_schema.SelectInput("city", keep=False),
+            transform_schema.SelectInput("salary"),
+        ],
+        keep_missing=True,
+    )
+    flow.add_select(select_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    verify_code_contains(code, '.drop(["name", "city"])')
+    assert ".select(" not in code
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df)
+
+
+def test_reordering_select_is_not_exported_as_drop():
+    """Kept columns listed out of input order are a reorder, so the node stays a select."""
+    flow = create_basic_flow()
+    flow = create_sample_dataframe_node(flow)
+    select_node = input_schema.NodeSelect(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        select_input=[
+            transform_schema.SelectInput("salary"),
+            transform_schema.SelectInput("name", keep=False),
+            transform_schema.SelectInput("id"),
+        ],
+        keep_missing=True,
+    )
+    flow.add_select(select_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_flow_to_polars(flow)
+    assert ".drop(" not in code
+    verify_code_contains(code, ".select(")
+
+
+def test_polars_code_description_names_the_exported_function():
+    flow = create_basic_flow()
+    flow = create_sample_dataframe_node(flow)
+    flow.add_polars_code(
+        input_schema.NodePolarsCode(
+            flow_id=1,
+            node_id=2,
+            depending_on_ids=[1],
+            polars_code_input=transform_schema.PolarsCodeInput(
+                polars_code="input_df.with_columns((pl.col('age') * 2).alias('double_age'))"
+            ),
+            description="Double the age",
+        )
+    )
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_flow_to_polars(flow)
+    verify_code_contains(code, "# Custom Polars code: Double the age")
+    verify_if_execute(code)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_group_by_concat_aggregation(export_func):
+    """Test group by with concat aggregation function (special mapping)."""
+    flow = create_basic_flow()
+    flow = create_sales_dataframe_node(flow)
+
+    groupby_node = input_schema.NodeGroupBy(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        groupby_input=transform_schema.GroupByInput(
+            agg_cols=[
+                transform_schema.AggColl("product", "groupby"),
+                transform_schema.AggColl("region", "concat", "all_regions"),
+            ]
+        )
+    )
+    flow.add_group_by(groupby_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code, 'pl.col("region").str.join(\',\').alias("all_regions")')
+    verify_if_execute(code)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_union_relaxed_vs_strict(export_func):
+    """Test union with strict mode (diagonal) vs relaxed mode."""
+    flow = create_basic_flow()
+
+    data1 = input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=1,
+        raw_data_format=input_schema.RawData(
+            columns=[input_schema.MinimalFieldInfo(name="a", data_type="Integer")],
+            data=[[1, 2]]
+        )
+    )
+    flow.add_manual_input(data1)
+
+    data2 = input_schema.NodeManualInput(
+        flow_id=1,
+        node_id=2,
+        raw_data_format=input_schema.RawData(
+            columns=[input_schema.MinimalFieldInfo(name="b", data_type="Integer")],
+            data=[[3, 4]]
+        )
+    )
+    flow.add_manual_input(data2)
+
+    union_node = input_schema.NodeUnion(
+        flow_id=1,
+        node_id=3,
+        depending_on_ids=[1, 2],
+        union_input=transform_schema.UnionInput(mode="selective")
+    )
+    flow.add_union(union_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 3))
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(2, 3))
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code, "how='diagonal'")
+
+
+# Catalog Reader Tests
+
+
+def test_catalog_reader_by_table_name():
+    """Test catalog reader code generation with a table name."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    flow = create_basic_flow()
+
+    catalog_reader = input_schema.NodeCatalogReader(
+        flow_id=1,
+        node_id=1,
+        catalog_table_name="my_table",
+    )
+
+    converter = FlowGraphToFlowFrameConverter(flow)
+    converter.node_var_mapping[1] = "df_1"
+    converter.last_node_var = "df_1"
+    converter._handle_catalog_reader(catalog_reader, "df_1", {})
+
+    code_output = "\n".join(converter.code_lines)
+    verify_code_contains(code_output, "ff.read_catalog_table(", '"my_table"')
+    assert "import flowfile as ff" in converter.imports
+
+
+def test_catalog_reader_with_namespace_and_version():
+    """An id that no longer resolves to a namespace falls back to ``namespace_id=``."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    flow = create_basic_flow()
+
+    catalog_reader = input_schema.NodeCatalogReader(
+        flow_id=1,
+        node_id=1,
+        catalog_table_name="versioned_table",
+        catalog_namespace_id=987654,
+        delta_version=3,
+    )
+
+    converter = FlowGraphToFlowFrameConverter(flow)
+    converter.node_var_mapping[1] = "df_1"
+    converter.last_node_var = "df_1"
+    converter._handle_catalog_reader(catalog_reader, "df_1", {})
+
+    code_output = "\n".join(converter.code_lines)
+    verify_code_contains(
+        code_output, "ff.read_catalog_table(", '"versioned_table"', "namespace_id=987654", "delta_version=3"
+    )
+
+
+def test_catalog_reader_scd2_view():
+    """Test catalog reader code generation with an SCD2 history view."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    flow = create_basic_flow()
+
+    catalog_reader = input_schema.NodeCatalogReader(
+        flow_id=1,
+        node_id=1,
+        catalog_table_name="dim_customer",
+        scd2_view="active_at",
+        scd2_as_of="2024-01-01T00:00:00+00:00",
+    )
+
+    converter = FlowGraphToFlowFrameConverter(flow)
+    converter.node_var_mapping[1] = "df_1"
+    converter.last_node_var = "df_1"
+    converter._handle_catalog_reader(catalog_reader, "df_1", {})
+
+    code_output = "\n".join(converter.code_lines)
+    verify_code_contains(
+        code_output,
+        "ff.read_catalog_table(",
+        '"dim_customer"',
+        'scd2_view="active_at"',
+        'scd2_as_of="2024-01-01T00:00:00+00:00"',
+    )
+
+
+def test_catalog_reader_changes_since_last_run():
+    """A since-last-run change reader emits its cursor kwargs verbatim."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    flow = create_basic_flow()
+
+    catalog_reader = input_schema.NodeCatalogReader(
+        flow_id=1,
+        node_id=1,
+        catalog_table_name="orders",
+        cdc_mode="since_last_run",
+        cdc_consumer_name="nightly",
+        cdc_start="beginning",
+        cdc_include_preimage=True,
+    )
+
+    converter = FlowGraphToFlowFrameConverter(flow)
+    converter._handle_catalog_reader(catalog_reader, "df_1", {})
+
+    code_output = "\n".join(converter.code_lines)
+    verify_code_contains(
+        code_output,
+        "ff.read_catalog_table(",
+        'changes_since="last_run"',
+        'changes_consumer="nightly"',
+        'changes_start="beginning"',
+        "include_change_preimage=True",
+    )
+
+
+def test_catalog_reader_changes_since_version_and_timestamp():
+    """The version and timestamp change modes both land on the changes_since kwarg."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    flow = create_basic_flow()
+
+    by_version = input_schema.NodeCatalogReader(
+        flow_id=1, node_id=1, catalog_table_name="orders", cdc_mode="since_version", cdc_from_version=12
+    )
+    converter = FlowGraphToFlowFrameConverter(flow)
+    converter._handle_catalog_reader(by_version, "df_1", {})
+    verify_code_contains("\n".join(converter.code_lines), "changes_since=12")
+
+    by_timestamp = input_schema.NodeCatalogReader(
+        flow_id=1,
+        node_id=2,
+        catalog_table_name="orders",
+        cdc_mode="since_timestamp",
+        cdc_from_timestamp="2024-01-01T00:00:00+00:00",
+    )
+    converter = FlowGraphToFlowFrameConverter(flow)
+    converter._handle_catalog_reader(by_timestamp, "df_2", {})
+    verify_code_contains("\n".join(converter.code_lines), 'changes_since="2024-01-01T00:00:00+00:00"')
+
+
+def test_catalog_reader_changes_since_from_flow_parameter():
+    """A ${param} in either since field becomes a reference to the generated function's kwarg."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+    from flowfile_core.flowfile.code_generator.param_codegen import apply_param_sentinels, resolve_param_sentinels
+
+    flow = create_basic_flow()
+    params = [
+        FlowParameter(name="since", default_value="12", type="integer"),
+        FlowParameter(name="since_ts", default_value="2024-01-01T00:00:00+00:00", type="string"),
+    ]
+    by_version = input_schema.NodeCatalogReader(
+        flow_id=1, node_id=1, catalog_table_name="orders", cdc_mode="since_version", cdc_from_version="${since}"
+    )
+    by_time = input_schema.NodeCatalogReader(
+        flow_id=1, node_id=2, catalog_table_name="orders", cdc_mode="since_timestamp", cdc_from_timestamp="${since_ts}"
+    )
+    apply_param_sentinels([by_version, by_time], params)
+    converter = FlowGraphToFlowFrameConverter(flow)
+    converter._handle_catalog_reader(by_version, "df_1", {})
+    converter._handle_catalog_reader(by_time, "df_2", {})
+    code, leaked = resolve_param_sentinels("\n".join(converter.code_lines), {"since", "since_ts"})
+    assert not leaked
+    verify_code_contains(code, "changes_since=since,")
+    verify_code_contains(code, "changes_since=since_ts,")
+
+
+def test_catalog_reader_without_changes_emits_no_change_kwargs():
+    """A plain reader stays free of change-feed kwargs."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    flow = create_basic_flow()
+
+    catalog_reader = input_schema.NodeCatalogReader(flow_id=1, node_id=1, catalog_table_name="orders")
+    converter = FlowGraphToFlowFrameConverter(flow)
+    converter._handle_catalog_reader(catalog_reader, "df_1", {})
+
+    code_output = "\n".join(converter.code_lines)
+    assert "changes_since" not in code_output
+    assert "include_change_preimage" not in code_output
+
+
+def test_catalog_writer_track_changes_is_emitted():
+    """The writer's track_changes flag survives export."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    flow = create_basic_flow()
+
+    catalog_writer = input_schema.NodeCatalogWriter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        catalog_write_settings=input_schema.CatalogWriteSettings(
+            table_name="orders",
+            write_mode="upsert",
+            merge_keys=["order_id"],
+            track_changes=True,
+        ),
+    )
+
+    converter = FlowGraphToFlowFrameConverter(flow)
+    converter.node_var_mapping[2] = "df_2"
+    converter.last_node_var = "df_2"
+    converter._handle_catalog_writer(catalog_writer, "df_2", {"main": "df_1"})
+
+    code_output = "\n".join(converter.code_lines)
+    verify_code_contains(code_output, "ff.write_catalog_table(", "track_changes=True")
+
+
+def test_catalog_reader_missing_table_name_adds_to_unsupported():
+    """Test that catalog reader with no table name or ID is added to unsupported nodes."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    flow = create_basic_flow()
+
+    catalog_reader = input_schema.NodeCatalogReader(
+        flow_id=1,
+        node_id=1,
+    )
+
+    converter = FlowGraphToFlowFrameConverter(flow)
+    converter._handle_catalog_reader(catalog_reader, "df_1", {})
+
+    assert len(converter.unsupported_nodes) == 1
+    assert "no table name" in converter.unsupported_nodes[0][2].lower()
+
+
+# Catalog Writer Tests
+
+
+def test_catalog_writer_overwrite_mode():
+    """Test catalog writer code generation with overwrite mode."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    flow = create_basic_flow()
+
+    catalog_writer = input_schema.NodeCatalogWriter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        catalog_write_settings=input_schema.CatalogWriteSettings(
+            table_name="output_table",
+            write_mode="overwrite",
+        ),
+    )
+
+    converter = FlowGraphToFlowFrameConverter(flow)
+    converter.node_var_mapping[2] = "df_2"
+    converter.last_node_var = "df_2"
+    converter._handle_catalog_writer(catalog_writer, "df_2", {"main": "df_1"})
+
+    code_output = "\n".join(converter.code_lines)
+    verify_code_contains(
+        code_output, "ff.write_catalog_table(", "df_1,", '"output_table"',
+        'write_mode="overwrite"',
+    )
+    assert "import flowfile as ff" in converter.imports
+
+
+def test_catalog_writer_upsert_with_merge_keys():
+    """Test catalog writer code generation with upsert mode and merge keys."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    flow = create_basic_flow()
+
+    catalog_writer = input_schema.NodeCatalogWriter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        catalog_write_settings=input_schema.CatalogWriteSettings(
+            table_name="target_table",
+            namespace_id=987654,
+            write_mode="upsert",
+            merge_keys=["id", "name"],
+            description="My upsert table",
+        ),
+    )
+
+    converter = FlowGraphToFlowFrameConverter(flow)
+    converter.node_var_mapping[2] = "df_2"
+    converter.last_node_var = "df_2"
+    converter._handle_catalog_writer(catalog_writer, "df_2", {"main": "df_1"})
+
+    code_output = "\n".join(converter.code_lines)
+    verify_code_contains(
+        code_output, "ff.write_catalog_table(", '"target_table"', "namespace_id=987654",
+        'write_mode="upsert"', "merge_keys=[", 'description="My upsert table"',
+    )
+
+
+def test_catalog_writer_partition_by_is_emitted():
+    """Regression test: partition_by was silently dropped from generated catalog-writer code."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    flow = create_basic_flow()
+
+    catalog_writer = input_schema.NodeCatalogWriter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        catalog_write_settings=input_schema.CatalogWriteSettings(
+            table_name="partitioned_table",
+            write_mode="overwrite",
+            partition_by=["region", "year"],
+        ),
+    )
+
+    converter = FlowGraphToFlowFrameConverter(flow)
+    converter.node_var_mapping[2] = "df_2"
+    converter.last_node_var = "df_2"
+    converter._handle_catalog_writer(catalog_writer, "df_2", {"main": "df_1"})
+
+    code_output = "\n".join(converter.code_lines)
+    verify_code_contains(code_output, "ff.write_catalog_table(", "partition_by=[")
+
+
+def test_catalog_writer_scd2_emits_all_settings():
+    """SCD2 kwargs are emitted only when they differ from their default."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    flow = create_basic_flow()
+
+    catalog_writer = input_schema.NodeCatalogWriter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        catalog_write_settings=input_schema.CatalogWriteSettings(
+            table_name="dim_customer",
+            namespace_full_name="catalog.schema",
+            write_mode="scd2",
+            merge_keys=["id"],
+            scd2=input_schema.Scd2Settings(
+                compare_columns=["name", "city"],
+                full_snapshot=True,
+                surrogate_key_column="row_key",
+                valid_from_column="effective_from",
+                valid_to_column="effective_to",
+                is_current_column="current_flag",
+            ),
+        ),
+    )
+
+    converter = FlowGraphToFlowFrameConverter(flow)
+    converter.node_var_mapping[2] = "df_2"
+    converter.last_node_var = "df_2"
+    converter._handle_catalog_writer(catalog_writer, "df_2", {"main": "df_1"})
+
+    code_output = "\n".join(converter.code_lines)
+    verify_code_contains(
+        code_output,
+        "ff.write_catalog_table(",
+        '"dim_customer"',
+        'namespace_full_name="catalog.schema"',
+        'write_mode="scd2"',
+        "merge_keys=[",
+        "scd2_compare_columns=[",
+        "scd2_full_snapshot=True",
+        'scd2_surrogate_key_column="row_key"',
+        'scd2_valid_from_column="effective_from"',
+        'scd2_valid_to_column="effective_to"',
+        'scd2_is_current_column="current_flag"',
+    )
+
+
+def test_catalog_writer_stored_namespace_name_replaces_the_id():
+    """A stored ``namespace_full_name`` is emitted on its own; the install-local id is dropped."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    flow = create_basic_flow()
+    catalog_writer = input_schema.NodeCatalogWriter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        catalog_write_settings=input_schema.CatalogWriteSettings(
+            table_name="scores",
+            namespace_id=987654,
+            namespace_full_name="Demo.sales_analytics",
+            write_mode="append",
+        ),
+    )
+
+    converter = FlowGraphToFlowFrameConverter(flow)
+    converter._handle_catalog_writer(catalog_writer, "df_2", {"main": "df_1"})
+
+    code_output = "\n".join(converter.code_lines)
+    assert 'namespace_full_name="Demo.sales_analytics"' in code_output
+    assert "namespace_id=" not in code_output
+
+
+def test_catalog_writer_scd2_defaults_are_not_emitted():
+    """SCD2 kwargs at their default value stay out of the generated code."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    flow = create_basic_flow()
+
+    catalog_writer = input_schema.NodeCatalogWriter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        catalog_write_settings=input_schema.CatalogWriteSettings(
+            table_name="dim_customer_defaults",
+            write_mode="scd2",
+            merge_keys=["id"],
+            scd2=input_schema.Scd2Settings(),
+        ),
+    )
+
+    converter = FlowGraphToFlowFrameConverter(flow)
+    converter.node_var_mapping[2] = "df_2"
+    converter.last_node_var = "df_2"
+    converter._handle_catalog_writer(catalog_writer, "df_2", {"main": "df_1"})
+
+    code_output = "\n".join(converter.code_lines)
+    assert "scd2_compare_columns" not in code_output
+    assert "scd2_full_snapshot" not in code_output
+    assert "scd2_surrogate_key_column" not in code_output
+    assert "scd2_valid_from_column" not in code_output
+    assert "scd2_valid_to_column" not in code_output
+    assert "scd2_is_current_column" not in code_output
+    assert "scd2_output_mode" not in code_output
+
+
+def _scd2_writer_code(framework_converter_cls, **scd2_kwargs) -> str:
+    """Render one SCD2 catalog writer through a converter and return its generated code."""
+    flow = create_basic_flow()
+    catalog_writer = input_schema.NodeCatalogWriter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        catalog_write_settings=input_schema.CatalogWriteSettings(
+            table_name="dim_bound",
+            write_mode="scd2",
+            merge_keys=["id"],
+            scd2=input_schema.Scd2Settings(**scd2_kwargs),
+        ),
+    )
+    converter = framework_converter_cls(flow)
+    converter.node_var_mapping[2] = "df_2"
+    converter.last_node_var = "df_2"
+    converter._handle_catalog_writer(catalog_writer, "df_2", {"main": "df_1"})
+    return "\n".join(converter.code_lines)
+
+
+def test_catalog_writer_scd2_output_mode_is_emitted_when_not_default():
+    """The output mode changes what leaves the node, so a non-default value must survive export."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    code_output = _scd2_writer_code(FlowGraphToFlowFrameConverter, output_mode="changed")
+
+    verify_code_contains(code_output, "ff.write_catalog_table(", 'scd2_output_mode="changed"')
+
+
+def test_catalog_writer_scd2_binds_the_call_result():
+    """An SCD2 write emits extra columns, so the generated code must keep what the call returns."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    code_output = _scd2_writer_code(FlowGraphToFlowFrameConverter)
+
+    assert "df_2 = ff.write_catalog_table(" in code_output
+    # The passthrough assignment is exactly what the bound call replaces.
+    assert "df_2 = df_1" not in code_output
+
+
+def test_catalog_writer_non_scd2_keeps_the_passthrough_assignment():
+    """Every other write mode is unchanged: a bare call, then the input passed through."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    flow = create_basic_flow()
+    catalog_writer = input_schema.NodeCatalogWriter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        catalog_write_settings=input_schema.CatalogWriteSettings(
+            table_name="plain_bound",
+            write_mode="overwrite",
+        ),
+    )
+    converter = FlowGraphToFlowFrameConverter(flow)
+    converter.node_var_mapping[2] = "df_2"
+    converter.last_node_var = "df_2"
+    converter._handle_catalog_writer(catalog_writer, "df_2", {"main": "df_1"})
+
+    code_output = "\n".join(converter.code_lines)
+    assert "\nff.write_catalog_table(" in f"\n{code_output}"
+    assert "df_2 = ff.write_catalog_table(" not in code_output
+    assert "df_2 = df_1" in code_output
+
+
+def test_catalog_writer_missing_table_name_adds_to_unsupported():
+    """Test that catalog writer with no table name is added to unsupported nodes."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    flow = create_basic_flow()
+
+    catalog_writer = input_schema.NodeCatalogWriter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        catalog_write_settings=input_schema.CatalogWriteSettings(
+            table_name="",
+        ),
+    )
+
+    converter = FlowGraphToFlowFrameConverter(flow)
+    converter._handle_catalog_writer(catalog_writer, "df_2", {"main": "df_1"})
+
+    assert len(converter.unsupported_nodes) == 1
+    assert "no table name" in converter.unsupported_nodes[0][2].lower()
+
+
+def test_catalog_writer_pass_through():
+    """Test that catalog writer generates pass-through assignment."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    flow = create_basic_flow()
+
+    catalog_writer = input_schema.NodeCatalogWriter(
+        flow_id=1,
+        node_id=2,
+        depending_on_id=1,
+        catalog_write_settings=input_schema.CatalogWriteSettings(
+            table_name="output_table",
+        ),
+    )
+
+    converter = FlowGraphToFlowFrameConverter(flow)
+    converter.node_var_mapping[2] = "df_2"
+    converter.last_node_var = "df_2"
+    converter._handle_catalog_writer(catalog_writer, "df_2", {"main": "df_1"})
+
+    code_output = "\n".join(converter.code_lines)
+    verify_code_contains(code_output, "df_2 = df_1")
+
+
+# Catalog Code Generation Integration Tests
+
+
+def _catalog_cleanup():
+    """Remove all catalog rows so tests start clean."""
+    from flowfile_core.database.connection import get_db_context
+    from flowfile_core.database.models import CatalogNamespace, CatalogTable, CatalogTableReadLink, FlowRegistration
+
+    with get_db_context() as db:
+        db.query(CatalogTableReadLink).delete()
+        db.query(CatalogTable).delete()
+        db.query(FlowRegistration).delete()
+        db.query(CatalogNamespace).delete()
+        db.commit()
+
+
+def _create_catalog_namespace() -> int:
+    """Create a namespace hierarchy and return the schema-level id."""
+    from flowfile_core.database.connection import get_db_context
+    from flowfile_core.database.models import CatalogNamespace
+
+    with get_db_context() as db:
+        cat = CatalogNamespace(name="CodeGenCat", level=0, owner_id=1)
+        db.add(cat)
+        db.commit()
+        db.refresh(cat)
+        schema = CatalogNamespace(name="CodeGenSch", level=1, parent_id=cat.id, owner_id=1)
+        db.add(schema)
+        db.commit()
+        db.refresh(schema)
+        return schema.id
+
+
+def _register_catalog_table(name: str, ns_id: int, data: list[dict]) -> int:
+    """Write data as a parquet file, register it in the catalog, return the table id."""
+    import tempfile
+
+    from flowfile_core.catalog.repository import SQLAlchemyCatalogRepository
+    from flowfile_core.catalog.service import CatalogService
+    from flowfile_core.database.connection import get_db_context
+
+    df = pl.DataFrame(data)
+    tmp = tempfile.NamedTemporaryFile(suffix=".parquet", delete=False)
+    df.write_parquet(tmp.name)
+    tmp.close()
+
+    with get_db_context() as db:
+        repo = SQLAlchemyCatalogRepository(db)
+        svc = CatalogService(repo)
+        table_out = svc.register_table(name=name, file_path=tmp.name, owner_id=1, namespace_id=ns_id)
+    return table_out.id
+
+
+def test_catalog_reader_code_executes():
+    """Integration test: register a catalog table, export reader flow to code, execute it.
+
+    Follows the pattern from test_catalog_flow_graph.py TestCatalogReader.
+    """
+    _catalog_cleanup()
+    ns_id = _create_catalog_namespace()
+    _register_catalog_table("code_gen_table", ns_id, [{"name": "Alice", "age": 30}, {"name": "Bob", "age": 25}])
+
+    flow = create_basic_flow()
+    promise = input_schema.NodePromise(flow_id=flow.flow_id, node_id=1, node_type="catalog_reader")
+    flow.add_node_promise(promise)
+    reader = input_schema.NodeCatalogReader(
+        flow_id=flow.flow_id,
+        node_id=1,
+        catalog_table_name="code_gen_table",
+        catalog_namespace_id=ns_id,
+    )
+    flow.add_catalog_reader(reader)
+
+    code = export_flow_to_flowframe(flow)
+    assert 'namespace_full_name="CodeGenCat.CodeGenSch"' in code
+    assert "namespace_id=" not in code
+    result = get_result_from_generated_code(code)
+    if hasattr(result, "collect"):
+        result = result.collect()
+    assert len(result) == 2
+    assert set(result.columns) == {"name", "age"}
+
+    _catalog_cleanup()
+
+
+def test_catalog_writer_code_executes():
+    """Integration test: export manual_input -> catalog_writer to code, execute it, verify catalog."""
+    from flowfile_core.catalog.repository import SQLAlchemyCatalogRepository
+    from flowfile_core.catalog.service import CatalogService
+    from flowfile_core.database.connection import get_db_context
+
+    _catalog_cleanup()
+    ns_id = _create_catalog_namespace()
+
+    flow = create_basic_flow()
+    create_sample_dataframe_node(flow, node_id=1)
+
+    promise = input_schema.NodePromise(flow_id=flow.flow_id, node_id=2, node_type="catalog_writer")
+    flow.add_node_promise(promise)
+    writer = input_schema.NodeCatalogWriter(
+        flow_id=flow.flow_id,
+        node_id=2,
+        depending_on_id=1,
+        catalog_write_settings=input_schema.CatalogWriteSettings(
+            table_name="written_from_code",
+            namespace_id=ns_id,
+            write_mode="overwrite",
+        ),
+        user_id=1,
+    )
+    flow.add_catalog_writer(writer)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_flow_to_flowframe(flow)
+    assert 'namespace_full_name="CodeGenCat.CodeGenSch"' in code
+    assert "namespace_id=" not in code
+    verify_if_execute(code)
+
+    with get_db_context() as db:
+        repo = SQLAlchemyCatalogRepository(db)
+        svc = CatalogService(repo)
+        tables = svc.list_tables(namespace_id=ns_id)
+        assert len(tables) == 1
+        assert tables[0].name == "written_from_code"
+        assert tables[0].row_count == 5
+
+    _catalog_cleanup()
+
+
+def _add_manual_input_from_rows(flow: FlowGraph, data: list[dict], node_id: int) -> None:
+    """Add a manual input node from a list of row dicts (flexible shape, unlike
+    ``create_sample_dataframe_node``)."""
+    manual_input = input_schema.NodeManualInput(
+        flow_id=flow.flow_id,
+        node_id=node_id,
+        raw_data_format=input_schema.RawData.from_pylist(data),
+    )
+    flow.add_manual_input(manual_input)
+
+
+def test_catalog_writer_scd2_code_executes():
+    """Integration test: export two SCD2 writes to code, execute both, verify history shape.
+
+    Modeled on ``test_catalog_writer_code_executes``. V1 has one row; V2 changes that row and
+    adds a new one, so the catalog table ends up with 3 rows total (1 closed + 2 current).
+    """
+    from flowfile_core.catalog.repository import SQLAlchemyCatalogRepository
+    from flowfile_core.catalog.service import CatalogService
+    from flowfile_core.database.connection import get_db_context
+
+    _catalog_cleanup()
+    ns_id = _create_catalog_namespace()
+
+    scd2_v1 = [{"id": 1, "name": "Alice", "city": "Amsterdam"}]
+    scd2_v2 = [
+        {"id": 1, "name": "Alice", "city": "Antwerp"},  # changed
+        {"id": 2, "name": "Bob", "city": "Berlin"},  # new
+    ]
+
+    def _build_and_run(data: list[dict], flow_id: int) -> None:
+        flow = create_basic_flow(flow_id=flow_id, name=f"scd2_export_{flow_id}")
+        _add_manual_input_from_rows(flow, data, node_id=1)
+
+        promise = input_schema.NodePromise(flow_id=flow.flow_id, node_id=2, node_type="catalog_writer")
+        flow.add_node_promise(promise)
+        writer = input_schema.NodeCatalogWriter(
+            flow_id=flow.flow_id,
+            node_id=2,
+            depending_on_id=1,
+            catalog_write_settings=input_schema.CatalogWriteSettings(
+                table_name="scd2_written_from_code",
+                namespace_id=ns_id,
+                write_mode="scd2",
+                merge_keys=["id"],
+                scd2=input_schema.Scd2Settings(),
+            ),
+            user_id=1,
+        )
+        flow.add_catalog_writer(writer)
+        add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+        code = export_flow_to_flowframe(flow)
+        verify_if_execute(code)
+
+    _build_and_run(scd2_v1, flow_id=1)
+    _build_and_run(scd2_v2, flow_id=2)
+
+    with get_db_context() as db:
+        repo = SQLAlchemyCatalogRepository(db)
+        svc = CatalogService(repo)
+        tables = svc.list_tables(namespace_id=ns_id)
+        assert len(tables) == 1
+        table = tables[0]
+        assert table.name == "scd2_written_from_code"
+        assert table.row_count == 3
+        assert table.scd2 is not None
+        assert table.scd2.business_keys == ["id"]
+
+    result_df = pl.read_delta(_table_file_path(ns_id, "scd2_written_from_code"))
+    assert result_df.height == 3
+    assert result_df.filter(pl.col("is_current")).height == 2
+
+    _catalog_cleanup()
+
+
+def _table_file_path(ns_id: int, name: str) -> str:
+    from flowfile_core.catalog.repository import SQLAlchemyCatalogRepository
+    from flowfile_core.database.connection import get_db_context
+
+    with get_db_context() as db:
+        repo = SQLAlchemyCatalogRepository(db)
+        table = next(t for t in repo.list_tables(namespace_id=ns_id) if t.name == name)
+        return table.file_path
+
+
+def test_catalog_round_trip_code_generation():
+    """Integration test: write to catalog via generated code, then read back via generated code."""
+    _catalog_cleanup()
+    ns_id = _create_catalog_namespace()
+
+    write_flow = create_basic_flow()
+    create_sample_dataframe_node(write_flow, node_id=1)
+
+    promise = input_schema.NodePromise(flow_id=write_flow.flow_id, node_id=2, node_type="catalog_writer")
+    write_flow.add_node_promise(promise)
+    writer = input_schema.NodeCatalogWriter(
+        flow_id=write_flow.flow_id,
+        node_id=2,
+        depending_on_id=1,
+        catalog_write_settings=input_schema.CatalogWriteSettings(
+            table_name="roundtrip_code_table",
+            namespace_id=ns_id,
+            write_mode="overwrite",
+        ),
+        user_id=1,
+    )
+    write_flow.add_catalog_writer(writer)
+    add_connection(write_flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    write_code = export_flow_to_flowframe(write_flow)
+    verify_if_execute(write_code)
+
+    read_flow = create_basic_flow(flow_id=2, name="read_flow")
+    read_promise = input_schema.NodePromise(flow_id=read_flow.flow_id, node_id=1, node_type="catalog_reader")
+    read_flow.add_node_promise(read_promise)
+    reader = input_schema.NodeCatalogReader(
+        flow_id=read_flow.flow_id,
+        node_id=1,
+        catalog_table_name="roundtrip_code_table",
+        catalog_namespace_id=ns_id,
+    )
+    read_flow.add_catalog_reader(reader)
+
+    read_code = export_flow_to_flowframe(read_flow)
+    result = get_result_from_generated_code(read_code)
+    if hasattr(result, "collect"):
+        result = result.collect()
+    assert len(result) == 5
+    assert set(result.columns) == {"id", "name", "age", "city", "salary"}
+
+    _catalog_cleanup()
+
+
+def test_kafka_source_with_connection_name():
+    """Test kafka source code generation with a named connection."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    flow = create_basic_flow()
+
+    kafka_source = input_schema.NodeKafkaSource(
+        flow_id=1,
+        node_id=1,
+        kafka_settings=input_schema.KafkaSourceSettings(
+            kafka_connection_name="my_kafka",
+            topic_name="events",
+        ),
+    )
+
+    converter = FlowGraphToFlowFrameConverter(flow)
+    converter.node_var_mapping[1] = "df_1"
+    converter.last_node_var = "df_1"
+    converter._handle_kafka_source(kafka_source, "df_1", {})
+
+    code_output = "\n".join(converter.code_lines)
+    verify_code_contains(code_output, "ff.read_kafka(", '"my_kafka"', 'topic_name="events"')
+    assert "import flowfile as ff" in converter.imports
+
+
+def test_kafka_source_with_all_parameters():
+    """Test kafka source code generation with non-default parameters."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    flow = create_basic_flow()
+
+    kafka_source = input_schema.NodeKafkaSource(
+        flow_id=1,
+        node_id=1,
+        kafka_settings=input_schema.KafkaSourceSettings(
+            kafka_connection_name="my_kafka",
+            topic_name="events",
+            max_messages=50_000,
+            start_offset="earliest",
+            poll_timeout_seconds=60.0,
+        ),
+    )
+
+    converter = FlowGraphToFlowFrameConverter(flow)
+    converter.node_var_mapping[1] = "df_1"
+    converter.last_node_var = "df_1"
+    converter._handle_kafka_source(kafka_source, "df_1", {})
+
+    code_output = "\n".join(converter.code_lines)
+    verify_code_contains(code_output, "ff.read_kafka(", "max_messages=50000", 'start_offset="earliest"', "poll_timeout_seconds=60.0")
+
+
+def test_kafka_source_default_parameters_omitted():
+    """Test that kafka source omits parameters with default values."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    flow = create_basic_flow()
+
+    kafka_source = input_schema.NodeKafkaSource(
+        flow_id=1,
+        node_id=1,
+        kafka_settings=input_schema.KafkaSourceSettings(
+            kafka_connection_name="my_kafka",
+            topic_name="events",
+            max_messages=100_000,
+            start_offset="latest",
+            poll_timeout_seconds=30.0,
+        ),
+    )
+
+    converter = FlowGraphToFlowFrameConverter(flow)
+    converter.node_var_mapping[1] = "df_1"
+    converter.last_node_var = "df_1"
+    converter._handle_kafka_source(kafka_source, "df_1", {})
+
+    code_output = "\n".join(converter.code_lines)
+    assert "max_messages" not in code_output
+    assert "start_offset" not in code_output
+    assert "poll_timeout_seconds" not in code_output
+
+
+def test_kafka_source_missing_connection_adds_to_unsupported():
+    """Test that kafka source with no connection is added to unsupported nodes."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    flow = create_basic_flow()
+
+    kafka_source = input_schema.NodeKafkaSource(
+        flow_id=1,
+        node_id=1,
+        kafka_settings=input_schema.KafkaSourceSettings(
+            topic_name="events",
+        ),
+    )
+
+    converter = FlowGraphToFlowFrameConverter(flow)
+    converter._handle_kafka_source(kafka_source, "df_1", {})
+
+    assert len(converter.unsupported_nodes) == 1
+    assert "no connection" in converter.unsupported_nodes[0][2].lower()
+
+
+def test_kafka_source_id_only_adds_to_unsupported():
+    """Test that kafka source with only connection ID (no name) is added to unsupported nodes."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    flow = create_basic_flow()
+
+    kafka_source = input_schema.NodeKafkaSource(
+        flow_id=1,
+        node_id=1,
+        kafka_settings=input_schema.KafkaSourceSettings(
+            kafka_connection_id=42,
+            topic_name="events",
+        ),
+    )
+
+    converter = FlowGraphToFlowFrameConverter(flow)
+    converter._handle_kafka_source(kafka_source, "df_1", {})
+
+    assert len(converter.unsupported_nodes) == 1
+    assert "named connection" in converter.unsupported_nodes[0][2].lower()
+
+
+def test_cloud_storage_reader_handler_unified():
+    """Test cloud storage reader generates unified read_from_cloud_storage call."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    flow = create_basic_flow()
+    settings = input_schema.NodeCloudStorageReader(
+        flow_id=1,
+        node_id=1,
+        cloud_storage_settings=cloud_ss.CloudStorageReadSettings(
+            resource_path="s3://bucket/data.parquet",
+            connection_name="my_conn",
+            file_format="parquet",
+        ),
+    )
+
+    converter = FlowGraphToFlowFrameConverter(flow)
+    converter.node_var_mapping[1] = "df_1"
+    converter.last_node_var = "df_1"
+    converter._handle_cloud_storage_reader(settings, "df_1", {})
+
+    code_output = "\n".join(converter.code_lines)
+    verify_code_contains(code_output, "ff.read_from_cloud_storage(", "s3://bucket/data.parquet", "my_conn")
+    assert "import flowfile as ff" in converter.imports
+    assert "scan_parquet_from_cloud_storage" not in code_output
+    assert "scan_csv_from_cloud_storage" not in code_output
+
+
+def test_cloud_storage_reader_handler_csv_unset_options():
+    """Unset CSV options export as the engine's defaults, never as literal None."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    settings = input_schema.NodeCloudStorageReader(
+        flow_id=1,
+        node_id=1,
+        cloud_storage_settings=cloud_ss.CloudStorageReadSettings(
+            resource_path="s3://bucket/data.csv",
+            file_format="csv",
+            csv_has_header=None,
+            csv_delimiter=None,
+            csv_encoding=None,
+        ),
+    )
+
+    converter = FlowGraphToFlowFrameConverter(create_basic_flow())
+    converter._handle_cloud_storage_reader(settings, "df_1", {})
+    code_output = "\n".join(converter.code_lines)
+
+    verify_code_contains(code_output, 'delimiter=",",')
+    assert "None" not in code_output
+    assert "has_header" not in code_output
+    assert "encoding" not in code_output
+
+
+def test_cloud_storage_reader_polars_unsupported():
+    """Test that cloud storage reader is unsupported in Polars mode."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToPolarsConverter
+
+    flow = create_basic_flow()
+    settings = input_schema.NodeCloudStorageReader(
+        flow_id=1,
+        node_id=1,
+        cloud_storage_settings=cloud_ss.CloudStorageReadSettings(
+            resource_path="s3://bucket/data.parquet",
+            connection_name="my_conn",
+            file_format="parquet",
+        ),
+    )
+
+    converter = FlowGraphToPolarsConverter(flow)
+    converter._handle_cloud_storage_reader(settings, "df_1", {})
+
+    assert len(converter.unsupported_nodes) == 1
+    assert "not supported by polars" in converter.unsupported_nodes[0][2].lower()
+
+
+def test_cloud_storage_writer_handler_unified():
+    """Test cloud storage writer generates unified write_to_cloud_storage call."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    flow = create_basic_flow()
+    settings = input_schema.NodeCloudStorageWriter(
+        flow_id=1,
+        node_id=2,
+        user_id=1,
+        cloud_storage_settings=cloud_ss.CloudStorageWriteSettings(
+            resource_path="s3://bucket/output.parquet",
+            connection_name="my_conn",
+            file_format="parquet",
+        ),
+    )
+
+    converter = FlowGraphToFlowFrameConverter(flow)
+    converter.node_var_mapping[1] = "df_1"
+    converter.last_node_var = "df_1"
+    converter._handle_cloud_storage_writer(settings, "df_2", {"main": "df_1"})
+
+    code_output = "\n".join(converter.code_lines)
+    verify_code_contains(code_output, "ff.write_to_cloud_storage(", "s3://bucket/output.parquet", "my_conn")
+    assert "import flowfile as ff" in converter.imports
+    assert "ff.FlowFrame(" not in code_output
+
+
+def test_cloud_storage_writer_handler_delta_partition_by():
+    """Partitioned delta cloud writes must emit partition_by in the generated call."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    flow = create_basic_flow()
+    settings = input_schema.NodeCloudStorageWriter(
+        flow_id=1,
+        node_id=2,
+        user_id=1,
+        cloud_storage_settings=cloud_ss.CloudStorageWriteSettings(
+            resource_path="s3://bucket/output_delta",
+            connection_name="my_conn",
+            file_format="delta",
+            write_mode="append",
+            partition_by=["region", "year"],
+        ),
+    )
+
+    converter = FlowGraphToFlowFrameConverter(flow)
+    converter.node_var_mapping[1] = "df_1"
+    converter.last_node_var = "df_1"
+    converter._handle_cloud_storage_writer(settings, "df_2", {"main": "df_1"})
+
+    code_output = "\n".join(converter.code_lines)
+    verify_code_contains(
+        code_output,
+        "ff.write_to_cloud_storage(",
+        'write_mode="append"',
+        "partition_by=['region', 'year']",
+    )
+    assert "df_2 = df_1" in code_output
+
+
+def test_cloud_storage_writer_handler_delta_merge_and_track_changes():
+    """A cloud Delta upsert keeps its merge keys and track_changes flag on export."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    flow = create_basic_flow()
+    settings = input_schema.NodeCloudStorageWriter(
+        flow_id=1,
+        node_id=2,
+        user_id=1,
+        cloud_storage_settings=cloud_ss.CloudStorageWriteSettings(
+            resource_path="s3://bucket/orders_delta",
+            connection_name="my_conn",
+            file_format="delta",
+            write_mode="upsert",
+            merge_keys=["order_id"],
+            track_changes=True,
+        ),
+    )
+
+    converter = FlowGraphToFlowFrameConverter(flow)
+    converter._handle_cloud_storage_writer(settings, "df_2", {"main": "df_1"})
+
+    verify_code_contains(
+        "\n".join(converter.code_lines),
+        "ff.write_to_cloud_storage(",
+        'write_mode="upsert"',
+        "merge_keys=['order_id']",
+        "track_changes=True",
+    )
+
+
+def test_cloud_storage_reader_handler_delta_changes_since():
+    """Version, timestamp and ${param} change windows all land on the changes_since kwarg."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+    from flowfile_core.flowfile.code_generator.param_codegen import apply_param_sentinels, resolve_param_sentinels
+
+    def reader(node_id: int, **cdc) -> input_schema.NodeCloudStorageReader:
+        return input_schema.NodeCloudStorageReader(
+            flow_id=1,
+            node_id=node_id,
+            cloud_storage_settings=cloud_ss.CloudStorageReadSettings(
+                resource_path="s3://bucket/orders_delta", file_format="delta", **cdc
+            ),
+        )
+
+    by_version = reader(1, cdc_mode="since_version", cdc_from_version=12, cdc_include_preimage=True)
+    by_time = reader(2, cdc_mode="since_timestamp", cdc_from_timestamp="2024-01-01T00:00:00+00:00")
+    by_param = reader(3, cdc_mode="since_version", cdc_from_version="${since}")
+    apply_param_sentinels([by_param], [FlowParameter(name="since", default_value="12", type="integer")])
+
+    converter = FlowGraphToFlowFrameConverter(create_basic_flow())
+    converter._handle_cloud_storage_reader(by_version, "df_1", {})
+    converter._handle_cloud_storage_reader(by_time, "df_2", {})
+    converter._handle_cloud_storage_reader(by_param, "df_3", {})
+    code, leaked = resolve_param_sentinels("\n".join(converter.code_lines), {"since"})
+
+    assert not leaked
+    verify_code_contains(
+        code,
+        "changes_since=12,",
+        "include_change_preimage=True",
+        'changes_since="2024-01-01T00:00:00+00:00"',
+        "changes_since=since,",
+    )
+    assert code.count("include_change_preimage") == 1
+
+
+def test_cloud_storage_writer_polars_unsupported():
+    """Test that cloud storage writer is unsupported in Polars mode."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToPolarsConverter
+
+    flow = create_basic_flow()
+    settings = input_schema.NodeCloudStorageWriter(
+        flow_id=1,
+        node_id=2,
+        user_id=1,
+        cloud_storage_settings=cloud_ss.CloudStorageWriteSettings(
+            resource_path="s3://bucket/output.parquet",
+            connection_name="my_conn",
+            file_format="parquet",
+        ),
+    )
+
+    converter = FlowGraphToPolarsConverter(flow)
+    converter._handle_cloud_storage_writer(settings, "df_2", {"main": "df_1"})
+
+    assert len(converter.unsupported_nodes) == 1
+    assert "not supported by polars" in converter.unsupported_nodes[0][2].lower()
+
+
+def test_kafka_source_polars_unsupported():
+    """Test that kafka source is unsupported in Polars mode."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToPolarsConverter
+
+    flow = create_basic_flow()
+
+    kafka_source = input_schema.NodeKafkaSource(
+        flow_id=1,
+        node_id=1,
+        kafka_settings=input_schema.KafkaSourceSettings(
+            kafka_connection_name="my_kafka",
+            topic_name="events",
+        ),
+    )
+
+    converter = FlowGraphToPolarsConverter(flow)
+    converter._handle_kafka_source(kafka_source, "df_1", {})
+
+    assert len(converter.unsupported_nodes) == 1
+    assert "not supported by polars" in converter.unsupported_nodes[0][2].lower()
+
+
+@pytest.mark.kafka
+@pytest.mark.skipif(not is_docker_available(), reason="Docker is not available")
+def test_kafka_source_code_executes():
+    """Test that kafka_source code generation produces executable code that reads from Redpanda."""
+    from flowfile_core.database.connection import get_db_context
+    from flowfile_core.database.models import KafkaConnection
+    from flowfile_core.kafka.connection_manager import store_kafka_connection
+    from flowfile_core.schemas.kafka_schemas import KafkaConnectionCreate
+    from test_utils.kafka.fixtures import (
+        BOOTSTRAP_SERVERS,
+        REDPANDA_CONTAINER_NAME,
+        create_topic,
+        is_container_running,
+        produce_json_messages,
+        start_redpanda_container,
+    )
+    if not is_container_running(REDPANDA_CONTAINER_NAME):
+        if not start_redpanda_container():
+            pytest.skip("Could not start Redpanda")
+
+    with get_db_context() as db:
+        db.query(KafkaConnection).delete()
+        db.commit()
+
+    try:
+        with get_db_context() as db:
+            conn = store_kafka_connection(
+                db,
+                KafkaConnectionCreate(
+                    connection_name="test-codegen-kafka",
+                    bootstrap_servers=BOOTSTRAP_SERVERS,
+                    security_protocol="PLAINTEXT",
+                ),
+                user_id=1,
+            )
+        connection_id = conn.id
+
+        topic_name = f"codegen_test_{uuid4().hex[:8]}"
+        create_topic(topic_name, num_partitions=1)
+        messages = [
+            {"name": "Alice", "age": 30},
+            {"name": "Bob", "age": 25},
+            {"name": "Charlie", "age": 35},
+        ]
+        produce_json_messages(topic_name, messages)
+
+        flow = create_basic_flow()
+        promise = input_schema.NodePromise(flow_id=1, node_id=1, node_type="kafka_source")
+        flow.add_node_promise(promise)
+        kafka_settings = input_schema.KafkaSourceSettings(
+            kafka_connection_id=connection_id,
+            kafka_connection_name="test-codegen-kafka",
+            topic_name=topic_name,
+            start_offset="earliest",
+            poll_timeout_seconds=10.0,
+        )
+        node_kafka = input_schema.NodeKafkaSource(
+            flow_id=1,
+            node_id=1,
+            kafka_settings=kafka_settings,
+            user_id=1,
+        )
+        flow.add_kafka_source(node_kafka)
+
+        code = export_flow_to_flowframe(flow)
+        assert "ff.read_kafka(" in code
+        assert "test-codegen-kafka" in code
+        assert topic_name in code
+
+        result = get_result_from_generated_code(code)
+        assert isinstance(result, (pl.DataFrame, pl.LazyFrame, FlowFrame))
+        if isinstance(result, FlowFrame):
+            result = result.collect()
+        elif isinstance(result, pl.LazyFrame):
+            result = result.collect()
+        assert len(result) == 3
+        assert "name" in result.columns
+        assert "age" in result.columns
+        assert set(result["name"].to_list()) == {"Alice", "Bob", "Charlie"}
+    finally:
+        with get_db_context() as db:
+            db.query(KafkaConnection).delete()
+            db.commit()
+
+
+# ML / DS round-trip tests — train_model, apply_model, evaluate_model, wait_for
+
+
+def _create_ml_sample_dataframe_node(flow: FlowGraph, node_id: int = 1) -> FlowGraph:
+    """Manual input with two numeric features and a target — suitable for linear regression."""
+    manual_input = input_schema.NodeManualInput(
+        flow_id=flow.flow_id,
+        node_id=node_id,
+        raw_data_format=input_schema.RawData.from_pylist(
+            [
+                {"x1": 1.0, "x2": 2.0, "y": 5.0},
+                {"x1": 2.0, "x2": 1.0, "y": 4.0},
+                {"x1": 3.0, "x2": 4.0, "y": 11.0},
+                {"x1": 4.0, "x2": 3.0, "y": 10.0},
+                {"x1": 5.0, "x2": 5.0, "y": 15.0},
+            ]
+        ),
+    )
+    flow.add_manual_input(manual_input)
+    return flow
+
+
+def _create_predictions_dataframe_node(flow: FlowGraph, node_id: int = 1) -> FlowGraph:
+    """Manual input shaped like the output of an Apply Model node — for evaluate-only tests."""
+    manual_input = input_schema.NodeManualInput(
+        flow_id=flow.flow_id,
+        node_id=node_id,
+        raw_data_format=input_schema.RawData.from_pylist(
+            [
+                {"y": 1.0, "prediction": 1.1},
+                {"y": 2.0, "prediction": 1.9},
+                {"y": 3.0, "prediction": 3.0},
+                {"y": 4.0, "prediction": 4.2},
+                {"y": 5.0, "prediction": 5.1},
+            ]
+        ),
+    )
+    flow.add_manual_input(manual_input)
+    return flow
+
+
+def test_evaluate_model_round_trip():
+    """Evaluate Model alone — pure-polars node, no worker round-trip needed."""
+    flow = create_basic_flow()
+    _create_predictions_dataframe_node(flow, node_id=1)
+    flow.add_evaluate_model(
+        input_schema.NodeEvaluateModel(
+            flow_id=flow.flow_id,
+            node_id=2,
+            depending_on_id=1,
+            evaluate_input=input_schema.EvaluateModelSettings(
+                actual_column="y", predicted_column="prediction"
+            ),
+        )
+    )
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_flow_to_flowframe(flow)
+    verify_code_contains(code, '.evaluate_model(\'y\')')
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected)
+
+
+def test_evaluate_model_classification_round_trip():
+    """Explicit task_type='classification' must be preserved by code-gen."""
+    flow = create_basic_flow()
+    manual_input = input_schema.NodeManualInput(
+        flow_id=flow.flow_id,
+        node_id=1,
+        raw_data_format=input_schema.RawData.from_pylist(
+            [
+                {"y": 0, "prediction": 0},
+                {"y": 1, "prediction": 1},
+                {"y": 0, "prediction": 1},
+                {"y": 1, "prediction": 1},
+            ]
+        ),
+    )
+    flow.add_manual_input(manual_input)
+    flow.add_evaluate_model(
+        input_schema.NodeEvaluateModel(
+            flow_id=flow.flow_id,
+            node_id=2,
+            depending_on_id=1,
+            evaluate_input=input_schema.EvaluateModelSettings(
+                actual_column="y", predicted_column="prediction", task_type="classification"
+            ),
+        )
+    )
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_flow_to_flowframe(flow)
+    verify_code_contains(code, "task_type='classification'")
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected)
+
+
+def test_train_model_round_trip():
+    """Train Model is pass-through; generated code should produce the same frame as direct execution."""
+    flow = create_basic_flow()
+    _create_ml_sample_dataframe_node(flow, node_id=1)
+    flow.add_train_model(
+        input_schema.NodeTrainModel(
+            flow_id=flow.flow_id,
+            node_id=2,
+            depending_on_id=1,
+            train_input=input_schema.TrainModelSettings(
+                target_column="y",
+                feature_columns=["x1", "x2"],
+                model_type="linear_regression",
+                params={"add_bias": True},
+            ),
+        )
+    )
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_flow_to_flowframe(flow)
+    verify_code_contains(code, ".train_model(", "target='y'", "features=['x1', 'x2']")
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected)
+
+
+def test_train_apply_round_trip():
+    """Train + Apply chained: apply consumes train's output and adds a prediction column."""
+    flow = create_basic_flow()
+    _create_ml_sample_dataframe_node(flow, node_id=1)
+    flow.add_train_model(
+        input_schema.NodeTrainModel(
+            flow_id=flow.flow_id,
+            node_id=2,
+            depending_on_id=1,
+            train_input=input_schema.TrainModelSettings(
+                target_column="y",
+                feature_columns=["x1", "x2"],
+                model_type="linear_regression",
+                params={"add_bias": True},
+            ),
+        )
+    )
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    # Apply chains off train so depending_on_id walks back through it (forces train to run first).
+    flow.add_apply_model(
+        input_schema.NodeApplyModel(
+            flow_id=flow.flow_id,
+            node_id=3,
+            depending_on_id=2,
+            apply_input=input_schema.ApplyModelSettings(
+                source="upstream",
+                upstream_node_id=2,
+                output_column="prediction",
+            ),
+        )
+    )
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(2, 3))
+
+    code = export_flow_to_flowframe(flow)
+    verify_code_contains(code, ".apply_model(upstream=trained)")
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected = normalize_result(flow.get_node(3).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected)
+
+
+def test_apply_model_custom_output_column_round_trip():
+    """A non-default output_column must be preserved in generated code."""
+    flow = create_basic_flow()
+    _create_ml_sample_dataframe_node(flow, node_id=1)
+    flow.add_train_model(
+        input_schema.NodeTrainModel(
+            flow_id=flow.flow_id,
+            node_id=2,
+            depending_on_id=1,
+            train_input=input_schema.TrainModelSettings(
+                target_column="y",
+                feature_columns=["x1", "x2"],
+                model_type="linear_regression",
+                params={"add_bias": True},
+            ),
+        )
+    )
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+    flow.add_apply_model(
+        input_schema.NodeApplyModel(
+            flow_id=flow.flow_id,
+            node_id=3,
+            depending_on_id=2,
+            apply_input=input_schema.ApplyModelSettings(
+                source="upstream",
+                upstream_node_id=2,
+                output_column="score",
+            ),
+        )
+    )
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(2, 3))
+
+    code = export_flow_to_flowframe(flow)
+    verify_code_contains(code, "output_column='score'")
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    assert "score" in result.columns
+
+
+def test_apply_model_catalog_mode_emits_correct_code():
+    """Catalog-mode apply_model should emit model_name/version/namespace_id without trying to fetch.
+
+    We don't execute the generated code here — the test environment has no
+    catalog backend, and runtime catalog resolution is exercised in
+    ``test_ml_train_apply.py``.
+    """
+    flow = create_basic_flow()
+    _create_ml_sample_dataframe_node(flow, node_id=1)
+    flow.add_apply_model(
+        input_schema.NodeApplyModel(
+            flow_id=flow.flow_id,
+            node_id=2,
+            depending_on_id=1,
+            apply_input=input_schema.ApplyModelSettings(
+                source="catalog",
+                model_name="my_model",
+                model_version=3,
+                namespace_id=42,
+                output_column="prediction",
+            ),
+        )
+    )
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_flow_to_flowframe(flow)
+    verify_code_contains(code, "model_name='my_model'", "version=3", "namespace_id=42")
+
+
+def test_train_apply_evaluate_full_chain_round_trip():
+    """End-to-end DS pipeline: manual_input -> train -> apply -> evaluate."""
+    flow = create_basic_flow()
+    _create_ml_sample_dataframe_node(flow, node_id=1)
+    flow.add_train_model(
+        input_schema.NodeTrainModel(
+            flow_id=flow.flow_id,
+            node_id=2,
+            depending_on_id=1,
+            train_input=input_schema.TrainModelSettings(
+                target_column="y",
+                feature_columns=["x1", "x2"],
+                model_type="linear_regression",
+                params={"add_bias": True},
+            ),
+        )
+    )
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+    flow.add_apply_model(
+        input_schema.NodeApplyModel(
+            flow_id=flow.flow_id,
+            node_id=3,
+            depending_on_id=2,
+            apply_input=input_schema.ApplyModelSettings(
+                source="upstream", upstream_node_id=2, output_column="prediction"
+            ),
+        )
+    )
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(2, 3))
+    flow.add_evaluate_model(
+        input_schema.NodeEvaluateModel(
+            flow_id=flow.flow_id,
+            node_id=4,
+            depending_on_id=3,
+            evaluate_input=input_schema.EvaluateModelSettings(
+                actual_column="y",
+                predicted_column="prediction",
+                task_type="auto",
+                upstream_train_node_id=2,
+            ),
+        )
+    )
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(3, 4))
+
+    code = export_flow_to_flowframe(flow)
+    verify_code_ordering(code, ".train_model(", ".apply_model(", ".evaluate_model(")
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected = normalize_result(flow.get_node(4).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected)
+
+
+def test_wait_for_round_trip():
+    """Wait For should preserve its left input and forward the dependency through code-gen."""
+    flow = create_basic_flow()
+    _create_ml_sample_dataframe_node(flow, node_id=1)
+    flow.add_train_model(
+        input_schema.NodeTrainModel(
+            flow_id=flow.flow_id,
+            node_id=2,
+            depending_on_id=1,
+            train_input=input_schema.TrainModelSettings(
+                target_column="y",
+                feature_columns=["x1", "x2"],
+                model_type="linear_regression",
+                params={"add_bias": True},
+            ),
+        )
+    )
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+    flow.add_apply_model(
+        input_schema.NodeApplyModel(
+            flow_id=flow.flow_id,
+            node_id=3,
+            depending_on_id=2,
+            apply_input=input_schema.ApplyModelSettings(
+                source="upstream", upstream_node_id=2, output_column="prediction"
+            ),
+        )
+    )
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(2, 3))
+    flow.add_wait_for(
+        input_schema.NodeWaitFor(
+            flow_id=flow.flow_id,
+            node_id=4,
+            depending_on_ids=[3, 2],
+        )
+    )
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(3, 4, "main"))
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(2, 4, "right"))
+
+    code = export_flow_to_flowframe(flow)
+    verify_code_contains(code, ".wait_for(trained)")
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected = normalize_result(flow.get_node(4).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected)
+
+
+# Dynamic Rename round-trip tests
+
+
+def test_dynamic_rename_prefix_round_trip():
+    flow = create_basic_flow()
+    create_sample_dataframe_node(flow, node_id=1)
+    flow.add_dynamic_rename(
+        input_schema.NodeDynamicRename(
+            flow_id=flow.flow_id,
+            node_id=2,
+            depending_on_id=1,
+            dynamic_rename_input=transform_schema.DynamicRenameInput(
+                rename_mode="prefix", prefix="src_", selection_mode="all"
+            ),
+        )
+    )
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_flow_to_flowframe(flow)
+    verify_code_contains(code, ".dynamic_rename(mode='prefix', prefix='src_')")
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected)
+
+
+def test_dynamic_rename_suffix_with_columns_list_round_trip():
+    flow = create_basic_flow()
+    create_sample_dataframe_node(flow, node_id=1)
+    flow.add_dynamic_rename(
+        input_schema.NodeDynamicRename(
+            flow_id=flow.flow_id,
+            node_id=2,
+            depending_on_id=1,
+            dynamic_rename_input=transform_schema.DynamicRenameInput(
+                rename_mode="suffix",
+                suffix="_raw",
+                selection_mode="list",
+                selected_columns=["name"],
+            ),
+        )
+    )
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_flow_to_flowframe(flow)
+    verify_code_contains(code, "mode='suffix'", "suffix='_raw'", "columns=['name']")
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected)
+
+
+def test_dynamic_rename_data_type_round_trip():
+    flow = create_basic_flow()
+    create_sample_dataframe_node(flow, node_id=1)
+    flow.add_dynamic_rename(
+        input_schema.NodeDynamicRename(
+            flow_id=flow.flow_id,
+            node_id=2,
+            depending_on_id=1,
+            dynamic_rename_input=transform_schema.DynamicRenameInput(
+                rename_mode="prefix",
+                prefix="num_",
+                selection_mode="data_type",
+                selected_data_type="Numeric",
+            ),
+        )
+    )
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_flow_to_flowframe(flow)
+    verify_code_contains(code, "data_type='Numeric'")
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected)
+
+
+def test_dynamic_rename_formula_round_trip():
+    flow = create_basic_flow()
+    create_sample_dataframe_node(flow, node_id=1)
+    flow.add_dynamic_rename(
+        input_schema.NodeDynamicRename(
+            flow_id=flow.flow_id,
+            node_id=2,
+            depending_on_id=1,
+            dynamic_rename_input=transform_schema.DynamicRenameInput(
+                rename_mode="formula",
+                formula="uppercase([column_name])",
+                selection_mode="all",
+            ),
+        )
+    )
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_flow_to_flowframe(flow)
+    verify_code_contains(code, "mode='formula'", "uppercase([column_name])")
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected)
+
+
+def test_dynamic_rename_first_row_round_trip():
+    flow = create_basic_flow()
+    create_sample_dataframe_node(flow, node_id=1)
+    flow.add_dynamic_rename(
+        input_schema.NodeDynamicRename(
+            flow_id=flow.flow_id,
+            node_id=2,
+            depending_on_id=1,
+            dynamic_rename_input=transform_schema.DynamicRenameInput(
+                rename_mode="first_row", selection_mode="all"
+            ),
+        )
+    )
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_flow_to_flowframe(flow)
+    verify_code_contains(code, "mode='first_row'")
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected)
+
+
+# Polars-side: confirm these new node types are flagged as unsupported when
+# the user requests a pure-Polars export.
+
+
+@pytest.mark.parametrize(
+    "node_type",
+    ["train_model", "apply_model", "evaluate_model", "wait_for", "dynamic_rename"],
+)
+def test_new_nodes_unsupported_in_polars_export(node_type):
+    flow = create_basic_flow()
+    _create_predictions_dataframe_node(flow, node_id=1)
+    if node_type == "train_model":
+        flow.add_train_model(
+            input_schema.NodeTrainModel(
+                flow_id=flow.flow_id, node_id=2, depending_on_id=1,
+                train_input=input_schema.TrainModelSettings(
+                    target_column="y", feature_columns=["prediction"], model_type="linear_regression"
+                ),
+            )
+        )
+    elif node_type == "apply_model":
+        flow.add_apply_model(
+            input_schema.NodeApplyModel(
+                flow_id=flow.flow_id, node_id=2, depending_on_id=1,
+                apply_input=input_schema.ApplyModelSettings(
+                    source="catalog", model_name="m", output_column="pred"
+                ),
+            )
+        )
+    elif node_type == "evaluate_model":
+        flow.add_evaluate_model(
+            input_schema.NodeEvaluateModel(
+                flow_id=flow.flow_id, node_id=2, depending_on_id=1,
+                evaluate_input=input_schema.EvaluateModelSettings(
+                    actual_column="y", predicted_column="prediction"
+                ),
+            )
+        )
+    elif node_type == "wait_for":
+        # wait_for requires both inputs wired; a half-connected node is skipped
+        # from the export (like the run path) instead of raising.
+        _create_predictions_dataframe_node(flow, node_id=3)
+        flow.add_wait_for(
+            input_schema.NodeWaitFor(flow_id=flow.flow_id, node_id=2, depending_on_ids=[1, 3])
+        )
+        add_connection(flow, input_schema.NodeConnection.create_from_simple_input(3, 2, "right"))
+    elif node_type == "dynamic_rename":
+        flow.add_dynamic_rename(
+            input_schema.NodeDynamicRename(
+                flow_id=flow.flow_id, node_id=2, depending_on_id=1,
+                dynamic_rename_input=transform_schema.DynamicRenameInput(
+                    rename_mode="prefix", prefix="x_"
+                ),
+            )
+        )
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+    with pytest.raises(UnsupportedNodeError):
+        export_flow_to_polars(flow)
+
+
+# Multi-output node code generation: random_split + filter (split_mode)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_random_split_two_splits(export_func):
+    """random_split with seed: train (output-0) round-trips through code-gen."""
+    flow = create_basic_flow()
+    flow = create_sample_dataframe_node(flow)
+
+    flow.add_random_split(
+        input_schema.NodeRandomSplit(
+            flow_id=1,
+            node_id=2,
+            depending_on_id=1,
+            splits=[
+                input_schema.RandomSplitGroup(name="train", percentage=80.0),
+                input_schema.RandomSplitGroup(name="test", percentage=20.0),
+            ],
+            seed=42,
+        )
+    )
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code, "train = ", "test = ", "shuffle(seed=", "slice(")
+    else:
+        verify_code_contains(code, "train, test = ", ".random_split({", "seed=42")
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_random_split_three_splits(export_func):
+    """Three-way split: offset accumulator and last-split remainder are correct."""
+    flow = create_basic_flow()
+    flow = create_sample_dataframe_node(flow)
+
+    flow.add_random_split(
+        input_schema.NodeRandomSplit(
+            flow_id=1,
+            node_id=2,
+            depending_on_id=1,
+            splits=[
+                input_schema.RandomSplitGroup(name="train", percentage=60.0),
+                input_schema.RandomSplitGroup(name="val", percentage=30.0),
+                input_schema.RandomSplitGroup(name="test", percentage=10.0),
+            ],
+            seed=7,
+        )
+    )
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    verify_code_contains(code, "train", "val", "test")
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_random_split_per_handle_downstream(export_func):
+    """A record_count wired to output-1 (test) must read the test split, not train."""
+    flow = create_basic_flow()
+    flow = create_sample_dataframe_node(flow)
+
+    flow.add_random_split(
+        input_schema.NodeRandomSplit(
+            flow_id=1,
+            node_id=2,
+            depending_on_id=1,
+            splits=[
+                input_schema.RandomSplitGroup(name="train", percentage=60.0),
+                input_schema.RandomSplitGroup(name="test", percentage=40.0),
+            ],
+            seed=123,
+        )
+    )
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    flow.add_record_count(
+        input_schema.NodeRecordCount(flow_id=1, node_id=3, depending_on_id=2)
+    )
+    add_connection(
+        flow,
+        input_schema.NodeConnection.create_from_simple_input(2, 3, output_handle="output-1"),
+    )
+
+    code = export_func(flow)
+    verify_code_contains(code, "counted = test")
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(3).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_filter_split_mode_pass_and_fail(export_func):
+    """split_mode filter: downstream consumers wired to output-0/output-1 see pass/fail."""
+    flow = create_basic_flow()
+    flow = create_sample_dataframe_node(flow)
+
+    flow.add_filter(
+        input_schema.NodeFilter(
+            flow_id=1,
+            node_id=2,
+            depending_on_id=1,
+            filter_input=transform_schema.FilterInput(
+                advanced_filter='[age] > 30',
+                filter_type="advanced",
+            ),
+            split_mode=True,
+        )
+    )
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    flow.add_record_count(
+        input_schema.NodeRecordCount(flow_id=1, node_id=3, depending_on_id=2)
+    )
+    add_connection(
+        flow,
+        input_schema.NodeConnection.create_from_simple_input(2, 3, output_handle="output-1"),
+    )
+
+    code = export_func(flow)
+    verify_code_contains(code, "split_pass", "split_fail", "counted = split_fail.select(")
+    verify_if_execute(code)
+    result_df = normalize_result(get_result_from_generated_code(code))
+    expected_df = normalize_result(flow.get_node(3).get_resulting_data().data_frame)
+    assert_frame_equal(result_df, expected_df, check_row_order=False)
+
+
+# ---------------------------------------------------------------------------
+# Chain fusion: shape assertions (actually fused, boundaries preserved), on top
+# of the round-trip correctness the rest of the suite already guards.
+# ---------------------------------------------------------------------------
+
+
+def _count_pipeline_assignments(code: str) -> int:
+    """Number of top-level assignment statements inside run_etl_pipeline()."""
+    tree = ast.parse(code)
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "run_etl_pipeline")
+    return sum(isinstance(stmt, ast.Assign) for stmt in fn.body)
+
+
+def _basic_age_filter(node_id: int, depending_on_id: int) -> input_schema.NodeFilter:
+    return input_schema.NodeFilter(
+        flow_id=1,
+        node_id=node_id,
+        depending_on_id=depending_on_id,
+        filter_input=transform_schema.FilterInput(
+            mode="basic",
+            basic_filter=transform_schema.BasicFilter(field="age", filter_type=">=", filter_value="25"),
+        ),
+    )
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_fusion_linear_chain_collapses_to_single_pipe(export_func):
+    """A linear single-use chain fuses into one piped expression with no df_N ladder."""
+    flow = create_basic_flow()
+    flow = create_sample_dataframe_node(flow)  # node 1
+    flow.add_filter(_basic_age_filter(2, 1))
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+    flow.add_formula(input_schema.NodeFormula(
+        flow_id=1, node_id=3, depending_on_id=2,
+        function=transform_schema.FunctionInput(
+            field=transform_schema.FieldInput(name="bonus", data_type="Auto"),
+            function="[salary] * 2",
+        ),
+    ))
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(2, 3))
+    flow.add_sort(input_schema.NodeSort(
+        flow_id=1, node_id=4, depending_on_id=3,
+        sort_input=[transform_schema.SortByInput(column="age", how="asc")],
+    ))
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(3, 4))
+    flow.add_group_by(input_schema.NodeGroupBy(
+        flow_id=1, node_id=5, depending_on_id=4,
+        groupby_input=transform_schema.GroupByInput(agg_cols=[
+            transform_schema.AggColl("city", "groupby"),
+            transform_schema.AggColl("salary", "sum", "total_salary"),
+        ]),
+    ))
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(4, 5))
+
+    code = export_func(flow)
+    assert _count_pipeline_assignments(code) == 1
+    assert "df_" not in code, "no throwaway df_N ladder should remain"
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected = normalize_result(flow.get_node(5).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_fusion_keeps_named_boundaries_at_join(export_func):
+    """The join arm and the join stay named variables; the linear left run still fuses."""
+    flow = create_basic_flow()
+    flow.add_manual_input(input_schema.NodeManualInput(
+        flow_id=1, node_id=1,
+        raw_data_format=input_schema.RawData(
+            columns=[input_schema.MinimalFieldInfo(name="id", data_type="Integer"),
+                     input_schema.MinimalFieldInfo(name="age", data_type="Integer")],
+            data=[[1, 2, 3], [25, 30, 35]],
+        ),
+    ))
+    flow.add_filter(_basic_age_filter(2, 1))
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+    flow.add_manual_input(input_schema.NodeManualInput(
+        flow_id=1, node_id=3,
+        raw_data_format=input_schema.RawData(
+            columns=[input_schema.MinimalFieldInfo(name="id", data_type="Integer"),
+                     input_schema.MinimalFieldInfo(name="city", data_type="String")],
+            data=[[1, 2, 3], ["NYC", "LA", "Chicago"]],
+        ),
+    ))
+    flow.add_join(input_schema.NodeJoin(
+        flow_id=1, node_id=4, depending_on_ids=[2, 3],
+        join_input=transform_schema.JoinInput(
+            join_mapping=[transform_schema.JoinMap("id", "id")],
+            left_select=[transform_schema.SelectInput("id"), transform_schema.SelectInput("age")],
+            right_select=[transform_schema.SelectInput("id"), transform_schema.SelectInput("city")],
+            how="inner",
+        ),
+    ))
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(2, 4, 'main'))
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(3, 4, 'right'))
+    flow.add_group_by(input_schema.NodeGroupBy(
+        flow_id=1, node_id=5, depending_on_id=4,
+        groupby_input=transform_schema.GroupByInput(agg_cols=[
+            transform_schema.AggColl("city", "groupby"),
+            transform_schema.AggColl("id", "count", "n"),
+        ]),
+    ))
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(4, 5))
+
+    code = export_func(flow)
+    # left arm (filtered) + right source + join (+ group_by) stay separate statements
+    assert _count_pipeline_assignments(code) >= 3
+    if export_func is export_flow_to_polars:
+        verify_code_contains(code, "filtered", "joined")
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected = normalize_result(flow.get_node(5).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected, check_row_order=False)
+
+
+def test_fusion_grouped_record_id_self_reference_preserved():
+    """Grouped record_id reads its input's .columns, so that input must stay named."""
+    flow = create_basic_flow()
+    flow = create_sample_dataframe_node(flow)  # node 1 (has 'city')
+    flow.add_filter(_basic_age_filter(2, 1))
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+    flow.add_record_id(input_schema.NodeRecordId(
+        flow_id=1, node_id=3, depending_on_id=2,
+        record_id_input=transform_schema.RecordIdInput(
+            output_column_name="row_num", offset=1, group_by=True, group_by_columns=["city"],
+        ),
+    ))
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(2, 3))
+    flow.add_group_by(input_schema.NodeGroupBy(
+        flow_id=1, node_id=4, depending_on_id=3,
+        groupby_input=transform_schema.GroupByInput(agg_cols=[
+            transform_schema.AggColl("city", "groupby"),
+            transform_schema.AggColl("row_num", "max", "max_row"),
+        ]),
+    ))
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(3, 4))
+
+    code = export_flow_to_polars(flow)
+    # Frame-equality would NameError if the .columns self-reference's target were fused away.
+    assert _count_pipeline_assignments(code) >= 2
+    assert "+ 1 - 1" not in code
+    assert "+ 0" not in code
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected = normalize_result(flow.get_node(4).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+@pytest.mark.parametrize("offset", [1, 0, 5])
+def test_fusion_record_id_offset_folding(export_func, offset):
+    """The (offset - 1) shift is folded: offset=1 -> none, 0 -> '- 1', 5 -> '+ 4'."""
+    flow = create_basic_flow()
+    flow = create_sample_dataframe_node(flow)
+    flow.add_record_id(input_schema.NodeRecordId(
+        flow_id=1, node_id=2, depending_on_id=1,
+        record_id_input=transform_schema.RecordIdInput(
+            output_column_name="row_num", offset=offset, group_by=True, group_by_columns=["city"],
+        ),
+    ))
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    assert "+ 1 - 1" not in code
+    if export_func is export_flow_to_flowframe:
+        assert f".with_row_index(\"row_num\", offset={offset}, group_by=['city'])" in code
+    elif offset == 1:
+        assert "+ 0" not in code
+        assert ".over(['city']))" in code
+    elif offset == 0:
+        assert " - 1)" in code
+    else:  # offset == 5
+        assert " + 4)" in code
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected, check_row_order=False)
+
+
+def test_fusion_explore_data_elided_mid_chain():
+    """explore_data between two transforms is elided; the chain fuses straight through it."""
+    flow = create_basic_flow()
+    flow = create_sample_dataframe_node(flow)  # node 1
+    flow.add_sort(input_schema.NodeSort(
+        flow_id=1, node_id=2, depending_on_id=1,
+        sort_input=[transform_schema.SortByInput(column="age", how="asc")],
+    ))
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+    flow.add_node_promise(input_schema.NodePromise(node_id=3, flow_id=1, node_type="explore_data"))
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(2, 3))
+    flow.add_explore_data(input_schema.NodeExploreData(flow_id=1, node_id=3, depending_on_id=2))
+    flow.add_filter(_basic_age_filter(4, 3))
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(3, 4))
+
+    code = export_flow_to_polars(flow)
+    assert "Pass through" not in code
+    assert _count_pipeline_assignments(code) == 1  # source.sort().filter() collapses to one pipe
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected = normalize_result(flow.get_node(4).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected, check_row_order=False)
+
+
+def test_fusion_node_reference_pins_variable():
+    """A node_reference keeps that node as its own named statement, unfused."""
+    flow = create_basic_flow()
+    flow.add_manual_input(input_schema.NodeManualInput(
+        flow_id=1, node_id=1, node_reference="raw",
+        raw_data_format=input_schema.RawData(
+            columns=[input_schema.MinimalFieldInfo(name="city", data_type="String"),
+                     input_schema.MinimalFieldInfo(name="age", data_type="Integer")],
+            data=[["NYC", "LA", "NYC"], [25, 30, 35]],
+        ),
+    ))
+    flow.add_filter(_basic_age_filter(2, 1))
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+    flow.add_group_by(input_schema.NodeGroupBy(
+        flow_id=1, node_id=3, depending_on_id=2,
+        groupby_input=transform_schema.GroupByInput(agg_cols=[
+            transform_schema.AggColl("city", "groupby"),
+            transform_schema.AggColl("age", "sum", "total_age"),
+        ]),
+    ))
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(2, 3))
+
+    code = export_flow_to_polars(flow)
+    assert "raw = " in code  # the pinned source survives fusion as its own statement
+    assert _count_pipeline_assignments(code) >= 2
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected = normalize_result(flow.get_node(3).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected, check_row_order=False)
+
+
+# ---------------------------------------------------------------------------
+# Code-generator review regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_catalog_reader_id_only_is_unsupported():
+    """An ID-only catalog reader cannot map to ff.read_catalog_table (needs a name)."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToFlowFrameConverter
+
+    flow = create_basic_flow()
+    catalog_reader = input_schema.NodeCatalogReader(flow_id=1, node_id=1, catalog_table_id=42)
+
+    converter = FlowGraphToFlowFrameConverter(flow)
+    converter._handle_catalog_reader(catalog_reader, "df_1", {})
+
+    assert converter.code_lines == []
+    assert len(converter.unsupported_nodes) == 1
+    assert "table id only" in converter.unsupported_nodes[0][2].lower()
+
+
+def test_catalog_sql_reader_flowframe_emits_valid_call():
+    """Catalog SQL reads are FlowFrame-only; the FlowFrame target emits a valid read_catalog_sql.
+
+    The Polars converter marks catalog readers unsupported, so the SQL path only
+    runs under FlowFrame (no .data suffix), and embedded triple-quotes are escaped.
+    """
+    from flowfile_core.flowfile.code_generator.code_generator import (
+        FlowGraphToFlowFrameConverter,
+        FlowGraphToPolarsConverter,
+    )
+
+    flow = create_basic_flow()
+    catalog_reader = input_schema.NodeCatalogReader(flow_id=1, node_id=1, sql_query='SELECT """x""" FROM t')
+
+    ff_conv = FlowGraphToFlowFrameConverter(flow)
+    ff_conv._handle_catalog_reader(catalog_reader, "df_1", {})
+    ff_code = "\n".join(ff_conv.code_lines)
+    assert "ff.read_catalog_sql(" in ff_code
+    assert ".data" not in ff_code
+    ast.parse(ff_code)
+
+    pl_conv = FlowGraphToPolarsConverter(flow)
+    pl_conv._handle_catalog_reader(catalog_reader, "df_1", {})
+    assert pl_conv.code_lines == []
+    assert len(pl_conv.unsupported_nodes) == 1
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+@pytest.mark.parametrize("how", ["semi", "anti"])
+def test_semi_anti_join_passes_left_through_unchanged(join_input_large_dataset, how, export_func):
+    """Semi/anti joins pass all left columns through unchanged (left rename/drop ignored), and
+    the generated code matches the runtime."""
+    flow = create_basic_flow()
+    left_data, right_data = join_input_large_dataset
+    flow.add_manual_input(left_data)
+    flow.add_manual_input(right_data)
+
+    join_node = input_schema.NodeJoin(
+        flow_id=1,
+        node_id=3,
+        depending_on_ids=[1, 2],
+        join_input=transform_schema.JoinInput(
+            join_mapping=[transform_schema.JoinMap("ID", "ID")],
+            left_select=[
+                transform_schema.SelectInput("ID"),
+                transform_schema.SelectInput("Name", "left_name"),
+                transform_schema.SelectInput("Address", keep=False),
+                transform_schema.SelectInput("Zipcode"),
+            ],
+            right_select=[
+                transform_schema.SelectInput("ID"),
+                transform_schema.SelectInput("Name"),
+                transform_schema.SelectInput("City"),
+            ],
+            how=how,
+        ),
+    )
+    flow.add_join(join_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 3, "main"))
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(2, 3, "right"))
+
+    code = export_func(flow)
+    verify_if_execute(code)
+    # Left passes through unchanged: the left_select rename (Name -> left_name) and drop
+    # (Address keep=False) are ignored for semi/anti joins.
+    runtime_cols = set(flow.get_node(3).get_resulting_data().columns)
+    assert runtime_cols == {"ID", "Name", "Address", "Zipcode"}
+    result = normalize_result(get_result_from_generated_code(code))
+    expected = normalize_result(flow.get_node(3).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected, check_column_order=False, check_row_order=False)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+@pytest.mark.parametrize("how", ["inner", "left", "right", "outer"])
+def test_join_renamed_unkept_non_join_key_does_not_crash(join_input_large_dataset, how, export_func):
+    """A non-join-key column renamed AND keep=False must not rename-then-drop crash."""
+    flow = create_basic_flow()
+    left_data, right_data = join_input_large_dataset
+    flow.add_manual_input(left_data)
+    flow.add_manual_input(right_data)
+
+    join_node = input_schema.NodeJoin(
+        flow_id=1,
+        node_id=3,
+        depending_on_ids=[1, 2],
+        join_input=transform_schema.JoinInput(
+            join_mapping=[transform_schema.JoinMap("ID", "ID")],
+            left_select=[
+                transform_schema.SelectInput("ID"),
+                transform_schema.SelectInput("Name"),
+                transform_schema.SelectInput("Address", "addr", keep=False),
+                transform_schema.SelectInput("Zipcode"),
+            ],
+            right_select=[
+                transform_schema.SelectInput("ID"),
+                transform_schema.SelectInput("Name", "r_name", keep=False),
+                transform_schema.SelectInput("City"),
+            ],
+            how=how,
+        ),
+    )
+    flow.add_join(join_node)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 3, "main"))
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(2, 3, "right"))
+
+    code = export_func(flow)
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected = normalize_result(flow.get_node(3).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected, check_column_order=False, check_row_order=False)
+
+
+def test_random_split_named_pl_does_not_shadow_import():
+    """A split literally named ``pl`` must be uniquified so it can't shadow ``import polars as pl``."""
+    flow = create_basic_flow()
+    flow = create_sample_dataframe_node(flow)
+
+    flow.add_random_split(
+        input_schema.NodeRandomSplit(
+            flow_id=1,
+            node_id=2,
+            depending_on_id=1,
+            splits=[
+                input_schema.RandomSplitGroup(name="pl", percentage=50.0),
+                input_schema.RandomSplitGroup(name="rest", percentage=50.0),
+            ],
+            seed=1,
+        )
+    )
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+    # Wire a record_count onto the "pl" split: its emitted pl.len() would break if "pl" shadowed the import.
+    flow.add_record_count(input_schema.NodeRecordCount(flow_id=1, node_id=3, depending_on_id=2))
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(2, 3, output_handle="output-0"))
+
+    code = export_flow_to_polars(flow)
+    assert "import polars as pl" in code
+    assert "\npl = " not in code  # the split was renamed, not bound to the import alias
+    verify_if_execute(code)
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+@pytest.mark.parametrize("special_value", ['say "hi"', "C:\\temp", "back\\slash"])
+def test_basic_filter_value_with_special_chars_is_escaped(export_func, special_value):
+    """A filter value with a quote/backslash must be escaped: a quote would be a
+    SyntaxError, an unescaped backslash a silent mismatch (``\\t`` -> tab)."""
+    flow = create_basic_flow()
+    flow.add_manual_input(
+        input_schema.NodeManualInput(
+            flow_id=1,
+            node_id=1,
+            raw_data_format=input_schema.RawData(
+                columns=[
+                    input_schema.MinimalFieldInfo(name="id", data_type="Integer"),
+                    input_schema.MinimalFieldInfo(name="label", data_type="String"),
+                ],
+                data=[[1, 2, 3], ["plain", special_value, "other"]],
+            ),
+        )
+    )
+    flow.add_filter(
+        input_schema.NodeFilter(
+            flow_id=1,
+            node_id=2,
+            depending_on_id=1,
+            filter_input=transform_schema.FilterInput(
+                mode="basic",
+                basic_filter=transform_schema.BasicFilter(
+                    field="label",
+                    operator=transform_schema.FilterOperator.EQUALS,
+                    value=special_value,
+                ),
+            ),
+        )
+    )
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+
+    code = export_func(flow)
+    ast.parse(code)  # an unescaped quote in the value would make this raise
+    result = normalize_result(get_result_from_generated_code(code))
+    assert result["label"].to_list() == [special_value]
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_fuzzy_match_left_drop_uses_node_local_temp(fuzzy_join_left_data, export_func):
+    """A fuzzy-match left drop goes into a node-local temp instead of rebinding the
+    upstream frame, so a fanned-out sibling consumer keeps the original columns."""
+    flow = create_basic_flow(1)
+    flow.add_manual_input(fuzzy_join_left_data)
+    flow.add_manual_input(
+        input_schema.NodeManualInput(
+            flow_id=1,
+            node_id=2,
+            raw_data_format=input_schema.RawData(
+                columns=[
+                    input_schema.MinimalFieldInfo(name="name", data_type="String"),
+                    input_schema.MinimalFieldInfo(name="city", data_type="String"),
+                ],
+                data=[["Edward", "Charles"], ["Amsterdam", "London"]],
+            ),
+        )
+    )
+    settings = input_schema.NodeFuzzyMatch(
+        flow_id=1,
+        node_id=3,
+        description="",
+        auto_generate_selection=True,
+        join_input=transform_schema.FuzzyMatchInput(
+            join_mapping=[FuzzyMapping("name", threshold_score=75.0)],
+            left_select=[
+                transform_schema.SelectInput(old_name="id", keep=True),
+                transform_schema.SelectInput(old_name="name", keep=True),
+                transform_schema.SelectInput(old_name="address", keep=False),
+            ],
+            right_select=[
+                transform_schema.SelectInput(old_name="name", keep=True),
+                transform_schema.SelectInput(old_name="city", keep=True),
+            ],
+        ),
+    )
+    flow.add_fuzzy_match(settings)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 3, input_type="main"))
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(2, 3, input_type="right"))
+
+    code = export_func(flow)
+    assert "_fuzzy_left_3" in code  # the drop lands in a temp, not a rebind of the input var
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected = normalize_result(flow.get_node(3).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected, check_dtypes=False, check_row_order=False, check_column_order=False)
+
+
+def _fuzzy_match_flow(left: dict, right: dict | None, mapping, left_select, right_select) -> FlowGraph:
+    """Manual inputs 1 (left) and 2 (right) into fuzzy match 3; with ``right`` None, input 1 feeds both sides."""
+    flow = create_basic_flow()
+    sources = ((1, left),) if right is None else ((1, left), (2, right))
+    for node_id, columns in sources:
+        flow.add_manual_input(
+            input_schema.NodeManualInput(
+                flow_id=1,
+                node_id=node_id,
+                raw_data_format=input_schema.RawData.from_pylist(
+                    [dict(zip(columns, row)) for row in zip(*columns.values())]
+                ),
+            )
+        )
+    right_id = 1 if right is None else 2
+    flow.add_fuzzy_match(
+        input_schema.NodeFuzzyMatch(
+            flow_id=1,
+            node_id=3,
+            depending_on_ids=[1, right_id],
+            join_input=transform_schema.FuzzyMatchInput(
+                join_mapping=mapping, left_select=left_select, right_select=right_select
+            ),
+        )
+    )
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 3, input_type="main"))
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(right_id, 3, input_type="right"))
+    return flow
+
+
+def _assert_fuzzy_export_matches_the_node(flow: FlowGraph, code: str) -> pl.DataFrame:
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected = normalize_result(flow.get_node(3).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected, check_dtypes=False, check_row_order=False, check_column_order=False)
+    return expected
+
+
+_INTERNAL = {"id": [1, 2], "product_name": ["Apple MacBook Pro 16-inch", "Samsung Galaxy S24 Ultra"], "sku": ["A", "B"]}
+_SUPPLIER = {"supplier_id": [7, 8], "product_name": ["MacBook Pro 16in Apple", "Galaxy S24 Ultra Samsung"]}
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_fuzzy_match_renaming_its_key_columns_renames_before_matching(export_func):
+    """The product-match template: both keys are renamed by the selects, which the node applies before it matches
+    (its score column is named after the new names), so the export renames first too."""
+    flow = _fuzzy_match_flow(
+        _INTERNAL,
+        _SUPPLIER,
+        [FuzzyMapping("product_name", threshold_score=30.0)],
+        left_select=[
+            transform_schema.SelectInput(old_name="id", new_name="internal_id"),
+            transform_schema.SelectInput(old_name="product_name", new_name="internal_name"),
+            transform_schema.SelectInput(old_name="sku"),
+        ],
+        right_select=[
+            transform_schema.SelectInput(old_name="supplier_id"),
+            transform_schema.SelectInput(old_name="product_name", new_name="supplier_name"),
+        ],
+    )
+    expected = _assert_fuzzy_export_matches_the_node(flow, export_func(flow))
+    assert "internal_name_vs_supplier_name_levenshtein" in expected.columns
+
+
+_S = transform_schema.SelectInput
+_FUZZY_SELECT_CASES = {
+    "drop_and_rename_on_one_side": (
+        [_S(old_name="id", new_name="internal_id"), _S(old_name="product_name"), _S(old_name="sku", keep=False)],
+        [_S(old_name="supplier_id"), _S(old_name="product_name")],
+    ),
+    "dropped_key_renamed": (
+        [_S(old_name="id"), _S(old_name="product_name", new_name="name", keep=False), _S(old_name="sku")],
+        [_S(old_name="supplier_id"), _S(old_name="product_name")],
+    ),
+    "key_renamed_to_a_name_with_a_quote": (
+        [_S(old_name="id"), _S(old_name="product_name"), _S(old_name="sku")],
+        [_S(old_name="supplier_id"), _S(old_name="product_name", new_name="supplier's name")],
+    ),
+    "rename_of_a_column_no_longer_in_the_input": (
+        [_S(old_name="id"), _S(old_name="product_name"), _S(old_name="gone", new_name="was_gone")],
+        [_S(old_name="supplier_id"), _S(old_name="product_name")],
+    ),
+    "present_column_saved_as_unavailable": (
+        [_S(old_name="id", new_name="internal_id", is_available=False), _S(old_name="product_name")],
+        [_S(old_name="supplier_id"), _S(old_name="product_name")],
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(_FUZZY_SELECT_CASES))
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_fuzzy_match_select_edge_cases_export_like_the_node(case, export_func):
+    """Drops and renames on one side, a dropped key, a quoted name and stale entries all export as the node runs."""
+    left_select, right_select = _FUZZY_SELECT_CASES[case]
+    mapping = [FuzzyMapping("product_name", threshold_score=30.0)]
+    flow = _fuzzy_match_flow(_INTERNAL, _SUPPLIER, mapping, left_select, right_select)
+    _assert_fuzzy_export_matches_the_node(flow, export_func(flow))
+
+
+@pytest.mark.parametrize("export_func", [export_flow_to_polars, export_flow_to_flowframe], ids=["polars", "flowframe"])
+def test_fuzzy_match_of_an_input_with_itself_renames_both_sides(export_func):
+    flow = _fuzzy_match_flow(
+        _INTERNAL,
+        None,
+        [FuzzyMapping("product_name", threshold_score=30.0)],
+        left_select=[_S(old_name="id", new_name="left_id"), _S(old_name="product_name", new_name="left_name")],
+        right_select=[_S(old_name="id", new_name="right_id"), _S(old_name="product_name", new_name="right_name")],
+    )
+    code = export_func(flow)
+    assert "df_right = " in code
+    _assert_fuzzy_export_matches_the_node(flow, code)
+
+
+def test_rest_api_reader_redacts_sensitive_headers():
+    """A token placed directly in a header/param is redacted, not emitted verbatim."""
+    from flowfile_core.flowfile.code_generator.code_generator import FlowGraphToPolarsConverter
+
+    flow = create_basic_flow()
+    reader = _make_rest_api_reader(
+        url="https://api.example.com/users",
+        headers={"Authorization": "Bearer secret-token-123", "Accept": "application/json"},
+        query_params={"api_key": "leak-me-please", "lang": "en"},
+    )
+
+    converter = FlowGraphToPolarsConverter(flow)
+    converter._handle_rest_api_reader(reader, "df_1", {})
+
+    code = "\n".join(converter.code_lines)
+    assert "secret-token-123" not in code
+    assert "leak-me-please" not in code
+    assert "redacted" in code
+    verify_code_contains(code, "Accept", "application/json", "lang", "en")
+    ast.parse(code)
+
+
+# Multi-Field Formula round-trip tests
+
+
+def _add_multi_field_formula(flow: FlowGraph, **settings) -> FlowGraph:
+    flow.add_multi_field_formula(
+        input_schema.NodeMultiFieldFormula(
+            flow_id=flow.flow_id,
+            node_id=2,
+            depending_on_id=1,
+            multi_field_formula_input=transform_schema.MultiFieldFormulaInput(**settings),
+        )
+    )
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+    return flow
+
+
+def test_multi_field_formula_replace_all_round_trip():
+    flow = create_basic_flow()
+    create_sample_dataframe_node(flow, node_id=1)
+    _add_multi_field_formula(flow, formula="to_string([_CurrentField_])", selection_mode="all")
+
+    code = export_flow_to_flowframe(flow)
+    verify_code_contains(code, ".multi_field_formula('to_string([_CurrentField_])')")
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected)
+
+
+def test_multi_field_formula_list_with_prefix_round_trip():
+    flow = create_basic_flow()
+    create_sample_dataframe_node(flow, node_id=1)
+    _add_multi_field_formula(
+        flow,
+        formula="[_CurrentField_] * 2",
+        selection_mode="list",
+        selected_columns=["age", "salary"],
+        output_mode="new",
+        output_prefix="dbl_",
+    )
+
+    code = export_flow_to_flowframe(flow)
+    verify_code_contains(
+        code, ".multi_field_formula('[_CurrentField_] * 2'", "columns=['age', 'salary']", "prefix='dbl_'"
+    )
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected)
+    assert "dbl_age" in result.columns
+
+
+def test_multi_field_formula_data_type_with_suffix_and_cast_round_trip():
+    flow = create_basic_flow()
+    create_sample_dataframe_node(flow, node_id=1)
+    _add_multi_field_formula(
+        flow,
+        formula="[_CurrentField_] / 100",
+        selection_mode="data_type",
+        selected_data_type="Numeric",
+        output_mode="new",
+        output_suffix=" pct",
+        output_data_type="Float64",
+    )
+
+    code = export_flow_to_flowframe(flow)
+    verify_code_contains(code, "data_type='Numeric'", "suffix=' pct'", "output_data_type='Float64'")
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected)
+    assert result.schema["age pct"] == pl.Float64
+
+
+def test_multi_field_formula_without_a_data_type_exports_an_empty_column_list():
+    """`data_type` mode with nothing selected picks no columns; omitting the kwarg would mean 'all'."""
+    flow = create_basic_flow()
+    create_sample_dataframe_node(flow, node_id=1)
+    _add_multi_field_formula(
+        flow,
+        formula="to_string([_CurrentField_])",
+        selection_mode="data_type",
+        selected_data_type=None,
+    )
+
+    code = export_flow_to_flowframe(flow)
+    verify_code_contains(code, "columns=[]")
+    # Anchored so the assertion cannot be satisfied by the `output_data_type=` kwarg.
+    assert re.search(r"(?<!output_)data_type=", code) is None
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected)
+    assert result.schema["id"] == pl.Int64  # the no-op left the input untouched
+
+
+def test_multi_field_formula_enum_output_data_type_round_trip():
+    """A `DataType` enum has to render as its plain value; `repr()` would emit `Types.Float64`."""
+    flow = create_basic_flow()
+    create_sample_dataframe_node(flow, node_id=1)
+    _add_multi_field_formula(
+        flow,
+        formula="[_CurrentField_] * 2",
+        selection_mode="list",
+        selected_columns=["age"],
+        output_data_type=DataType.Float64,
+    )
+
+    code = export_flow_to_flowframe(flow)
+    verify_code_contains(code, "output_data_type='Float64'")
+    assert "Types." not in code
+    verify_if_execute(code)
+    result = normalize_result(get_result_from_generated_code(code))
+    expected = normalize_result(flow.get_node(2).get_resulting_data().data_frame)
+    assert_frame_equal(result, expected)
+
+
+def test_multi_field_formula_new_mode_without_an_affix_is_unsupported():
+    """The engine refuses this node; exporting it as a replace call would overwrite the sources."""
+    flow = create_basic_flow()
+    create_sample_dataframe_node(flow, node_id=1)
+    _add_multi_field_formula(
+        flow,
+        formula="[_CurrentField_] * 2",
+        selection_mode="list",
+        selected_columns=["age"],
+        output_mode="new",
+    )
+
+    with pytest.raises(UnsupportedNodeError) as excinfo:
+        export_flow_to_flowframe(flow)
+    assert excinfo.value.node_type == "multi_field_formula"
+
+
+def test_multi_field_formula_is_unsupported_in_polars_export():
+    flow = create_basic_flow()
+    create_sample_dataframe_node(flow, node_id=1)
+    _add_multi_field_formula(flow, formula="to_string([_CurrentField_])", selection_mode="all")
+
+    with pytest.raises(UnsupportedNodeError) as excinfo:
+        export_flow_to_polars(flow)
+    assert excinfo.value.node_type == "multi_field_formula"
+    assert "multi_field_formula" in str(excinfo.value)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__])

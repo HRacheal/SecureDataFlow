@@ -1,0 +1,96 @@
+"""Flow Catalog service layer.
+
+Public interface:
+
+* ``CatalogService`` — business-logic orchestrator
+* ``CatalogRepository`` — data-access protocol (for type-hints / mocking)
+* ``SQLAlchemyCatalogRepository`` — concrete SQLAlchemy implementation
+* Domain exceptions (``CatalogError`` hierarchy)
+"""
+
+from .exceptions import (
+    AmbiguousFlowError,
+    AmbiguousTableError,
+    CatalogError,
+    CdcCursorNotFoundError,
+    CdcCursorsAtRiskError,
+    CdcNotSupportedError,
+    DashboardNotFoundError,
+    FavoriteNotFoundError,
+    FlowAlreadyRunningError,
+    FlowExistsError,
+    FlowHasArtifactsError,
+    FlowNotFoundError,
+    FollowNotFoundError,
+    InvalidNamespaceStorageError,
+    NamespaceExistsError,
+    NamespaceNotEmptyError,
+    NamespaceNotFoundError,
+    NamespaceStorageLockedError,
+    NestingLimitError,
+    NoSnapshotError,
+    NotAuthorizedError,
+    NotAVirtualTableError,
+    NotebookExistsError,
+    NotebookNotFoundError,
+    RunNotFoundError,
+    ScheduleConflictError,
+    ScheduleNotFoundError,
+    SeededNamespaceError,
+    StaleWriteError,
+    TableExistsError,
+    TableFavoriteNotFoundError,
+    TableNotFoundError,
+    TableVersionUnavailableError,
+    VisualizationComputeError,
+    VisualizationExistsError,
+    VisualizationNotFoundError,
+    WorkerUnavailableError,
+)
+from .repository import CatalogRepository, SQLAlchemyCatalogRepository
+from .service import CatalogService
+from .services.tables import KEEP_PREDICTION
+
+__all__ = [
+    "CatalogService",
+    "KEEP_PREDICTION",
+    "CatalogRepository",
+    "SQLAlchemyCatalogRepository",
+    "CatalogError",
+    "NamespaceNotFoundError",
+    "NamespaceExistsError",
+    "NestingLimitError",
+    "NamespaceNotEmptyError",
+    "SeededNamespaceError",
+    "NamespaceStorageLockedError",
+    "InvalidNamespaceStorageError",
+    "FlowHasArtifactsError",
+    "FlowNotFoundError",
+    "FlowExistsError",
+    "RunNotFoundError",
+    "NotAuthorizedError",
+    "FavoriteNotFoundError",
+    "FollowNotFoundError",
+    "NoSnapshotError",
+    "ScheduleNotFoundError",
+    "ScheduleConflictError",
+    "FlowAlreadyRunningError",
+    "TableNotFoundError",
+    "TableVersionUnavailableError",
+    "TableExistsError",
+    "TableFavoriteNotFoundError",
+    "NotAVirtualTableError",
+    "WorkerUnavailableError",
+    "AmbiguousTableError",
+    "AmbiguousFlowError",
+    "StaleWriteError",
+    "VisualizationNotFoundError",
+    "VisualizationExistsError",
+    "VisualizationComputeError",
+    "DashboardNotFoundError",
+    "NotebookNotFoundError",
+    "NotebookExistsError",
+    "CdcNotSupportedError",
+    "CdcCursorNotFoundError",
+    "CdcCursorsAtRiskError",
+]

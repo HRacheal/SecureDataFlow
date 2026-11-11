@@ -1,0 +1,1524 @@
+"""Tests for virtual flow table catalog writer and upstream laziness checking.
+
+Covers:
+- Virtual catalog writer: creates virtual tables without materializing data
+- Virtual writer requires a source_registration_id
+- Serialized lazy frame storage and is_optimized flag
+- check_flow_laziness / check_upstream_laziness scoping
+- FlowRegistration.flow_path usage (regression for file_path AttributeError)
+- Source table version tracking and staleness detection
+- Virtual table previews read through a backend with the protocol flag on
+- A virtual table's producer runs on the execution context's backend, and a stopped worker answers 503
+"""
+
+import json
+import tempfile
+
+import polars as pl
+import pytest
+from fastapi.testclient import TestClient
+
+from flowfile_core import main
+from flowfile_core.catalog import CatalogService
+from flowfile_core.catalog.delta_utils import check_source_versions_current
+from flowfile_core.catalog.repository import SQLAlchemyCatalogRepository
+from flowfile_core.catalog.services import previews
+from flowfile_core.catalog.services import virtual_tables as virtual_tables_module
+from flowfile_core.database.connection import get_db_context
+from flowfile_core.database.models import (
+    FlowRegistration,
+    FlowSchedule,
+)
+from flowfile_core.flowfile.execution import registry
+from flowfile_core.flowfile.execution.backends.worker import WorkerBackend
+from flowfile_core.flowfile.execution.context import ExecutionContext, use_context
+from flowfile_core.flowfile.flow_graph import add_connection
+from flowfile_core.schemas import input_schema
+from flowfile_core.schemas.transform_schema import BasicFilter, FilterInput, PivotInput
+from shared.compute_protocol import WorkerLocation
+from shared.delta_models import SourceTableVersion
+from tests.conftest import closed_url
+from tests.flowfile.conftest import (
+    CATALOG_SAMPLE_DATA as SAMPLE_DATA,
+)
+from tests.flowfile.conftest import (
+    add_test_catalog_writer as _add_catalog_writer,
+)
+from tests.flowfile.conftest import (
+    add_test_manual_input as _add_manual_input,
+)
+from tests.flowfile.conftest import (
+    catalog_cleanup as _cleanup,
+)
+from tests.flowfile.conftest import (
+    create_test_flow_registration as _create_flow_registration,
+)
+from tests.flowfile.conftest import (
+    create_test_graph as _create_graph,
+)
+from tests.flowfile.conftest import (
+    create_test_namespace as _create_namespace,
+)
+from tests.flowfile.conftest import (
+    run_test_graph as _run_graph,
+)
+
+
+@pytest.fixture()
+def catalog_service() -> CatalogService:
+    with get_db_context() as db:
+        repo = SQLAlchemyCatalogRepository(db)
+        yield CatalogService(repo)
+
+
+@pytest.fixture()
+def lazy_virtual_table_id() -> int:
+    ns_id = _create_namespace()
+    with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False) as f:
+        flow_path = f.name
+    reg_id = _create_flow_registration(ns_id, name="lazy_flow", path=flow_path)
+    graph = _create_graph(source_registration_id=reg_id)
+    _add_manual_input(graph, SAMPLE_DATA, node_id=1)
+
+    # Node 2: filter (lazy operation)
+    promise_filter = input_schema.NodePromise(flow_id=graph.flow_id, node_id=2, node_type="filter")
+    graph.add_node_promise(promise_filter)
+    filter_settings = input_schema.NodeFilter(
+        flow_id=graph.flow_id,
+        node_id=2,
+        depending_on_id=1,
+        filter_input=FilterInput(
+            mode="basic",
+            basic_filter=BasicFilter(field="age", operator="greater_than", value="28"),
+        ),
+    )
+    graph.add_filter(filter_settings)
+    add_connection(graph, input_schema.NodeConnection.create_from_simple_input(from_id=1, to_id=2))
+
+    _add_catalog_writer(
+        graph,
+        node_id=3,
+        depending_on_id=2,
+        table_name="lazy_virtual",
+        namespace_id=ns_id,
+        write_mode="virtual",
+    )
+
+    _run_graph(graph)
+    graph.save_flow(flow_path)
+
+    with get_db_context() as db:
+        repo = SQLAlchemyCatalogRepository(db)
+        tables = repo.list_tables(namespace_id=ns_id)
+        table = next(t for t in tables if t.name == "lazy_virtual")
+
+    return table.id
+
+
+@pytest.fixture()
+def eager_virtual_table_id() -> int:
+    ns_id = _create_namespace()
+    with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False) as f:
+        flow_path = f.name
+    reg_id = _create_flow_registration(ns_id, name="eager_flow", path=flow_path)
+    graph = _create_graph(source_registration_id=reg_id)
+
+    _add_manual_input(graph, SAMPLE_DATA, node_id=1)
+
+    # Node 2: pivot (eager operation)
+    promise_pivot = input_schema.NodePromise(flow_id=graph.flow_id, node_id=2, node_type="pivot")
+    graph.add_node_promise(promise_pivot)
+    pivot_settings = input_schema.NodePivot(
+        flow_id=graph.flow_id,
+        node_id=2,
+        depending_on_id=1,
+        pivot_input=PivotInput(
+            index_columns=["name"],
+            pivot_column="city",
+            value_col="age",
+            aggregations=["first"],
+        ),
+    )
+    graph.add_pivot(pivot_settings)
+    add_connection(graph, input_schema.NodeConnection.create_from_simple_input(from_id=1, to_id=2))
+
+    _add_catalog_writer(
+        graph,
+        node_id=3,
+        depending_on_id=2,
+        table_name="eager_virtual",
+        namespace_id=ns_id,
+        write_mode="virtual",
+    )
+
+    _run_graph(graph)
+    graph.save_flow(flow_path)
+
+    with get_db_context() as db:
+        repo = SQLAlchemyCatalogRepository(db)
+        tables = repo.list_tables(namespace_id=ns_id)
+        table = next(t for t in tables if t.name == "eager_virtual")
+
+    return table.id
+
+
+@pytest.fixture(autouse=True)
+def clean_state():
+    _cleanup()
+    yield
+    _cleanup()
+
+
+class TestVirtualCatalogWriter:
+    """Test that catalog_writer nodes in virtual mode create non-materialized tables."""
+
+    def test_virtual_writer_creates_virtual_table(self):
+        """Running a flow with a virtual catalog_writer should create a CatalogTable
+        with table_type='virtual' and no physical file."""
+        ns_id = _create_namespace()
+        reg_id = _create_flow_registration(ns_id, name="producer_flow")
+        graph = _create_graph(source_registration_id=reg_id)
+
+        _add_manual_input(graph, SAMPLE_DATA, node_id=1)
+        _add_catalog_writer(
+            graph,
+            node_id=2,
+            depending_on_id=1,
+            table_name="virtual_table",
+            namespace_id=ns_id,
+            write_mode="virtual",
+        )
+
+        _run_graph(graph)
+
+        with get_db_context() as db:
+            repo = SQLAlchemyCatalogRepository(db)
+            tables = repo.list_tables(namespace_id=ns_id)
+            assert len(tables) == 1
+            table = tables[0]
+            assert table.name == "virtual_table"
+            assert table.table_type == "virtual"
+            assert table.producer_registration_id == reg_id
+
+    def test_virtual_writer_multiple_writers_same_registration(self):
+        """A flow with two virtual catalog_writers (same source_registration_id) should
+        produce two distinct virtual rows, not collide on the name+namespace UNIQUE
+        constraint. Regression for get_virtual_table_by_producer returning an ambiguous
+        first match when multiple virtual tables share a producer_registration_id."""
+        ns_id = _create_namespace()
+        reg_id = _create_flow_registration(ns_id, name="multi_writer_flow")
+        graph = _create_graph(source_registration_id=reg_id)
+
+        _add_manual_input(graph, SAMPLE_DATA, node_id=1)
+        _add_catalog_writer(
+            graph,
+            node_id=2,
+            depending_on_id=1,
+            table_name="writer_a",
+            namespace_id=ns_id,
+            write_mode="virtual",
+        )
+        _add_manual_input(graph, SAMPLE_DATA, node_id=3)
+        _add_catalog_writer(
+            graph,
+            node_id=4,
+            depending_on_id=3,
+            table_name="writer_b",
+            namespace_id=ns_id,
+            write_mode="virtual",
+        )
+
+        # First run creates both virtual tables
+        _run_graph(graph)
+        # Second run must update in place (no UNIQUE violation) and keep two rows
+        _run_graph(graph)
+
+        with get_db_context() as db:
+            repo = SQLAlchemyCatalogRepository(db)
+            tables = repo.list_tables(namespace_id=ns_id)
+            names = sorted(t.name for t in tables)
+            assert names == ["writer_a", "writer_b"]
+            for table in tables:
+                assert table.table_type == "virtual"
+                assert table.producer_registration_id == reg_id
+
+    def test_virtual_writer_rehomes_across_flow_registrations(self):
+        """When a virtual table already exists in a namespace (e.g. created by a prior
+        flow registration), a new flow writing to the same name+namespace must update
+        the existing row in place — not raise TableExistsError. The producer is rehomed
+        to the new registration. Regression for 'Catalog table X already exists in
+        namespace' when re-registering a flow."""
+        ns_id = _create_namespace()
+        reg_a = _create_flow_registration(ns_id, name="flow_a")
+        graph_a = _create_graph(flow_id=1, source_registration_id=reg_a)
+        _add_manual_input(graph_a, SAMPLE_DATA, node_id=1)
+        _add_catalog_writer(
+            graph_a,
+            node_id=2,
+            depending_on_id=1,
+            table_name="shared_name",
+            namespace_id=ns_id,
+            write_mode="virtual",
+        )
+        _run_graph(graph_a)
+
+        # A different registration writes to the same (name, namespace). This simulates
+        # the user's case: the flow was re-registered and now has a new registration_id.
+        reg_b = _create_flow_registration(ns_id, name="flow_b")
+        graph_b = _create_graph(flow_id=2, source_registration_id=reg_b)
+        _add_manual_input(graph_b, SAMPLE_DATA, node_id=1)
+        _add_catalog_writer(
+            graph_b,
+            node_id=2,
+            depending_on_id=1,
+            table_name="shared_name",
+            namespace_id=ns_id,
+            write_mode="virtual",
+        )
+        _run_graph(graph_b)
+
+        with get_db_context() as db:
+            repo = SQLAlchemyCatalogRepository(db)
+            tables = repo.list_tables(namespace_id=ns_id)
+            assert len(tables) == 1
+            assert tables[0].name == "shared_name"
+            assert tables[0].table_type == "virtual"
+            # Producer was rehomed to the most recent writer
+            assert tables[0].producer_registration_id == reg_b
+
+    def test_virtual_writer_requires_source_registration(self):
+        """When source_registration_id is not set, virtual write should fail
+        with a clear error about missing registration."""
+        ns_id = _create_namespace()
+        graph = _create_graph(source_registration_id=None)
+
+        _add_manual_input(graph, SAMPLE_DATA, node_id=1)
+        _add_catalog_writer(
+            graph,
+            node_id=2,
+            depending_on_id=1,
+            table_name="should_fail",
+            namespace_id=ns_id,
+            write_mode="virtual",
+        )
+
+        with pytest.raises(AssertionError, match="not linked to a catalog registration"):
+            _run_graph(graph)
+
+    def test_virtual_writer_stores_serialized_lazyframe_when_lazy(self):
+        """A fully lazy graph (manual_input → filter → virtual writer) should store
+        a serialized lazy frame and set is_optimized=True."""
+        ns_id = _create_namespace()
+        reg_id = _create_flow_registration(ns_id, name="lazy_flow")
+        graph = _create_graph(source_registration_id=reg_id)
+        _add_manual_input(graph, SAMPLE_DATA, node_id=1)
+
+        # Node 2: filter (lazy operation)
+        promise_filter = input_schema.NodePromise(flow_id=graph.flow_id, node_id=2, node_type="filter")
+        graph.add_node_promise(promise_filter)
+        filter_settings = input_schema.NodeFilter(
+            flow_id=graph.flow_id,
+            node_id=2,
+            depending_on_id=1,
+            filter_input=FilterInput(
+                mode="basic",
+                basic_filter=BasicFilter(field="age", operator="greater_than", value="28"),
+            ),
+        )
+        graph.add_filter(filter_settings)
+        add_connection(graph, input_schema.NodeConnection.create_from_simple_input(from_id=1, to_id=2))
+
+        _add_catalog_writer(
+            graph,
+            node_id=3,
+            depending_on_id=2,
+            table_name="lazy_virtual",
+            namespace_id=ns_id,
+            write_mode="virtual",
+        )
+
+        _run_graph(graph)
+
+        with get_db_context() as db:
+            repo = SQLAlchemyCatalogRepository(db)
+            tables = repo.list_tables(namespace_id=ns_id)
+            assert len(tables) == 1
+            table = tables[0]
+            assert table.table_type == "virtual"
+            assert table.serialized_lazy_frame is not None
+            assert table.is_optimized is True
+
+    def test_virtual_writer_non_optimized_when_upstream_eager(self):
+        """A graph with an eager node upstream of the virtual writer should
+        set is_optimized=False."""
+        ns_id = _create_namespace()
+        reg_id = _create_flow_registration(ns_id, name="eager_flow")
+        graph = _create_graph(source_registration_id=reg_id)
+
+        _add_manual_input(graph, SAMPLE_DATA, node_id=1)
+        # Node 2: pivot (eager operation)
+        promise_pivot = input_schema.NodePromise(flow_id=graph.flow_id, node_id=2, node_type="pivot")
+        graph.add_node_promise(promise_pivot)
+        pivot_settings = input_schema.NodePivot(
+            flow_id=graph.flow_id,
+            node_id=2,
+            depending_on_id=1,
+            pivot_input=PivotInput(
+                index_columns=["name"],
+                pivot_column="city",
+                value_col="age",
+                aggregations=["first"],
+            ),
+        )
+        graph.add_pivot(pivot_settings)
+        add_connection(graph, input_schema.NodeConnection.create_from_simple_input(from_id=1, to_id=2))
+
+        _add_catalog_writer(
+            graph,
+            node_id=3,
+            depending_on_id=2,
+            table_name="eager_virtual",
+            namespace_id=ns_id,
+            write_mode="virtual",
+        )
+
+        _run_graph(graph)
+
+        with get_db_context() as db:
+            repo = SQLAlchemyCatalogRepository(db)
+            tables = repo.list_tables(namespace_id=ns_id)
+            assert len(tables) == 1
+            table = tables[0]
+            assert table.table_type == "virtual"
+            assert table.is_optimized is False
+
+
+class TestReadVirtualFlowTables:
+    """Tests that virtual tables can be resolved and previewed."""
+
+    def test_lazy_frame_table_preview(self, lazy_virtual_table_id, catalog_service):
+        """Preview of an optimized virtual table should return filtered rows."""
+        preview = catalog_service.get_table_preview(lazy_virtual_table_id)
+        assert len(preview.columns) > 0
+        # Filter is age > 28, so Alice (30) and Charlie (35) match
+        assert len(preview.rows) == 2
+
+    def test_lazy_frame_resolve(self, lazy_virtual_table_id, catalog_service):
+        """resolve_virtual_flow_table on an optimized table returns a LazyFrame."""
+        lf = catalog_service.resolve_virtual_flow_table(lazy_virtual_table_id)
+        assert isinstance(lf, pl.LazyFrame)
+        df = lf.collect()
+        assert df.height == 2
+
+    def test_eager_frame_table_preview(self, eager_virtual_table_id, catalog_service):
+        """Preview of a non-optimized (eager) virtual table should re-execute the flow."""
+        preview = catalog_service.get_table_preview(eager_virtual_table_id)
+        assert len(preview.columns) > 0
+        # Pivot of 3 rows by name produces 3 rows
+        assert len(preview.rows) == 3
+
+    def test_eager_frame_resolve(self, eager_virtual_table_id, catalog_service):
+        """resolve_virtual_flow_table on a non-optimized table re-executes and returns LazyFrame."""
+        lf = catalog_service.resolve_virtual_flow_table(eager_virtual_table_id)
+        assert isinstance(lf, pl.LazyFrame)
+        df = lf.collect()
+        assert df.height == 3
+
+    def test_catalog_reader_reads_lazy_virtual_table(self, lazy_virtual_table_id):
+        """A catalog_reader node should be able to read from an optimized virtual table in a graph."""
+        graph = _create_graph()
+        promise = input_schema.NodePromise(flow_id=graph.flow_id, node_id=1, node_type="catalog_reader")
+        graph.add_node_promise(promise)
+        reader = input_schema.NodeCatalogReader(
+            flow_id=graph.flow_id,
+            node_id=1,
+            catalog_table_id=lazy_virtual_table_id,
+        )
+        graph.add_catalog_reader(reader)
+
+        _run_graph(graph)
+
+        node = graph.get_node(1)
+        result_df = node.get_resulting_data().collect()
+        assert len(result_df) == 2
+        assert set(result_df.columns) == {"name", "age", "city"}
+
+    def test_catalog_reader_reads_eager_virtual_table(self, eager_virtual_table_id):
+        """A catalog_reader node should be able to read from a non-optimized virtual table in a graph."""
+        graph = _create_graph()
+        promise = input_schema.NodePromise(flow_id=graph.flow_id, node_id=1, node_type="catalog_reader")
+        graph.add_node_promise(promise)
+        reader = input_schema.NodeCatalogReader(
+            flow_id=graph.flow_id,
+            node_id=1,
+            catalog_table_id=eager_virtual_table_id,
+        )
+        graph.add_catalog_reader(reader)
+
+        _run_graph(graph)
+
+        node = graph.get_node(1)
+        result_df = node.get_resulting_data().collect()
+        assert len(result_df) == 3
+
+    def test_lazy_frame_query(self, lazy_virtual_table_id, catalog_service):
+        """SQL query against a virtual table should work."""
+        catalog_service.execute_sql_query("select * from lazy_virtual")
+
+    def test_resolve_query_virtual_only_materializes_referenced_tables(
+        self, lazy_virtual_table_id, catalog_service, monkeypatch
+    ):
+        """When a query-based virtual table is resolved, it must only materialize
+        the tables its stored SQL actually references — not every other virtual in
+        the catalog. Regression: previously, resolve_query_virtual_table registered
+        every catalog table in its SQLContext, which triggered flow execution for
+        each unrelated flow-based virtual."""
+        ns_id = _create_namespace()
+        with get_db_context() as db:
+            repo = SQLAlchemyCatalogRepository(db)
+            svc = CatalogService(repo)
+            with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False) as f:
+                path = f.name
+            other_reg_id = _create_flow_registration(ns_id, name="unrelated_producer", path=path)
+            svc.create_virtual_flow_table(
+                name="unrelated_flow_virtual",
+                owner_id=1,
+                producer_registration_id=other_reg_id,
+                namespace_id=ns_id,
+                serialized_lazy_frame=b"\x00",
+                is_optimized=True,
+            )
+            svc.create_query_virtual_table(
+                name="q_select_lazy",
+                owner_id=1,
+                namespace_id=ns_id,
+                sql_query="SELECT * FROM lazy_virtual",
+            )
+
+        calls: list[int] = []
+        original = catalog_service.resolve_virtual_flow_table
+
+        def spy(table_id, *args, **kwargs):
+            calls.append(table_id)
+            return original(table_id, *args, **kwargs)
+
+        monkeypatch.setattr(catalog_service, "resolve_virtual_flow_table", spy)
+
+        with get_db_context() as db:
+            repo = SQLAlchemyCatalogRepository(db)
+            q_row = repo.get_table_by_name("q_select_lazy", ns_id)
+            assert q_row is not None
+            q_id = q_row.id
+
+        catalog_service.resolve_query_virtual_table(q_id)
+        with get_db_context() as db:
+            repo = SQLAlchemyCatalogRepository(db)
+            unrelated = repo.get_table_by_name("unrelated_flow_virtual", ns_id)
+            assert unrelated is not None
+            assert unrelated.id not in calls
+
+    def test_sql_query_filter_ignores_alias_lookalike(
+        self, lazy_virtual_table_id, catalog_service, monkeypatch
+    ):
+        """A short bare-named virtual (e.g. ``t``) must not be materialized when the
+        query uses it as a column alias or only as a substring of another identifier.
+        Regression: previous substring-matching filter false-positively materialized
+        every virtual whose name appeared anywhere in the query, including inside
+        ``"test-table"`` or ``SELECT ... AS t``."""
+        ns_id = _create_namespace()
+        with get_db_context() as db:
+            repo = SQLAlchemyCatalogRepository(db)
+            svc = CatalogService(repo)
+            with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False) as f:
+                path = f.name
+            reg_id = _create_flow_registration(ns_id, name="t_producer", path=path)
+            svc.create_virtual_flow_table(
+                name="t",
+                owner_id=1,
+                producer_registration_id=reg_id,
+                namespace_id=ns_id,
+                serialized_lazy_frame=b"\x00",
+                is_optimized=True,
+            )
+
+        calls: list[int] = []
+        original = catalog_service.resolve_virtual_flow_table
+
+        def spy(table_id, *args, **kwargs):
+            calls.append(table_id)
+            return original(table_id, *args, **kwargs)
+
+        monkeypatch.setattr(catalog_service, "resolve_virtual_flow_table", spy)
+
+        catalog_service.execute_sql_query('SELECT count(*) as t FROM "test-table"')
+        # Only lazy_virtual (if referenced) or nothing — the short ``t`` virtual must
+        # NOT be materialized just because ``t`` appears as an alias or inside another
+        # identifier.
+        assert lazy_virtual_table_id not in calls  # sanity: not referenced here
+        # The bare ``t`` virtual also must not be materialized.
+        with get_db_context() as db:
+            repo = SQLAlchemyCatalogRepository(db)
+            t_row = repo.get_table_by_name("t", ns_id)
+            assert t_row is not None
+            assert t_row.id not in calls
+
+    def test_sql_query_does_not_materialize_unreferenced_virtuals(
+        self, lazy_virtual_table_id, catalog_service, monkeypatch
+    ):
+        """A SQL query that doesn't mention a virtual table must not run its flow.
+
+        Regression: execute_sql_query previously materialized every virtual table
+        in the catalog to generate IPC bytes, activating all their producer flows
+        even when the query only touched one physical/physical+named table."""
+        # Seed a physical table the query actually targets, in the same namespace.
+        ns_id = _create_namespace()
+        with get_db_context() as db:
+            repo = SQLAlchemyCatalogRepository(db)
+            svc = CatalogService(repo)
+            with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False) as f:
+                producer_path = f.name
+            reg_id = _create_flow_registration(ns_id, name="other_producer", path=producer_path)
+            # Create an additional unrelated virtual table whose producer flow would
+            # throw if materialized — simulating the worst-case observed symptom.
+            svc.create_virtual_flow_table(
+                name="untouched_virtual",
+                owner_id=1,
+                producer_registration_id=reg_id,
+                namespace_id=ns_id,
+                serialized_lazy_frame=b"\x00",  # invalid bytes on purpose
+                is_optimized=True,
+            )
+
+        calls: list[int] = []
+        original = catalog_service.resolve_virtual_flow_table
+
+        def spy(table_id, *args, **kwargs):
+            calls.append(table_id)
+            return original(table_id, *args, **kwargs)
+
+        monkeypatch.setattr(catalog_service, "resolve_virtual_flow_table", spy)
+
+        # Query references only "lazy_virtual" — untouched_virtual must not be resolved.
+        catalog_service.execute_sql_query("select * from lazy_virtual")
+        assert calls == [lazy_virtual_table_id]
+
+
+class TestCheckUpstreamLaziness:
+    """Test that laziness checking correctly scopes to upstream catalog writer deps."""
+
+    def test_check_upstream_laziness_excludes_unrelated_branches(self):
+        """check_flow_laziness should not include nodes from branches that don't
+        feed into a catalog_writer (e.g. an explore_data node on a separate path)."""
+        ns_id = _create_namespace()
+        reg_id = _create_flow_registration(ns_id, name="scoped_flow")
+        graph = _create_graph(source_registration_id=reg_id)
+
+        # Branch 1: manual_input (1) → catalog_writer (2) — all lazy
+        _add_manual_input(graph, SAMPLE_DATA, node_id=1)
+        _add_catalog_writer(
+            graph,
+            node_id=2,
+            depending_on_id=1,
+            table_name="scoped_table",
+            namespace_id=ns_id,
+            write_mode="virtual",
+        )
+
+        # Branch 2: manual_input (3) → explore_data (4) — unrelated
+        _add_manual_input(graph, SAMPLE_DATA, node_id=3)
+        promise_explore = input_schema.NodePromise(flow_id=graph.flow_id, node_id=4, node_type="explore_data")
+        graph.add_node_promise(promise_explore)
+        explore = input_schema.NodeExploreData(flow_id=graph.flow_id, node_id=4)
+        graph.add_explore_data(explore)
+        add_connection(graph, input_schema.NodeConnection.create_from_simple_input(from_id=3, to_id=4))
+
+        is_lazy, reasons = graph.check_flow_laziness()
+
+        # explore_data should NOT appear in reasons — it's on a separate branch
+        assert is_lazy is True
+        assert len(reasons) == 0
+
+    def test_check_upstream_laziness_reports_eager_upstream(self):
+        """An eager node upstream of a catalog_writer should be reported by
+        check_upstream_laziness."""
+        ns_id = _create_namespace()
+        reg_id = _create_flow_registration(ns_id, name="eager_check_flow")
+        graph = _create_graph(source_registration_id=reg_id)
+
+        # manual_input (1) → pivot (2, eager) → catalog_writer (3)
+        _add_manual_input(graph, SAMPLE_DATA, node_id=1)
+
+        promise_pivot = input_schema.NodePromise(flow_id=graph.flow_id, node_id=2, node_type="pivot")
+        graph.add_node_promise(promise_pivot)
+        pivot_settings = input_schema.NodePivot(
+            flow_id=graph.flow_id,
+            node_id=2,
+            depending_on_id=1,
+            pivot_input=PivotInput(
+                index_columns=["name"],
+                pivot_column="city",
+                value_col="age",
+                aggregations=["first"],
+            ),
+        )
+        graph.add_pivot(pivot_settings)
+        add_connection(graph, input_schema.NodeConnection.create_from_simple_input(from_id=1, to_id=2))
+
+        _add_catalog_writer(
+            graph,
+            node_id=3,
+            depending_on_id=2,
+            table_name="eager_check",
+            namespace_id=ns_id,
+            write_mode="virtual",
+        )
+
+        writer_node = graph.get_node(3)
+        is_lazy, reasons = writer_node.check_upstream_laziness()
+
+        assert is_lazy is False
+        assert len(reasons) >= 1
+        assert any("eager" in r.lower() for r in reasons)
+
+    def test_check_upstream_laziness_all_lazy(self):
+        """When all upstream nodes are lazy, check_upstream_laziness should
+        return (True, [])."""
+        ns_id = _create_namespace()
+        reg_id = _create_flow_registration(ns_id, name="all_lazy_flow")
+        graph = _create_graph(source_registration_id=reg_id)
+
+        # manual_input (1) → filter (2, lazy) → catalog_writer (3)
+        _add_manual_input(graph, SAMPLE_DATA, node_id=1)
+
+        promise_filter = input_schema.NodePromise(flow_id=graph.flow_id, node_id=2, node_type="filter")
+        graph.add_node_promise(promise_filter)
+        filter_settings = input_schema.NodeFilter(
+            flow_id=graph.flow_id,
+            node_id=2,
+            depending_on_id=1,
+            filter_input=FilterInput(
+                mode="basic",
+                basic_filter=BasicFilter(field="age", operator="greater_than", value="30"),
+            ),
+        )
+        graph.add_filter(filter_settings)
+        add_connection(graph, input_schema.NodeConnection.create_from_simple_input(from_id=1, to_id=2))
+
+        _add_catalog_writer(
+            graph,
+            node_id=3,
+            depending_on_id=2,
+            table_name="all_lazy",
+            namespace_id=ns_id,
+            write_mode="virtual",
+        )
+
+        writer_node = graph.get_node(3)
+        is_lazy, reasons = writer_node.check_upstream_laziness()
+
+        assert is_lazy is True
+        assert reasons == []
+        _run_graph(graph)
+
+
+class TestFlowRegistrationAttributes:
+    """Test that virtual table code correctly uses flow_path, not file_path."""
+
+    def test_compute_laziness_blockers_uses_flow_path(self):
+        """_compute_laziness_blockers should accept a flow_path without
+        AttributeError (regression: previously accessed .file_path)."""
+        ns_id = _create_namespace()
+
+        graph = _create_graph(flow_id=99)
+        _add_manual_input(graph, SAMPLE_DATA, node_id=1)
+        _add_catalog_writer(
+            graph,
+            node_id=2,
+            depending_on_id=1,
+            table_name="blockers_test",
+            namespace_id=ns_id,
+            write_mode="virtual",
+        )
+        with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False) as f:
+            save_path = f.name
+        graph.save_flow(save_path)
+
+        reg_id = _create_flow_registration(ns_id, name="blocker_flow", path=save_path)
+
+        with get_db_context() as db:
+            reg = db.get(FlowRegistration, reg_id)
+            assert hasattr(reg, "flow_path"), "FlowRegistration should have flow_path attribute"
+            assert not hasattr(reg, "file_path"), "FlowRegistration should NOT have file_path attribute"
+
+            # This should not raise AttributeError
+            blockers = CatalogService._compute_laziness_blockers(reg.flow_path)
+            assert isinstance(blockers, list)
+
+    def test_table_to_out_with_virtual_table(self):
+        """_table_to_out should handle a virtual table with a producer_registration_id
+        without raising AttributeError. Laziness is now opt-in (compute_laziness=True)
+        to avoid re-parsing the producer flow on every serialization."""
+        ns_id = _create_namespace()
+        # Save a flow to disk so _compute_laziness_blockers can load it
+        graph = _create_graph(flow_id=99)
+        _add_manual_input(graph, SAMPLE_DATA, node_id=1)
+        _add_catalog_writer(
+            graph,
+            node_id=2,
+            depending_on_id=1,
+            table_name="to_out_test",
+            namespace_id=ns_id,
+            write_mode="virtual",
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False) as f:
+            save_path = f.name
+        graph.save_flow(save_path)
+
+        reg_id = _create_flow_registration(ns_id, name="to_out_flow", path=save_path)
+
+        with get_db_context() as db:
+            repo = SQLAlchemyCatalogRepository(db)
+            svc = CatalogService(repo)
+            table_out = svc.create_virtual_flow_table(
+                name="to_out_virtual",
+                owner_id=1,
+                producer_registration_id=reg_id,
+                namespace_id=ns_id,
+            )
+            assert table_out.table_type == "virtual"
+            assert table_out.laziness_blockers is None  # opt-in default
+
+            # Explicit opt-in still works and does not raise AttributeError
+            table = repo.get_table(table_out.id)
+            with_blockers = svc._table_to_out(table, compute_laziness=True)
+            assert with_blockers.laziness_blockers is not None
+            assert isinstance(with_blockers.laziness_blockers, list)
+
+
+class TestVirtualTableTriggerFiring:
+    """Test that updating a virtual table fires table_trigger schedules (push path)."""
+
+    def test_update_virtual_table_fires_trigger(self):
+        """When a virtual table is updated via update_virtual_flow_table,
+        any enabled table_trigger schedule watching it should fire."""
+        ns_id = _create_namespace()
+        reg_id = _create_flow_registration(ns_id, name="producer_flow")
+        downstream_reg_id = _create_flow_registration(ns_id, name="downstream_flow", path="/tmp/downstream.yaml")
+
+        with get_db_context() as db:
+            repo = SQLAlchemyCatalogRepository(db)
+            svc = CatalogService(repo)
+            table_out = svc.create_virtual_flow_table(
+                name="trigger_test_table",
+                owner_id=1,
+                producer_registration_id=reg_id,
+                namespace_id=ns_id,
+            )
+            table_id = table_out.id
+
+        # Create a table_trigger schedule watching the virtual table
+        with get_db_context() as db:
+            schedule = FlowSchedule(
+                registration_id=downstream_reg_id,
+                schedule_type="table_trigger",
+                trigger_table_id=table_id,
+                enabled=True,
+                owner_id=1,
+            )
+            db.add(schedule)
+            db.commit()
+            db.refresh(schedule)
+        # Update the virtual table and check that _fire_table_trigger_schedules is called
+        with get_db_context() as db:
+            repo = SQLAlchemyCatalogRepository(db)
+            svc = CatalogService(repo)
+
+            fired_tables = []
+
+            def mock_fire(table_id, table_updated_at):
+                fired_tables.append(table_id)
+                # Don't actually spawn a subprocess
+                return 0
+
+            svc._fire_table_trigger_schedules = mock_fire
+
+            svc.update_virtual_flow_table(
+                table_id=table_id,
+                schema_json='[{"name": "x", "dtype": "Int64"}]',
+            )
+
+        assert table_id in fired_tables, "Updating a virtual table should fire table trigger schedules"
+
+
+class TestVirtualTableOptimizationPropagation:
+    """Test that reading a non-optimized virtual table propagates non-optimized status downstream."""
+
+    def test_downstream_virtual_table_not_optimized_when_source_is_not_optimized(self, eager_virtual_table_id):
+        """A flow that reads a non-optimized virtual table and writes a new virtual table
+        should produce a non-optimized output, even when all other nodes are lazy."""
+        ns_id = _create_namespace()
+        with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False) as f:
+            flow_path = f.name
+        reg_id = _create_flow_registration(ns_id, name="downstream_eager_flow", path=flow_path)
+        graph = _create_graph(source_registration_id=reg_id)
+
+        # Node 1: catalog reader reading the non-optimized (eager) virtual table
+        promise_reader = input_schema.NodePromise(flow_id=graph.flow_id, node_id=1, node_type="catalog_reader")
+        graph.add_node_promise(promise_reader)
+        reader = input_schema.NodeCatalogReader(
+            flow_id=graph.flow_id,
+            node_id=1,
+            catalog_table_id=eager_virtual_table_id,
+        )
+        graph.add_catalog_reader(reader)
+        # Node 2: filter (lazy operation) — should not make the chain optimized
+        promise_filter = input_schema.NodePromise(flow_id=graph.flow_id, node_id=2, node_type="filter")
+        graph.add_node_promise(promise_filter)
+        filter_settings = input_schema.NodeFilter(
+            flow_id=graph.flow_id,
+            node_id=2,
+            depending_on_id=1,
+            filter_input=FilterInput(
+                mode="basic",
+                basic_filter=BasicFilter(field="name", operator="not_equals", value="Alice"),
+            ),
+        )
+        graph.add_filter(filter_settings)
+        add_connection(graph, input_schema.NodeConnection.create_from_simple_input(from_id=1, to_id=2))
+
+        _add_catalog_writer(
+            graph,
+            node_id=3,
+            depending_on_id=2,
+            table_name="downstream_eager_virtual",
+            namespace_id=ns_id,
+            write_mode="virtual",
+        )
+
+        reader_node = graph.get_node(1)
+        assert reader_node.setting_input.is_virtual_optimized is False
+
+        writer_node = graph.get_node(3)
+        is_lazy, reasons = writer_node.check_upstream_laziness()
+        assert is_lazy is False
+        assert any("non-optimized virtual table" in r for r in reasons)
+        _run_graph(graph)
+
+    def test_downstream_virtual_table_optimized_when_source_is_optimized(self, lazy_virtual_table_id):
+        """A flow that reads an optimized virtual table and writes a new virtual table
+        should produce an optimized output when all nodes are lazy."""
+        ns_id = _create_namespace()
+        with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False) as f:
+            flow_path = f.name
+        reg_id = _create_flow_registration(ns_id, name="downstream_lazy_flow", path=flow_path)
+        graph = _create_graph(source_registration_id=reg_id)
+
+        # Node 1: catalog reader reading the optimized (lazy) virtual table
+        promise_reader = input_schema.NodePromise(flow_id=graph.flow_id, node_id=1, node_type="catalog_reader")
+        graph.add_node_promise(promise_reader)
+        reader = input_schema.NodeCatalogReader(
+            flow_id=graph.flow_id,
+            node_id=1,
+            catalog_table_id=lazy_virtual_table_id,
+        )
+        graph.add_catalog_reader(reader)
+
+        # Node 2: filter (lazy operation)
+        promise_filter = input_schema.NodePromise(flow_id=graph.flow_id, node_id=2, node_type="filter")
+        graph.add_node_promise(promise_filter)
+        filter_settings = input_schema.NodeFilter(
+            flow_id=graph.flow_id,
+            node_id=2,
+            depending_on_id=1,
+            filter_input=FilterInput(
+                mode="basic",
+                basic_filter=BasicFilter(field="name", operator="not_equals", value="Alice"),
+            ),
+        )
+        graph.add_filter(filter_settings)
+        add_connection(graph, input_schema.NodeConnection.create_from_simple_input(from_id=1, to_id=2))
+
+        _add_catalog_writer(
+            graph,
+            node_id=3,
+            depending_on_id=2,
+            table_name="downstream_lazy_virtual",
+            namespace_id=ns_id,
+            write_mode="virtual",
+        )
+
+        reader_node = graph.get_node(1)
+        assert reader_node.setting_input.is_virtual_optimized is True
+
+        writer_node = graph.get_node(3)
+        is_lazy, reasons = writer_node.check_upstream_laziness()
+        assert is_lazy is True
+        assert reasons == []
+
+    def test_sql_reader_not_optimized_when_source_virtual_table_is_not_optimized(self, eager_virtual_table_id):
+        """A SQL catalog reader referencing a non-optimized virtual table should propagate
+        non-optimized status to downstream virtual writers."""
+        ns_id = _create_namespace()
+        with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False) as f:
+            flow_path = f.name
+        reg_id = _create_flow_registration(ns_id, name="downstream_sql_eager_flow", path=flow_path)
+        graph = _create_graph(source_registration_id=reg_id)
+        # Node 1: SQL catalog reader querying the non-optimized virtual table
+        promise_reader = input_schema.NodePromise(flow_id=graph.flow_id, node_id=1, node_type="catalog_reader")
+        graph.add_node_promise(promise_reader)
+        reader = input_schema.NodeCatalogReader(
+            flow_id=graph.flow_id,
+            node_id=1,
+            sql_query="SELECT * FROM eager_virtual",
+        )
+        graph.add_catalog_reader(reader)
+        # Node 2: filter (lazy operation)
+        promise_filter = input_schema.NodePromise(flow_id=graph.flow_id, node_id=2, node_type="filter")
+        graph.add_node_promise(promise_filter)
+        filter_settings = input_schema.NodeFilter(
+            flow_id=graph.flow_id,
+            node_id=2,
+            depending_on_id=1,
+            filter_input=FilterInput(
+                mode="basic",
+                basic_filter=BasicFilter(field="name", operator="not_equals", value="Alice"),
+            ),
+        )
+        graph.add_filter(filter_settings)
+        add_connection(graph, input_schema.NodeConnection.create_from_simple_input(from_id=1, to_id=2))
+
+        _add_catalog_writer(
+            graph,
+            node_id=3,
+            depending_on_id=2,
+            table_name="downstream_sql_eager_virtual",
+            namespace_id=ns_id,
+            write_mode="virtual",
+        )
+
+        reader_node = graph.get_node(1)
+        assert reader_node.setting_input.is_virtual_optimized is False
+
+        writer_node = graph.get_node(3)
+        is_lazy, reasons = writer_node.check_upstream_laziness()
+        assert is_lazy is False
+        assert any("non-optimized virtual table" in r for r in reasons)
+        _run_graph(graph)
+
+
+# Source table version tracking tests
+
+
+class TestCheckSourceVersionsCurrent:
+    """Unit tests for the check_source_versions_current utility."""
+
+    def test_none_returns_false(self):
+        """No fingerprint can't prove currency — a pinned serialized plan would
+        replay the first snapshot forever, so None must read as stale."""
+        assert check_source_versions_current(None) is False
+
+    def test_empty_string_returns_false(self):
+        """Empty string is no fingerprint either."""
+        assert check_source_versions_current("") is False
+
+    def test_empty_list_returns_true(self):
+        """Empty JSON list should return True (no sources to check)."""
+        assert check_source_versions_current("[]") is True
+
+    def test_invalid_json_returns_false(self):
+        """Malformed JSON should return False (treat as stale)."""
+        assert check_source_versions_current("not json") is False
+
+    def test_matching_versions_returns_true(self):
+        """When source delta table versions match, should return True."""
+        from shared.delta_utils import write_delta
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            delta_path = f"{tmp_dir}/test_table"
+            df = pl.DataFrame({"x": [1, 2, 3]})
+            write_delta(df, delta_path, mode="overwrite")
+
+            from deltalake import DeltaTable
+
+            current_version = DeltaTable(delta_path, without_files=True).version()
+
+            versions_json = json.dumps(
+                [SourceTableVersion(table_id=1, file_path=delta_path, version=current_version).model_dump()]
+            )
+            assert check_source_versions_current(versions_json) is True
+
+    def test_stale_version_returns_false(self):
+        """When source delta table has been updated, should return False."""
+        from shared.delta_utils import write_delta
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            delta_path = f"{tmp_dir}/test_table"
+            df = pl.DataFrame({"x": [1, 2, 3]})
+            write_delta(df, delta_path, mode="overwrite")
+
+            # Record version 0
+            versions_json = json.dumps([SourceTableVersion(table_id=1, file_path=delta_path, version=0).model_dump()])
+
+            # Write again to bump version
+            write_delta(pl.DataFrame({"x": [4, 5, 6]}), delta_path, mode="overwrite")
+
+            assert check_source_versions_current(versions_json) is False
+
+    def test_missing_file_path_returns_false(self):
+        """When the delta table path doesn't exist, should return False."""
+        versions_json = json.dumps(
+            [SourceTableVersion(table_id=1, file_path="/nonexistent/path", version=0).model_dump()]
+        )
+        assert check_source_versions_current(versions_json) is False
+
+
+class TestSourceTableVersionCapture:
+    """Test that source_table_versions are captured when creating virtual tables
+    from flows that read physical delta catalog tables."""
+
+    def test_virtual_table_from_delta_source_stores_versions(self):
+        """A virtual table created from a flow reading a physical delta table
+        should have source_table_versions populated."""
+        from shared.delta_utils import write_delta
+
+        ns_id = _create_namespace()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            delta_path = f"{tmp_dir}/source_delta"
+            df = pl.DataFrame({"name": ["Alice", "Bob"], "age": [30, 25]})
+            write_delta(df, delta_path, mode="overwrite")
+
+            with get_db_context() as db:
+                repo = SQLAlchemyCatalogRepository(db)
+                svc = CatalogService(repo)
+                physical_table = svc.register_table_from_data(
+                    name="source_physical",
+                    table_path=delta_path,
+                    owner_id=1,
+                    namespace_id=ns_id,
+                    storage_format="delta",
+                    schema=[{"name": "name", "dtype": "Utf8"}, {"name": "age", "dtype": "Int64"}],
+                    row_count=2,
+                    column_count=2,
+                    size_bytes=100,
+                )
+                physical_table_id = physical_table.id
+
+            with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False) as f:
+                flow_path = f.name
+            reg_id = _create_flow_registration(ns_id, name="version_tracking_flow", path=flow_path)
+            graph = _create_graph(source_registration_id=reg_id)
+
+            promise_reader = input_schema.NodePromise(flow_id=graph.flow_id, node_id=1, node_type="catalog_reader")
+            graph.add_node_promise(promise_reader)
+            reader = input_schema.NodeCatalogReader(
+                flow_id=graph.flow_id,
+                node_id=1,
+                catalog_table_id=physical_table_id,
+            )
+            graph.add_catalog_reader(reader)
+
+            # Node 2: filter (lazy)
+            promise_filter = input_schema.NodePromise(flow_id=graph.flow_id, node_id=2, node_type="filter")
+            graph.add_node_promise(promise_filter)
+            filter_settings = input_schema.NodeFilter(
+                flow_id=graph.flow_id,
+                node_id=2,
+                depending_on_id=1,
+                filter_input=FilterInput(
+                    mode="basic",
+                    basic_filter=BasicFilter(field="age", operator="greater_than", value="20"),
+                ),
+            )
+            graph.add_filter(filter_settings)
+            add_connection(graph, input_schema.NodeConnection.create_from_simple_input(from_id=1, to_id=2))
+
+            _add_catalog_writer(
+                graph,
+                node_id=3,
+                depending_on_id=2,
+                table_name="version_tracked_virtual",
+                namespace_id=ns_id,
+                write_mode="virtual",
+            )
+
+            _run_graph(graph)
+
+            with get_db_context() as db:
+                repo = SQLAlchemyCatalogRepository(db)
+                tables = repo.list_tables(namespace_id=ns_id)
+                vt = next(t for t in tables if t.name == "version_tracked_virtual")
+                assert vt.is_optimized is True
+                assert vt.source_table_versions is not None
+
+                versions = json.loads(vt.source_table_versions)
+                assert len(versions) == 1
+                assert versions[0]["table_id"] == physical_table_id
+                assert versions[0]["file_path"] == delta_path
+                assert isinstance(versions[0]["version"], int)
+
+    def test_virtual_table_without_catalog_source_has_empty_versions(self):
+        """A virtual table from a flow with only manual input stores "[]" —
+        a provably complete (empty) fingerprint, so plan replay stays valid.
+        None is reserved for unfingerprintable sources."""
+        ns_id = _create_namespace()
+        reg_id = _create_flow_registration(ns_id, name="no_source_flow")
+        graph = _create_graph(source_registration_id=reg_id)
+
+        _add_manual_input(graph, SAMPLE_DATA, node_id=1)
+
+        # Node 2: filter (lazy)
+        promise_filter = input_schema.NodePromise(flow_id=graph.flow_id, node_id=2, node_type="filter")
+        graph.add_node_promise(promise_filter)
+        filter_settings = input_schema.NodeFilter(
+            flow_id=graph.flow_id,
+            node_id=2,
+            depending_on_id=1,
+            filter_input=FilterInput(
+                mode="basic",
+                basic_filter=BasicFilter(field="age", operator="greater_than", value="28"),
+            ),
+        )
+        graph.add_filter(filter_settings)
+        add_connection(graph, input_schema.NodeConnection.create_from_simple_input(from_id=1, to_id=2))
+
+        _add_catalog_writer(
+            graph,
+            node_id=3,
+            depending_on_id=2,
+            table_name="no_source_virtual",
+            namespace_id=ns_id,
+            write_mode="virtual",
+        )
+
+        _run_graph(graph)
+
+        with get_db_context() as db:
+            repo = SQLAlchemyCatalogRepository(db)
+            tables = repo.list_tables(namespace_id=ns_id)
+            vt = next(t for t in tables if t.name == "no_source_virtual")
+            assert vt.is_optimized is True
+            assert vt.source_table_versions is not None
+            assert json.loads(vt.source_table_versions) == []
+
+
+class TestVersionRestampAndClear:
+    """Post-resolution re-stamping and the explicit-clear sentinel."""
+
+    @staticmethod
+    def _delta_source_virtual(tmp_dir: str) -> tuple[int, int, str]:
+        """Register a physical delta table + an optimized virtual over it.
+
+        Returns (physical_table_id, virtual_table_id, delta_path).
+        """
+        from shared.delta_utils import write_delta
+
+        ns_id = _create_namespace()
+        delta_path = f"{tmp_dir}/restamp_source"
+        write_delta(pl.DataFrame({"name": ["Alice", "Bob"], "age": [30, 25]}), delta_path, mode="overwrite")
+
+        with get_db_context() as db:
+            repo = SQLAlchemyCatalogRepository(db)
+            svc = CatalogService(repo)
+            physical = svc.register_table_from_data(
+                name="restamp_physical",
+                table_path=delta_path,
+                owner_id=1,
+                namespace_id=ns_id,
+                storage_format="delta",
+                schema=[{"name": "name", "dtype": "Utf8"}, {"name": "age", "dtype": "Int64"}],
+                row_count=2,
+                column_count=2,
+                size_bytes=100,
+            )
+            physical_id = physical.id
+
+        with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False) as f:
+            flow_path = f.name
+        reg_id = _create_flow_registration(ns_id, name="restamp_flow", path=flow_path)
+        graph = _create_graph(source_registration_id=reg_id)
+
+        promise = input_schema.NodePromise(flow_id=graph.flow_id, node_id=1, node_type="catalog_reader")
+        graph.add_node_promise(promise)
+        graph.add_catalog_reader(
+            input_schema.NodeCatalogReader(flow_id=graph.flow_id, node_id=1, catalog_table_id=physical_id)
+        )
+        _add_catalog_writer(
+            graph,
+            node_id=2,
+            depending_on_id=1,
+            table_name="restamp_virtual",
+            namespace_id=ns_id,
+            write_mode="virtual",
+        )
+        _run_graph(graph)
+        graph.save_flow(flow_path)
+
+        with get_db_context() as db:
+            repo = SQLAlchemyCatalogRepository(db)
+            vt = next(t for t in repo.list_tables(namespace_id=ns_id) if t.name == "restamp_virtual")
+            return physical_id, vt.id, delta_path
+
+    def test_resolution_restamps_versions_after_source_change(self):
+        """Stale versions → resolution re-runs the producer flow and re-stamps,
+        and fresh_versions_hash (post-resolution, identity-map-bypassing) sees it."""
+        from flowfile_core.catalog.text_utils import hash_source_versions
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            _, virtual_id, delta_path = self._delta_source_virtual(tmp_dir)
+
+            with get_db_context() as db:
+                repo = SQLAlchemyCatalogRepository(db)
+                recorded_before = repo.get_table(virtual_id).source_table_versions
+                assert json.loads(recorded_before)[0]["version"] == 0
+
+            from shared.delta_utils import write_delta
+
+            write_delta(pl.DataFrame({"name": ["Zed"], "age": [99]}), delta_path, mode="overwrite")
+
+            with get_db_context() as db:
+                repo = SQLAlchemyCatalogRepository(db)
+                svc = CatalogService(repo)
+                stale_row = repo.get_table(virtual_id)
+                stale_hash = hash_source_versions(stale_row.source_table_versions)
+
+                svc.resolve_virtual_flow_table(virtual_id, run_location="local")
+
+                fresh_hash = svc.fresh_versions_hash(virtual_id)
+                assert fresh_hash != stale_hash
+                fresh_row = repo.get_table_fresh(virtual_id)
+                assert json.loads(fresh_row.source_table_versions)[0]["version"] == 1
+
+    def test_preview_reflects_out_of_band_source_change(self, catalog_service):
+        """End-to-end fresh-result-not-discarded proof: the preview after an
+        out-of-band source write must show the new data, not the cached IPC
+        snapshot named by the pre-resolution versions hash."""
+        from shared.delta_utils import write_delta
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            _, virtual_id, delta_path = self._delta_source_virtual(tmp_dir)
+
+            preview1 = catalog_service.get_table_preview(virtual_id)
+            assert len(preview1.rows) == 2
+
+            write_delta(pl.DataFrame({"name": ["Zed"], "age": [99]}), delta_path, mode="overwrite")
+
+            preview2 = catalog_service.get_table_preview(virtual_id)
+            assert len(preview2.rows) == 1
+
+    def test_update_virtual_flow_table_versions_sentinel(self):
+        """Passing None clears the fingerprint; omitting the arg leaves it."""
+        ns_id = _create_namespace()
+        reg_id = _create_flow_registration(ns_id, name="sentinel_flow")
+
+        with get_db_context() as db:
+            repo = SQLAlchemyCatalogRepository(db)
+            svc = CatalogService(repo)
+            vt = svc.create_virtual_flow_table(
+                name="sentinel_virtual",
+                owner_id=1,
+                producer_registration_id=reg_id,
+                namespace_id=ns_id,
+                source_table_versions='[{"table_id": 1, "file_path": "/x", "version": 3}]',
+            )
+
+            svc.update_virtual_flow_table(vt.id, description="still fingerprinted")
+            assert repo.get_table(vt.id).source_table_versions is not None
+
+            svc.update_virtual_flow_table(vt.id, source_table_versions=None)
+            assert repo.get_table(vt.id).source_table_versions is None
+
+    def test_reader_over_non_optimized_virtual_invalidates_every_run(self, eager_virtual_table_id):
+        """A non-optimized virtual re-runs its producer at resolution, so a
+        reader over it can never prove freshness — it must invalidate each run
+        (run_flow doctrine)."""
+        graph = _create_graph()
+        graph.add_node_promise(
+            input_schema.NodePromise(flow_id=graph.flow_id, node_id=1, node_type="catalog_reader")
+        )
+        graph.add_catalog_reader(
+            input_schema.NodeCatalogReader(flow_id=graph.flow_id, node_id=1, catalog_table_id=eager_virtual_table_id)
+        )
+        node = graph.get_node(1)
+
+        _run_graph(graph)
+        epoch_after_first = node._cache_epoch
+        _run_graph(graph)
+        assert node._cache_epoch == epoch_after_first + 1
+
+    def test_versions_none_when_source_unfingerprintable(self, eager_virtual_table_id):
+        """A reader over a virtual source without its own fingerprint poisons
+        the whole collection (complete-or-nothing) — even alongside a
+        fingerprintable physical delta source."""
+        from flowfile_core.flowfile.flow_graph import _collect_source_table_versions
+        from shared.delta_utils import write_delta
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ns_id = _create_namespace()
+            delta_path = f"{tmp_dir}/unfp_source"
+            write_delta(pl.DataFrame({"x": [1]}), delta_path, mode="overwrite")
+            with get_db_context() as db:
+                repo = SQLAlchemyCatalogRepository(db)
+                svc = CatalogService(repo)
+                physical = svc.register_table_from_data(
+                    name="unfp_physical",
+                    table_path=delta_path,
+                    owner_id=1,
+                    namespace_id=ns_id,
+                    storage_format="delta",
+                    schema=[{"name": "x", "dtype": "Int64"}],
+                    row_count=1,
+                    column_count=1,
+                    size_bytes=10,
+                )
+                physical_id = physical.id
+
+            graph = _create_graph()
+            graph.add_node_promise(
+                input_schema.NodePromise(flow_id=graph.flow_id, node_id=1, node_type="catalog_reader")
+            )
+            graph.add_catalog_reader(
+                input_schema.NodeCatalogReader(flow_id=graph.flow_id, node_id=1, catalog_table_id=physical_id)
+            )
+            assert _collect_source_table_versions(graph) is not None
+
+            graph.add_node_promise(
+                input_schema.NodePromise(flow_id=graph.flow_id, node_id=2, node_type="catalog_reader")
+            )
+            graph.add_catalog_reader(
+                input_schema.NodeCatalogReader(
+                    flow_id=graph.flow_id, node_id=2, catalog_table_id=eager_virtual_table_id
+                )
+            )
+            assert _collect_source_table_versions(graph) is None
+
+
+@pytest.fixture()
+def no_snapshot(monkeypatch):
+    """Fail the test if a preview asks the worker for a virtual table snapshot or reads a file in core."""
+
+    def _refused(*_args, **_kwargs):
+        pytest.fail("the preview read a virtual table snapshot")
+
+    monkeypatch.setattr(previews, "trigger_resolve_virtual_table", _refused)
+    monkeypatch.setattr(previews, "read_top_n", _refused)
+
+
+@pytest.fixture()
+def sampled(monkeypatch) -> list:
+    """Every ``WorkerBackend.sample`` as ``(ref, n)``."""
+    calls = []
+    real_sample = WorkerBackend.sample
+
+    def _recording_sample(self, ref, n):
+        calls.append((ref, n))
+        return real_sample(self, ref, n)
+
+    monkeypatch.setattr(WorkerBackend, "sample", _recording_sample)
+    return calls
+
+
+def _run_samples(sampled: list) -> list:
+    """The samples of a run's result, without those of the bounded reads a node makes while it runs (pivot values)."""
+    return [(ref, n) for ref, n in sampled if not ref.result_id.startswith("bounded_")]
+
+
+@pytest.mark.usefixtures("protocol_on", "no_snapshot")
+class TestVirtualTablePreviewThroughABackend:
+    """With the protocol flag on, a virtual table's preview is read through a backend, never from a snapshot file."""
+
+    def test_a_table_whose_producer_runs_previews_a_sample_of_that_runs_reference(
+        self, eager_virtual_table_id, catalog_service, sampled
+    ):
+        preview = catalog_service.get_table_preview(eager_virtual_table_id)
+
+        assert len(preview.rows) == 3
+        assert preview.total_rows == 3
+        [(ref, n)] = _run_samples(sampled)
+        assert n == 100
+        assert ref.state == "deferred"
+        assert WorkerLocation.model_validate_json(ref.location).kind == "plan"
+        assert not registry.backend(ref.backend_id).exists(ref)
+
+    def test_an_optimised_table_previews_its_plan_through_a_bounded_read(
+        self, lazy_virtual_table_id, catalog_service, sampled
+    ):
+        preview = catalog_service.get_table_preview(lazy_virtual_table_id)
+
+        assert len(preview.rows) == 2
+        assert preview.total_rows == 2
+        assert sampled
+        assert all(ref.result_id.startswith("bounded_") for ref, _ in sampled)
+
+    def test_a_query_table_previews_its_plan_through_a_bounded_read(
+        self, lazy_virtual_table_id, catalog_service, sampled
+    ):
+        query_table = catalog_service.create_query_virtual_table(
+            name="q_lazy_virtual", owner_id=1, sql_query="SELECT * FROM lazy_virtual", namespace_id=_create_namespace()
+        )
+
+        preview = catalog_service.get_table_preview(query_table.id)
+
+        assert len(preview.rows) == 2
+        assert preview.total_rows == 2
+        assert sampled
+        assert all(ref.result_id.startswith("bounded_") for ref, _ in sampled)
+
+    def test_the_resolve_route_reads_the_producer_runs_reference(
+        self, eager_virtual_table_id, catalog_service, sampled
+    ):
+        preview = catalog_service.resolve_virtual_flow_table_preview(eager_virtual_table_id, 2)
+
+        assert len(preview.rows) == 2
+        assert preview.total_rows == 3
+        [(ref, n)] = _run_samples(sampled)
+        assert n == 2
+        assert not registry.backend(ref.backend_id).exists(ref)
+
+    def test_a_table_whose_producer_cannot_run_previews_empty(self, catalog_service, sampled, tmp_path):
+        ns_id = _create_namespace()
+        reg_id = _create_flow_registration(ns_id, name="gone_producer", path=str(tmp_path / "gone.yaml"))
+        table = catalog_service.create_virtual_flow_table(
+            name="gone_virtual", owner_id=1, producer_registration_id=reg_id, namespace_id=ns_id
+        )
+
+        preview = catalog_service.get_table_preview(table.id)
+
+        assert (preview.columns, preview.rows, preview.total_rows) == ([], [], 0)
+        assert sampled == []
+
+
+class TestVirtualTableProducerCompute:
+    """A virtual table's producer runs where the execution context says, and a worker it cannot reach answers 503."""
+
+    @pytest.mark.parametrize("backend_id", [registry.LOCAL_BACKEND_ID, registry.WORKER_BACKEND_ID])
+    def test_with_no_location_named_the_producer_runs_on_the_contexts_backend(
+        self, eager_virtual_table_id, catalog_service, monkeypatch, backend_id
+    ):
+        entered = []
+
+        def recording(context):
+            entered.append(context.backend_id)
+            return use_context(context)
+
+        monkeypatch.setattr(virtual_tables_module, "use_context", recording)
+
+        with use_context(ExecutionContext(backend_id, parallelism=1, preview_rows=None)):
+            catalog_service.resolve_virtual_flow_table(eager_virtual_table_id)
+
+        assert entered == [backend_id]
+
+    def test_the_resolve_route_on_a_stopped_worker_answers_503_naming_no_address(
+        self, eager_virtual_table_id, monkeypatch
+    ):
+        client = TestClient(main.app)
+        client.headers = {"Authorization": f"Bearer {client.post('/auth/token').json()['access_token']}"}
+        url = closed_url()
+        monkeypatch.setattr(registry.backend(registry.WORKER_BACKEND_ID), "url", url)
+
+        response = client.post(f"/catalog/virtual-tables/{eager_virtual_table_id}/resolve")
+
+        assert response.status_code == 503
+        assert response.json()["detail"] == "Compute unavailable"
+        assert url not in response.text

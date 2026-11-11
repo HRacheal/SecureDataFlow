@@ -1,0 +1,1100 @@
+import { setActivePinia, createPinia } from "pinia";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { AiProvider } from "../views/AiSettingsView/aiProviderTypes";
+
+const mockSymbols = vi.hoisted(() => {
+  class AiStreamHttpError extends Error {
+    constructor(
+      public readonly status: number,
+      public readonly detail: string,
+    ) {
+      super(detail || `HTTP ${status}`);
+      this.name = "AiStreamHttpError";
+    }
+  }
+  class AiDisabledError extends Error {
+    constructor(message = "AI features are disabled.") {
+      super(message);
+      this.name = "AiDisabledError";
+    }
+  }
+  return {
+    AiStreamHttpError,
+    AiDisabledError,
+    streamChat: vi.fn(),
+    streamGenerateDocumentation: vi.fn(),
+    streamInlineAction: vi.fn(),
+    streamLineageQuestion: vi.fn(),
+    streamRunFailureExplanation: vi.fn(),
+    routeMessage: vi.fn(),
+    fetchAiProviders: vi.fn(async (): Promise<AiProvider[]> => []),
+    generateFlow: vi.fn(),
+    agentStoreStart: vi.fn(),
+    agentStoreAbort: vi.fn(),
+    flowStoreState: { flowId: 1 as number | null, vueFlowInstance: null as unknown },
+    editorStoreState: {
+      isAiOpen: false,
+      openAiDrawer: vi.fn(),
+      closeAiDrawer: vi.fn(),
+    },
+    loadPersistedAiState: vi.fn(() => ({
+      messages: [],
+      selectedProvider: null as string | null,
+      selectedModel: null as string | null,
+      autoPromote: null as boolean | null,
+    })),
+    persistAiState: vi.fn(),
+    clearPersistedAiState: vi.fn(),
+    // Device-wide settings bucket. `null` = never written (fresh install),
+    // which makes the store fall back to the legacy per-flow fields above.
+    loadPersistedAiSettings: vi.fn((): Record<string, unknown> | null => null),
+    persistAiSettings: vi.fn(),
+  };
+});
+
+vi.mock("../services/axios.config", () => {
+  const axiosStub = {
+    defaults: {},
+    interceptors: {
+      request: { use: vi.fn() },
+      response: { use: vi.fn() },
+    },
+    get: vi.fn(),
+    post: vi.fn(),
+    put: vi.fn(),
+    delete: vi.fn(),
+    patch: vi.fn(),
+  };
+  return { default: axiosStub };
+});
+
+vi.mock("../services/auth.service", () => {
+  const stub = {
+    getToken: vi.fn(async () => null),
+    logout: vi.fn(),
+    isInDesktopMode: () => false,
+    setModeFromBackend: vi.fn(),
+    initialize: vi.fn(async () => false),
+    hasValidToken: () => false,
+    requiresLogin: () => false,
+    isAuthenticated: () => false,
+    getCurrentUser: vi.fn(async () => null),
+  };
+  return { default: stub, authService: stub };
+});
+
+vi.mock("../services/aiStreamClient", () => ({
+  AiStreamHttpError: mockSymbols.AiStreamHttpError,
+  streamChat: mockSymbols.streamChat,
+  streamGenerateDocumentation: mockSymbols.streamGenerateDocumentation,
+  streamInlineAction: mockSymbols.streamInlineAction,
+  streamLineageQuestion: mockSymbols.streamLineageQuestion,
+  streamRunFailureExplanation: mockSymbols.streamRunFailureExplanation,
+  routeMessage: mockSymbols.routeMessage,
+}));
+
+vi.mock("../api/ai.api", () => ({
+  AiStreamHttpError: mockSymbols.AiStreamHttpError,
+  AiDisabledError: mockSymbols.AiDisabledError,
+  fetchAiProviders: mockSymbols.fetchAiProviders,
+  routeMessage: mockSymbols.routeMessage,
+  streamChat: mockSymbols.streamChat,
+  streamGenerateDocumentation: mockSymbols.streamGenerateDocumentation,
+  streamInlineAction: mockSymbols.streamInlineAction,
+  streamLineageQuestion: mockSymbols.streamLineageQuestion,
+  streamRunFailureExplanation: mockSymbols.streamRunFailureExplanation,
+}));
+
+vi.mock("./ai-agent-store", () => ({
+  useAiAgentStore: () => ({
+    start: mockSymbols.agentStoreStart,
+    abort: mockSymbols.agentStoreAbort,
+  }),
+}));
+
+vi.mock("./editor-store", () => ({
+  useEditorStore: () => mockSymbols.editorStoreState,
+}));
+
+vi.mock("./flow-store", () => ({
+  useFlowStore: () => mockSymbols.flowStoreState,
+}));
+
+vi.mock("./ai-store-persistence", () => ({
+  highestPersistedMessageId: () => 0,
+  loadPersistedAiState: mockSymbols.loadPersistedAiState,
+  persistAiState: mockSymbols.persistAiState,
+  clearPersistedAiState: mockSymbols.clearPersistedAiState,
+  loadPersistedAiSettings: mockSymbols.loadPersistedAiSettings,
+  persistAiSettings: mockSymbols.persistAiSettings,
+}));
+
+// localModelApi imports config/constants, which reads ``window`` at module
+// load — mock it (like every other sibling) so the store imports cleanly in
+// the jsdom-free unit env. Default ``fetchLocalModelStatus`` → null so no
+// synthetic "local" provider is injected, preserving the BYOK-only
+// expectations in the loadProviders specs below.
+vi.mock("../views/AiSettingsView/localModelApi", () => ({
+  LOCAL_PROVIDER_ID: "local",
+  fetchLocalModelStatus: vi.fn(async () => null),
+  generateFlow: mockSymbols.generateFlow,
+  // The real guard: pure, and the code-mode failure specs rely on it.
+  isGenerateFlowFailure: (detail: unknown) =>
+    typeof detail === "object" &&
+    detail !== null &&
+    (detail as { kind?: unknown }).kind === "code" &&
+    typeof (detail as { message?: unknown }).message === "string",
+  selectLocalModel: vi.fn(),
+  streamLocalModelInstall: vi.fn(),
+}));
+
+// Simple-build applies via the diff client (acceptDiff); mock it so the store
+// imports cleanly without the fetch layer.
+vi.mock("../services/aiDiffClient", () => ({
+  acceptDiff: vi.fn(),
+}));
+
+import { useAiStore } from "./ai-store";
+
+beforeEach(() => {
+  setActivePinia(createPinia());
+  mockSymbols.streamChat.mockReset();
+  mockSymbols.routeMessage.mockReset();
+  mockSymbols.agentStoreStart.mockReset();
+  mockSymbols.agentStoreAbort.mockReset();
+  mockSymbols.fetchAiProviders.mockReset();
+  mockSymbols.fetchAiProviders.mockImplementation(async () => []);
+  mockSymbols.flowStoreState.flowId = 1;
+  mockSymbols.loadPersistedAiState.mockReset();
+  mockSymbols.loadPersistedAiState.mockImplementation(() => ({
+    messages: [],
+    selectedProvider: null,
+    selectedModel: null,
+    autoPromote: null,
+  }));
+  mockSymbols.loadPersistedAiSettings.mockReset();
+  mockSymbols.loadPersistedAiSettings.mockImplementation(() => null);
+  mockSymbols.persistAiSettings.mockReset();
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+const _withProvider = (): ReturnType<typeof useAiStore> => {
+  const store = useAiStore();
+  store.selectedProvider = "anthropic";
+  store.selectedModel = "claude-sonnet-4-6";
+  return store;
+};
+
+describe("useAiStore - sendMessage with mode", () => {
+  it("promotes to agent when verdict='agent'", async () => {
+    mockSymbols.routeMessage.mockResolvedValue({
+      verdict: "agent",
+      kind: "build",
+      confidence: 0.85,
+      reason: "user wants to add a group_by",
+      latencyMs: 320,
+    });
+    mockSymbols.agentStoreStart.mockResolvedValue(undefined);
+
+    const store = _withProvider();
+    expect(store.mode).toBe("auto");
+    await store.sendMessage("add a group_by node grouping by status");
+
+    expect(mockSymbols.routeMessage).toHaveBeenCalledTimes(1);
+    expect(mockSymbols.routeMessage).toHaveBeenCalledWith({
+      message: "add a group_by node grouping by status",
+      provider: "anthropic",
+      model: "claude-sonnet-4-6",
+      // First send of the session — no prior turns, so `history` is omitted.
+      history: undefined,
+    });
+    expect(mockSymbols.agentStoreStart).toHaveBeenCalledTimes(1);
+    expect(mockSymbols.agentStoreStart).toHaveBeenCalledWith(
+      expect.objectContaining({
+        flow_id: 1,
+        prompt: "add a group_by node grouping by status",
+        // Default agent surface is now ``agent_live`` (REPL-style), so
+        // auto-promote dispatches there. Users can override via the
+        // settings popover.
+        surface: "agent_live",
+        provider: "anthropic",
+      }),
+    );
+    expect(mockSymbols.streamChat).not.toHaveBeenCalled();
+    // Banner is set so AiAssistant.vue renders the "switch back to chat" affordance.
+    expect(store.promotionBanner).toEqual({
+      reason: "user wants to add a group_by",
+      message: "add a group_by node grouping by status",
+    });
+    // The user message lands in the chat trail without an `[Agent]` prefix —
+    // the banner conveys the mode change.
+    expect(store.messages).toHaveLength(1);
+    expect(store.messages[0]).toMatchObject({
+      role: "user",
+      content: "add a group_by node grouping by status",
+    });
+  });
+
+  it("forwards recent chat history to /ai/route", async () => {
+    // Short follow-ups like "can you implement?" only classify
+    // correctly when the LLM sees the prior assistant suggestion.
+    // The store passes the last few non-pending messages to /ai/route.
+    mockSymbols.routeMessage.mockResolvedValue({
+      verdict: "agent",
+      kind: "build",
+      confidence: 0.82,
+      reason: "follow-up to a suggestion",
+      latencyMs: 410,
+    });
+    mockSymbols.agentStoreStart.mockResolvedValue(undefined);
+
+    const store = _withProvider();
+    // Seed the chat trail with a prior question + response.
+    store.messages = [
+      {
+        id: 1,
+        createdAt: 1,
+        role: "user",
+        content: "how do I count customers per city?",
+      },
+      {
+        id: 2,
+        createdAt: 2,
+        role: "assistant",
+        content: "Add a group_by node grouping on city ...",
+      },
+    ];
+
+    await store.sendMessage("can you implement?");
+
+    expect(mockSymbols.routeMessage).toHaveBeenCalledTimes(1);
+    const callBody = mockSymbols.routeMessage.mock.calls[0][0];
+    expect(callBody.message).toBe("can you implement?");
+    expect(callBody.history).toEqual([
+      { role: "user", content: "how do I count customers per city?" },
+      { role: "assistant", content: "Add a group_by node grouping on city ..." },
+    ]);
+    expect(mockSymbols.agentStoreStart).toHaveBeenCalledTimes(1);
+
+    // The agent's prompt is enriched with the chat transcript so the
+    // planner knows what to build. Without this, the agent receives
+    // only "can you implement?" and asks the user to clarify what
+    // they want — defeating the auto-promotion.
+    const agentArgs = mockSymbols.agentStoreStart.mock.calls[0][0];
+    expect(agentArgs.prompt).toContain("how do I count customers per city?");
+    expect(agentArgs.prompt).toContain("Add a group_by node grouping on city");
+    expect(agentArgs.prompt).toContain("can you implement?");
+    expect(agentArgs.prompt).toContain("User:");
+    expect(agentArgs.prompt).toContain("Assistant:");
+  });
+
+  it("dispatches the bare message when there's no prior chat history", async () => {
+    // First message of a session has no transcript to include; the
+    // enriched-prompt logic falls back to the verbatim text.
+    mockSymbols.routeMessage.mockResolvedValue({
+      verdict: "agent",
+      kind: "build",
+      confidence: 0.9,
+      reason: "clear build phrase",
+      latencyMs: 200,
+    });
+    mockSymbols.agentStoreStart.mockResolvedValue(undefined);
+
+    const store = _withProvider();
+    expect(store.messages).toHaveLength(0);
+    await store.sendMessage("add a sort node");
+
+    const agentArgs = mockSymbols.agentStoreStart.mock.calls[0][0];
+    expect(agentArgs.prompt).toBe("add a sort node");
+  });
+
+  it("pushes the user message before awaiting /ai/route (optimistic UX)", async () => {
+    // Without optimistic push the user's input clears, then they see
+    // *nothing* in the chat trail for the classifier latency (~800 ms
+    // p50 / ~1500 ms p95). Mirror the agent-mode dispatch's existing
+    // posture: push the message first, then route, then dispatch.
+    let captureSnapshot: { messageCount: number; lastContent: string | undefined } | null = null;
+    mockSymbols.routeMessage.mockImplementation(async () => {
+      // Inspect the store at the moment the classifier round-trip is in
+      // flight — the user's message must already be visible.
+      const snapshot = useAiStore();
+      captureSnapshot = {
+        messageCount: snapshot.messages.length,
+        lastContent: snapshot.messages[snapshot.messages.length - 1]?.content,
+      };
+      return {
+        verdict: "agent",
+        kind: "build",
+        confidence: 0.85,
+        reason: "...",
+        latencyMs: 700,
+      };
+    });
+    mockSymbols.agentStoreStart.mockResolvedValue(undefined);
+
+    const store = _withProvider();
+    expect(store.messages).toHaveLength(0);
+    await store.sendMessage("add a sort node");
+
+    expect(captureSnapshot).not.toBeNull();
+    expect(captureSnapshot!.messageCount).toBe(1);
+    expect(captureSnapshot!.lastContent).toBe("add a sort node");
+    // Promoted-agent dispatch must NOT push a duplicate user message.
+    const userMessages = store.messages.filter((m) => m.role === "user");
+    expect(userMessages).toHaveLength(1);
+    expect(userMessages[0].content).toBe("add a sort node");
+  });
+
+  it("falls through to chat when verdict='chat'", async () => {
+    mockSymbols.routeMessage.mockResolvedValue({
+      verdict: "chat",
+      kind: "chat",
+      confidence: 0.9,
+      reason: "message opens with a question word",
+      latencyMs: 14,
+    });
+    mockSymbols.streamChat.mockImplementation(async (_body, handlers) => {
+      handlers.onChunk?.("answer ");
+      handlers.onDone?.("stop");
+    });
+
+    const store = _withProvider();
+    await store.sendMessage("what columns does node 2 have");
+
+    expect(mockSymbols.routeMessage).toHaveBeenCalledTimes(1);
+    expect(mockSymbols.streamChat).toHaveBeenCalledTimes(1);
+    expect(mockSymbols.agentStoreStart).not.toHaveBeenCalled();
+    expect(store.promotionBanner).toBeNull();
+    // user + assistant placeholder pushed.
+    expect(store.messages).toHaveLength(2);
+  });
+
+  it("skips /ai/route entirely when mode is chat", async () => {
+    mockSymbols.streamChat.mockImplementation(async (_body, handlers) => {
+      handlers.onDone?.("stop");
+    });
+    const store = _withProvider();
+    store.setMode("chat");
+    await store.sendMessage("add a sort node");
+
+    expect(mockSymbols.routeMessage).not.toHaveBeenCalled();
+    expect(mockSymbols.streamChat).toHaveBeenCalledTimes(1);
+    expect(mockSymbols.agentStoreStart).not.toHaveBeenCalled();
+  });
+
+  it("skips /ai/route when no flow is loaded", async () => {
+    mockSymbols.flowStoreState.flowId = null;
+    mockSymbols.streamChat.mockImplementation(async (_body, handlers) => {
+      handlers.onDone?.("stop");
+    });
+    const store = _withProvider();
+    await store.sendMessage("add a sort node");
+
+    expect(mockSymbols.routeMessage).not.toHaveBeenCalled();
+    expect(mockSymbols.streamChat).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to chat when /ai/route throws", async () => {
+    mockSymbols.routeMessage.mockRejectedValue(
+      new mockSymbols.AiStreamHttpError(503, "AI features are disabled."),
+    );
+    mockSymbols.streamChat.mockImplementation(async (_body, handlers) => {
+      handlers.onDone?.("stop");
+    });
+    const store = _withProvider();
+    await store.sendMessage("add a sort node");
+
+    expect(mockSymbols.routeMessage).toHaveBeenCalledTimes(1);
+    expect(mockSymbols.streamChat).toHaveBeenCalledTimes(1);
+    expect(mockSymbols.agentStoreStart).not.toHaveBeenCalled();
+    expect(store.promotionBanner).toBeNull();
+  });
+
+  it("does not call /ai/route or dispatch when no provider is selected", async () => {
+    const store = useAiStore();
+    // selectedProvider stays null
+    await store.sendMessage("add a sort node");
+
+    expect(mockSymbols.routeMessage).not.toHaveBeenCalled();
+    expect(mockSymbols.streamChat).not.toHaveBeenCalled();
+    expect(mockSymbols.agentStoreStart).not.toHaveBeenCalled();
+    expect(store.streamingState).toBe("error");
+  });
+
+  it("low-confidence build gets verdict='chat' from the backend and stays as chat", async () => {
+    // The verdict-mapping is server-side; the store doesn't apply the
+    // threshold. This test exercises that contract.
+    mockSymbols.routeMessage.mockResolvedValue({
+      verdict: "chat",
+      kind: "build",
+      confidence: 0.3,
+      reason: "weak signal",
+      latencyMs: 200,
+    });
+    mockSymbols.streamChat.mockImplementation(async (_body, handlers) => {
+      handlers.onDone?.("stop");
+    });
+    const store = _withProvider();
+    await store.sendMessage("maybe drop trailing whitespace");
+
+    expect(mockSymbols.streamChat).toHaveBeenCalledTimes(1);
+    expect(mockSymbols.agentStoreStart).not.toHaveBeenCalled();
+  });
+});
+
+describe("useAiStore - undoPromotion", () => {
+  it("aborts the agent, flips mode to chat, and re-dispatches as chat", async () => {
+    mockSymbols.routeMessage.mockResolvedValue({
+      verdict: "agent",
+      kind: "build",
+      confidence: 0.85,
+      reason: "build signal",
+      latencyMs: 300,
+    });
+    mockSymbols.agentStoreStart.mockResolvedValue(undefined);
+    mockSymbols.agentStoreAbort.mockResolvedValue(undefined);
+    mockSymbols.streamChat.mockImplementation(async (_body, handlers) => {
+      handlers.onDone?.("stop");
+    });
+
+    const store = _withProvider();
+    await store.sendMessage("add a sort node");
+    expect(store.promotionBanner).not.toBeNull();
+    expect(store.mode).toBe("auto");
+    expect(mockSymbols.agentStoreStart).toHaveBeenCalledTimes(1);
+    // Pre-undo: chat stream should not have been opened.
+    expect(mockSymbols.streamChat).not.toHaveBeenCalled();
+
+    await store.undoPromotion();
+
+    expect(mockSymbols.agentStoreAbort).toHaveBeenCalledTimes(1);
+    expect(store.mode).toBe("chat");
+    expect(store.promotionBanner).toBeNull();
+    // After undo: a chat stream is opened; the saved user message stays
+    // exactly once in `messages` (no second push).
+    expect(mockSymbols.streamChat).toHaveBeenCalledTimes(1);
+    const userMessages = store.messages.filter((m) => m.role === "user");
+    expect(userMessages).toHaveLength(1);
+    expect(userMessages[0].content).toBe("add a sort node");
+  });
+
+  it("is a no-op when no banner is showing", async () => {
+    const store = _withProvider();
+    await store.undoPromotion();
+    expect(mockSymbols.agentStoreAbort).not.toHaveBeenCalled();
+    expect(mockSymbols.streamChat).not.toHaveBeenCalled();
+  });
+
+  it("also clears agentModeAccepted (mutually exclusive with continue-as-agent)", async () => {
+    // Undo means "back to chat". If a prior accept set
+    // agentModeAccepted=true, leaving it on would force the next send
+    // back to agent and silently erase the undo.
+    mockSymbols.routeMessage.mockResolvedValue({
+      verdict: "agent",
+      kind: "build",
+      confidence: 0.85,
+      reason: "build signal",
+      latencyMs: 200,
+    });
+    mockSymbols.agentStoreStart.mockResolvedValue(undefined);
+    mockSymbols.agentStoreAbort.mockResolvedValue(undefined);
+    mockSymbols.streamChat.mockImplementation(async (_body, handlers) => {
+      handlers.onDone?.("stop");
+    });
+
+    const store = _withProvider();
+    await store.sendMessage("add a sort node");
+    store.acceptPromotion();
+    expect(store.agentModeAccepted).toBe(true);
+
+    // Re-arm the banner (acceptPromotion clears it) so undo has something
+    // to act on.
+    store.promotionBanner = { reason: "...", message: "add a sort node" };
+    await store.undoPromotion();
+
+    expect(store.agentModeAccepted).toBe(false);
+    expect(store.mode).toBe("chat");
+  });
+});
+
+describe("useAiStore - acceptPromotion (round 7)", () => {
+  it("flips agentModeAccepted=true and clears the banner", async () => {
+    mockSymbols.routeMessage.mockResolvedValue({
+      verdict: "agent",
+      kind: "build",
+      confidence: 0.85,
+      reason: "build signal",
+      latencyMs: 200,
+    });
+    mockSymbols.agentStoreStart.mockResolvedValue(undefined);
+
+    const store = _withProvider();
+    await store.sendMessage("add a sort node");
+    expect(store.promotionBanner).not.toBeNull();
+    expect(store.agentModeAccepted).toBe(false);
+
+    store.acceptPromotion();
+
+    expect(store.agentModeAccepted).toBe(true);
+    expect(store.promotionBanner).toBeNull();
+    // Accept does NOT abort the in-flight run — "continue", not "restart".
+    expect(mockSymbols.agentStoreAbort).not.toHaveBeenCalled();
+  });
+
+  it("subsequent sendMessage skips /ai/route and dispatches agent directly", async () => {
+    mockSymbols.agentStoreStart.mockResolvedValue(undefined);
+
+    const store = _withProvider();
+    // Simulate post-accept state: banner cleared, flag flipped.
+    store.agentModeAccepted = true;
+    expect(store.messages).toHaveLength(0);
+
+    await store.sendMessage("now add a sort downstream");
+
+    expect(mockSymbols.routeMessage).not.toHaveBeenCalled();
+    expect(mockSymbols.agentStoreStart).toHaveBeenCalledTimes(1);
+    expect(mockSymbols.streamChat).not.toHaveBeenCalled();
+    const agentArgs = mockSymbols.agentStoreStart.mock.calls[0][0];
+    expect(agentArgs.flow_id).toBe(1);
+    // Default agent surface is ``agent_live``, so auto-promote dispatches there.
+    expect(agentArgs.surface).toBe("agent_live");
+    // The user message lands in the chat trail exactly once (round 6
+    // optimistic-push contract preserved).
+    expect(store.messages.filter((m) => m.role === "user")).toHaveLength(1);
+  });
+
+  it("acceptPromotion is a no-op when no banner is showing", () => {
+    const store = _withProvider();
+    expect(store.promotionBanner).toBeNull();
+    store.acceptPromotion();
+    expect(store.agentModeAccepted).toBe(false);
+  });
+
+  it("clearMessages resets agentModeAccepted", async () => {
+    const store = _withProvider();
+    store.agentModeAccepted = true;
+    store.messages = [{ id: 1, createdAt: 1, role: "user", content: "hi" }];
+
+    store.clearMessages();
+    expect(store.agentModeAccepted).toBe(false);
+    expect(store.messages).toHaveLength(0);
+  });
+});
+
+describe("useAiStore - mode default + autoPromote migration shim", () => {
+  // `mode` lives in sessionStorage now; the test environment has no
+  // `window`, so `_readPersistedMode` returns null and the migration
+  // shim ALWAYS drives the seed in these tests. Asserts that:
+  //   - legacy `autoPromote: false` from localStorage seeds mode="chat"
+  //   - legacy `autoPromote: true` / null / missing seeds mode="auto"
+  it("seeds mode='chat' when legacy autoPromote=false is in localStorage", () => {
+    mockSymbols.loadPersistedAiState.mockImplementation(() => ({
+      messages: [],
+      selectedProvider: null,
+      selectedModel: null,
+      autoPromote: false,
+    }));
+    const store = useAiStore();
+    expect(store.mode).toBe("chat");
+  });
+
+  it("seeds mode='auto' when no legacy autoPromote field is present", () => {
+    mockSymbols.loadPersistedAiState.mockImplementation(() => ({
+      messages: [],
+      selectedProvider: null,
+      selectedModel: null,
+      autoPromote: null,
+    }));
+    const store = useAiStore();
+    expect(store.mode).toBe("auto");
+  });
+
+  it("seeds mode='auto' when legacy autoPromote=true is in localStorage", () => {
+    mockSymbols.loadPersistedAiState.mockImplementation(() => ({
+      messages: [],
+      selectedProvider: null,
+      selectedModel: null,
+      autoPromote: true,
+    }));
+    const store = useAiStore();
+    expect(store.mode).toBe("auto");
+  });
+});
+
+describe("useAiStore - split model tiers (resolveSurface)", () => {
+  const _seed = (): ReturnType<typeof useAiStore> => {
+    const store = useAiStore();
+    store.providers = [
+      {
+        provider: "openrouter",
+        supportsTools: true,
+        supportsStreaming: true,
+        defaultModel: "qwen/qwen3-coder",
+        surfaces: { cron: "anthropic/claude-haiku-4.5" },
+        status: "configured",
+        credential: null,
+      },
+      {
+        provider: "local",
+        supportsTools: false,
+        supportsStreaming: true,
+        defaultModel: "qwen2.5-coder-3b",
+        surfaces: {},
+        status: "configured",
+        credential: null,
+      },
+    ];
+    store.setSelectedProvider("openrouter");
+    return store;
+  };
+
+  it("routes every surface to the main selection when split is off", () => {
+    const store = _seed();
+    store.setSelectedModel("anthropic/claude-opus-4.5");
+    expect(store.splitModels).toBe(false);
+    expect(store.resolveSurface("ghost_node")).toEqual({
+      provider: "openrouter",
+      model: "anthropic/claude-opus-4.5",
+    });
+    // cron is a simple surface but split is off → still the main selection.
+    expect(store.resolveSurface("cron")).toEqual({
+      provider: "openrouter",
+      model: "anthropic/claude-opus-4.5",
+    });
+  });
+
+  it("routes simple surfaces to the simple tier (own provider) when split is on", () => {
+    const store = _seed();
+    store.setSelectedModel("anthropic/claude-opus-4.5");
+    store.setSplitModels(true);
+    // Simple tier can be a different provider entirely (e.g. local).
+    store.setSimpleProvider("local");
+    expect(store.resolveSurface("cron")).toEqual({
+      provider: "local",
+      model: "qwen2.5-coder-3b",
+    });
+    expect(store.resolveSurface("settings_autocomplete").provider).toBe("local");
+    // Complex surfaces still use the main selection.
+    expect(store.resolveSurface("ghost_node")).toEqual({
+      provider: "openrouter",
+      model: "anthropic/claude-opus-4.5",
+    });
+  });
+
+  it("setSplitModels seeds the simple tier from the main selection", () => {
+    const store = _seed();
+    store.setSelectedModel("anthropic/claude-opus-4.5");
+    store.setSplitModels(true);
+    expect(store.simpleProvider).toBe("openrouter");
+    expect(store.simpleModel).toBe("anthropic/claude-opus-4.5");
+  });
+
+  it("setSimpleProvider defaults the simple model to that provider's default", () => {
+    const store = _seed();
+    store.setSplitModels(true);
+    store.setSimpleProvider("local");
+    expect(store.simpleModel).toBe("qwen2.5-coder-3b");
+  });
+
+  it("modelForSurface falls back to the surface preset, then provider default", () => {
+    const store = _seed();
+    store.setSelectedModel(null);
+    expect(store.modelForSurface("cron")).toBe("anthropic/claude-haiku-4.5");
+    expect(store.modelForSurface("mystery")).toBe("qwen/qwen3-coder");
+  });
+
+  it("modelForSurface returns null when no provider is selected", () => {
+    const store = useAiStore();
+    store.selectedProvider = null;
+    expect(store.modelForSurface("ghost_node")).toBeNull();
+  });
+
+  it("changing the complex provider leaves the independent simple tier intact", () => {
+    const store = _seed();
+    store.setSplitModels(true);
+    store.setSimpleProvider("local");
+    store.setSelectedProvider("openrouter");
+    // Simple tier is independent — not reset by a complex-provider change.
+    expect(store.simpleProvider).toBe("local");
+    expect(store.resolveSurface("cron").provider).toBe("local");
+  });
+
+  it("modelsForProvider unions the curated list with the default, deduped", () => {
+    const store = useAiStore();
+    store.providers = [
+      {
+        provider: "openrouter",
+        supportsTools: true,
+        supportsStreaming: true,
+        defaultModel: "qwen/qwen3-coder",
+        surfaces: {},
+        status: "configured",
+        credential: {
+          provider: "openrouter",
+          hasKey: true,
+          apiBase: null,
+          defaultModel: "anthropic/claude-sonnet-4.6",
+          models: ["moonshotai/kimi-k2:free", "anthropic/claude-sonnet-4.6"],
+          lastTestedAt: null,
+          lastTestStatus: null,
+          lastTestError: null,
+          createdAt: null,
+          updatedAt: null,
+        },
+      },
+    ];
+    expect(store.modelsForProvider("openrouter")).toEqual([
+      "moonshotai/kimi-k2:free",
+      "anthropic/claude-sonnet-4.6",
+    ]);
+    expect(store.modelsForProvider("missing")).toEqual([]);
+    expect(store.modelsForProvider(null)).toEqual([]);
+  });
+});
+
+describe("useAiStore - device-wide settings hydration", () => {
+  // Provider/model, the simple tier and the agent toggles are preferences,
+  // not conversation state: they hydrate from the settings bucket, fall
+  // back to the legacy per-flow fields exactly once (migration), and are
+  // written to the settings bucket — never the flow blob.
+  it("prefers the settings bucket over legacy per-flow fields", () => {
+    mockSymbols.loadPersistedAiState.mockImplementation(() => ({
+      messages: [],
+      selectedProvider: "anthropic",
+      selectedModel: "legacy-model",
+      autoPromote: null,
+      selectedAgentSurface: "agent_complex",
+      verifyPlanCompletion: false,
+    }));
+    mockSymbols.loadPersistedAiSettings.mockImplementation(() => ({
+      selectedProvider: "openai",
+      selectedModel: "gpt-5",
+      splitModels: true,
+      simpleProvider: "groq",
+      simpleModel: null,
+      selectedAgentSurface: "agent_staged",
+      verifyPlanCompletion: true,
+    }));
+    const store = useAiStore();
+    expect(store.selectedProvider).toBe("openai");
+    expect(store.selectedModel).toBe("gpt-5");
+    expect(store.splitModels).toBe(true);
+    expect(store.simpleProvider).toBe("groq");
+    expect(store.selectedAgentSurface).toBe("agent_staged");
+    expect(store.verifyPlanCompletion).toBe(true);
+    // Bucket already exists → no migration write.
+    expect(mockSymbols.persistAiSettings).not.toHaveBeenCalled();
+  });
+
+  it("migrates legacy per-flow settings into the bucket once when it is missing", () => {
+    mockSymbols.loadPersistedAiState.mockImplementation(() => ({
+      messages: [],
+      selectedProvider: "groq",
+      selectedModel: "llama",
+      autoPromote: null,
+      selectedAgentSurface: "agent_complex",
+      verifyPlanCompletion: true,
+    }));
+    const store = useAiStore();
+    expect(store.selectedProvider).toBe("groq");
+    expect(store.selectedModel).toBe("llama");
+    expect(store.selectedAgentSurface).toBe("agent_complex");
+    expect(store.verifyPlanCompletion).toBe(true);
+    expect(mockSymbols.persistAiSettings).toHaveBeenCalledTimes(1);
+    expect(mockSymbols.persistAiSettings).toHaveBeenCalledWith(
+      expect.objectContaining({
+        selectedProvider: "groq",
+        selectedModel: "llama",
+        selectedAgentSurface: "agent_complex",
+        verifyPlanCompletion: true,
+      }),
+    );
+  });
+
+  it("uses the defaults without a migration write on a fresh install", () => {
+    const store = useAiStore();
+    expect(store.selectedProvider).toBeNull();
+    expect(store.selectedAgentSurface).toBe("agent_live");
+    expect(store.verifyPlanCompletion).toBe(false);
+    expect(mockSymbols.persistAiSettings).not.toHaveBeenCalled();
+  });
+
+  it("writes agent settings to the settings bucket, not the flow blob", async () => {
+    const store = useAiStore();
+    store.setSelectedAgentSurface("agent_staged");
+    store.setVerifyPlanCompletion(true);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(mockSymbols.persistAiSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ selectedAgentSurface: "agent_staged", verifyPlanCompletion: true }),
+    );
+    // Throttled flow-blob writes from earlier specs may still land during the
+    // wait; what matters is that no flow-blob write ever carries a setting.
+    for (const [state] of mockSymbols.persistAiState.mock.calls as [Record<string, unknown>][]) {
+      expect(Object.keys(state).sort()).toEqual(["agentModeAccepted", "messages"]);
+    }
+  });
+});
+
+describe("useAiStore - aiDisabled", () => {
+  it("flags aiDisabled when the providers endpoint answers the disabled contract", async () => {
+    mockSymbols.fetchAiProviders.mockRejectedValue(new mockSymbols.AiDisabledError());
+    const store = useAiStore();
+    await store.loadProviders();
+    expect(store.aiDisabled).toBe(true);
+    expect(store.providers).toEqual([]);
+
+    // An admin flips the flag back on → the next successful load clears it.
+    mockSymbols.fetchAiProviders.mockResolvedValue([]);
+    await store.loadProviders();
+    expect(store.aiDisabled).toBe(false);
+  });
+
+  it("leaves aiDisabled false on an ordinary network failure", async () => {
+    mockSymbols.fetchAiProviders.mockRejectedValue(new Error("boom"));
+    const store = useAiStore();
+    await store.loadProviders();
+    expect(store.aiDisabled).toBe(false);
+    expect(store.providersError).toBe("boom");
+  });
+});
+
+describe("useAiStore - loadProviders resets a saved model the provider no longer offers", () => {
+  const _openrouter = (models: string[] | null): AiProvider => ({
+    provider: "openrouter",
+    supportsTools: true,
+    supportsStreaming: true,
+    defaultModel: "qwen/qwen3.6-35b-a3b",
+    surfaces: {},
+    status: "configured" as const,
+    credential:
+      models === null
+        ? null
+        : {
+            provider: "openrouter",
+            hasKey: true,
+            apiBase: null,
+            defaultModel: null,
+            models,
+            lastTestedAt: null,
+            lastTestStatus: null,
+            lastTestError: null,
+            createdAt: null,
+            updatedAt: null,
+          },
+  });
+
+  it("replaces a stale class default saved by an older build with the current default", async () => {
+    mockSymbols.loadPersistedAiSettings.mockImplementation(() => ({
+      selectedProvider: "openrouter",
+      selectedModel: "meta-llama/llama-3.3-70b-instruct",
+      splitModels: true,
+      simpleProvider: "openrouter",
+      simpleModel: "qwen/qwen3-coder-30b-a3b-instruct",
+    }));
+    mockSymbols.fetchAiProviders.mockResolvedValue([_openrouter(null)]);
+    const store = useAiStore();
+    expect(store.selectedModel).toBe("meta-llama/llama-3.3-70b-instruct");
+    await store.loadProviders();
+    expect(store.selectedProvider).toBe("openrouter");
+    expect(store.selectedModel).toBe("qwen/qwen3.6-35b-a3b");
+    expect(store.simpleModel).toBe("qwen/qwen3.6-35b-a3b");
+  });
+
+  it("keeps a model the user picked from their curated list", async () => {
+    mockSymbols.loadPersistedAiSettings.mockImplementation(() => ({
+      selectedProvider: "openrouter",
+      selectedModel: "custom/model-x:free",
+      splitModels: false,
+      simpleProvider: null,
+      simpleModel: null,
+    }));
+    mockSymbols.fetchAiProviders.mockResolvedValue([_openrouter(["custom/model-x:free"])]);
+    const store = useAiStore();
+    await store.loadProviders();
+    expect(store.selectedModel).toBe("custom/model-x:free");
+  });
+
+  it("leaves the pick alone when the provider list cannot be loaded", async () => {
+    mockSymbols.loadPersistedAiSettings.mockImplementation(() => ({
+      selectedProvider: "openrouter",
+      selectedModel: "meta-llama/llama-3.3-70b-instruct",
+    }));
+    mockSymbols.fetchAiProviders.mockRejectedValue(new Error("boom"));
+    const store = useAiStore();
+    await store.loadProviders();
+    expect(store.selectedModel).toBe("meta-llama/llama-3.3-70b-instruct");
+  });
+});
+
+describe("useAiStore - Simple build answers instead of failing on a question", () => {
+  const _seed = (): ReturnType<typeof useAiStore> => {
+    const store = useAiStore();
+    store.providers = [
+      {
+        provider: "local",
+        supportsTools: false,
+        supportsStreaming: true,
+        defaultModel: "qwen3.5-4b",
+        surfaces: {},
+        status: "configured",
+        credential: null,
+      },
+    ];
+    store.setSelectedProvider("local");
+    return store;
+  };
+
+  it("shows the model's reply as the assistant message and stages nothing", async () => {
+    mockSymbols.generateFlow.mockResolvedValue({
+      diffId: null,
+      opCount: 0,
+      created: [],
+      warnings: [],
+      rationale: "Answered without building",
+      diffPayload: null,
+      answer: "I build flows from a description; ask about this one in Chat mode.",
+    });
+    const store = _seed();
+    await store.generateFlowFromComposer("What is this flow?");
+    const reply = store.messages[store.messages.length - 1];
+    expect(reply.role).toBe("assistant");
+    expect(reply.content).toBe(
+      "I build flows from a description; ask about this one in Chat mode.",
+    );
+    expect(reply.buildDiffId).toBeUndefined();
+    expect(reply.error).toBeUndefined();
+    expect(store.streamingState).toBe("idle");
+  });
+
+  it("still renders the Add-to-canvas result for a real build", async () => {
+    mockSymbols.generateFlow.mockResolvedValue({
+      diffId: "diff-1",
+      opCount: 3,
+      created: [],
+      warnings: [],
+      rationale: "Generated flow (simple mode)",
+      diffPayload: {},
+      answer: null,
+      code: null,
+    });
+    const store = _seed();
+    await store.generateFlowFromComposer("read orders.csv and keep paid orders");
+    const reply = store.messages[store.messages.length - 1];
+    expect(reply.buildDiffId).toBe("diff-1");
+    expect(reply.buildOpCount).toBe(3);
+    expect(reply.content).toContain("Built a flow with 3 node(s)");
+  });
+});
+
+describe("useAiStore - Simple build in code mode", () => {
+  const SCRIPT = 'import flowfile as ff\norders = ff.read_csv("orders.csv")';
+  const _seed = (): ReturnType<typeof useAiStore> => {
+    const store = useAiStore();
+    store.providers = [
+      {
+        provider: "local",
+        supportsTools: false,
+        supportsStreaming: true,
+        defaultModel: "qwen3.5-4b",
+        surfaces: {},
+        status: "configured",
+        credential: null,
+      },
+    ];
+    store.setSelectedProvider("local");
+    return store;
+  };
+
+  it("asks for code by default and keeps the script on the bubble", async () => {
+    mockSymbols.generateFlow.mockResolvedValue({
+      diffId: "diff-2",
+      opCount: 1,
+      created: [],
+      warnings: [],
+      rationale: "Generated flow (code mode)",
+      diffPayload: {},
+      answer: null,
+      code: SCRIPT,
+    });
+    const store = _seed();
+    expect(store.simpleBuildOutput).toBe("code");
+    await store.generateFlowFromComposer("read orders.csv");
+    expect(mockSymbols.generateFlow).toHaveBeenCalledWith(
+      1,
+      "read orders.csv",
+      "local",
+      "qwen3.5-4b",
+      "code",
+    );
+    const reply = store.messages[store.messages.length - 1];
+    expect(reply.buildDiffId).toBe("diff-2");
+    expect(reply.buildCode).toBe(SCRIPT);
+    expect(reply.buildCodeLine).toBeUndefined();
+  });
+
+  it("sends the JSON mode when the setting says so", async () => {
+    mockSymbols.generateFlow.mockResolvedValue({
+      diffId: "diff-3",
+      opCount: 1,
+      created: [],
+      warnings: [],
+      rationale: "Generated flow (simple mode)",
+      diffPayload: {},
+      answer: null,
+      code: null,
+    });
+    const store = _seed();
+    store.setSimpleBuildOutput("json");
+    await store.generateFlowFromComposer("read orders.csv");
+    expect(mockSymbols.generateFlow).toHaveBeenLastCalledWith(
+      1,
+      "read orders.csv",
+      "local",
+      "qwen3.5-4b",
+      "simple",
+    );
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(mockSymbols.persistAiSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ simpleBuildOutput: "json" }),
+    );
+  });
+
+  it("shows the failing script and its line when the repair round also failed", async () => {
+    mockSymbols.generateFlow.mockRejectedValue({
+      response: {
+        status: 422,
+        data: {
+          detail: {
+            message: "`ff.read_json` is not a flowfile name",
+            line: 2,
+            kind: "code",
+            code: 'import flowfile as ff\norders = ff.read_json("orders.json")',
+          },
+        },
+      },
+    });
+    const store = _seed();
+    await store.generateFlowFromComposer("read orders.json");
+    const reply = store.messages[store.messages.length - 1];
+    expect(reply.error).toBe("line 2: `ff.read_json` is not a flowfile name");
+    expect(reply.content).toContain("Generation failed: line 2");
+    expect(reply.buildCode).toContain("ff.read_json");
+    expect(reply.buildCodeLine).toBe(2);
+    expect(reply.buildDiffId).toBeUndefined();
+    expect(store.streamingState).toBe("error");
+  });
+
+  it("keeps a plain string detail as the failure message", async () => {
+    mockSymbols.generateFlow.mockRejectedValue({
+      response: { status: 422, data: { detail: "Could not generate a flow: nothing parsed" } },
+    });
+    const store = _seed();
+    await store.generateFlowFromComposer("read orders.csv");
+    const reply = store.messages[store.messages.length - 1];
+    expect(reply.error).toBe("Could not generate a flow: nothing parsed");
+    expect(reply.buildCode).toBeUndefined();
+  });
+});

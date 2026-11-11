@@ -1,0 +1,84 @@
+// DEPRECATED: Import from '@/api' or '../../../api' instead
+// This file is kept for backward compatibility during migration
+
+import { ref, Ref } from "vue";
+import axios from "axios";
+import { FlowApi } from "../../api/flow.api";
+import type { NodeData } from "../../types/node.types";
+import type { FlowSettings, LocalFileInfo, RunInformation } from "../../types/flow.types";
+import { AxiosResponse } from "axios";
+
+export type {
+  ExecutionMode,
+  ExecutionLocation,
+  FlowSettings,
+  LocalFileInfo,
+} from "../../types/flow.types";
+
+export const insertNode = async (
+  flow_id: number,
+  node_id: number,
+  node_type: string,
+): Promise<AxiosResponse> => {
+  const response = await axios.post(
+    "editor/add_node/",
+    {},
+    {
+      params: {
+        flow_id: flow_id,
+        node_id: node_id,
+        node_type: node_type,
+      },
+      headers: {
+        accept: "application/json",
+      },
+    },
+  );
+  return response;
+};
+
+export async function createFlow(
+  flowPath: string | null = null,
+  name: string | null = null,
+  namespaceId: number | null = null,
+  registerInCatalog = true,
+): Promise<number> {
+  return FlowApi.createFlow(flowPath, name, namespaceId, registerInCatalog);
+}
+
+export async function getFlowSettings(flow_id: number): Promise<FlowSettings | null> {
+  return FlowApi.getFlowSettings(flow_id);
+}
+
+export async function updateFlowSettings(flowSettings: FlowSettings): Promise<null> {
+  console.log(flowSettings);
+  return FlowApi.updateFlowSettings(flowSettings);
+}
+
+export async function getSavedFlows(): Promise<LocalFileInfo[]> {
+  return FlowApi.getSavedFlows();
+}
+
+export const getNodeData = async (flow_id: number, node_id: number): Promise<Ref<NodeData>> => {
+  const response = await axios.get("/node", {
+    params: { flow_id: flow_id, node_id: node_id },
+    headers: { accept: "application/json" },
+  });
+  const nodeData: Ref<NodeData> = ref(response.data);
+  return nodeData;
+};
+
+export const addNodeSettings = async (node_type: string, nodeSettings: any) => {
+  const response = await axios.post("update_settings/", nodeSettings, {
+    params: { node_type: node_type },
+  });
+  console.log(response);
+};
+
+export const getRunStatus = async (flowId: number): Promise<AxiosResponse<RunInformation>> => {
+  const response = await axios.get("/flow/run_status/", {
+    params: { flow_id: flowId },
+    headers: { accept: "application/json" },
+  });
+  return response;
+};

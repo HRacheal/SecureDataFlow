@@ -1,0 +1,56 @@
+{
+  "source_file": "data\\reference\\historical_transactions.csv",
+  "records": 5000,
+  "categories": {
+    "Clothing": {
+      "n": 1001,
+      "log_price_median": 7.529572931627173,
+      "log_price_mad": 0.315666895236121,
+      "log_amount_median": 8.144806896627353,
+      "log_amount_mad": 0.48661100711518124,
+      "quantity_p995": 5.0,
+      "price_median_kes": 1862.31,
+      "amount_median_kes": 3445.44
+    },
+    "Electronics": {
+      "n": 670,
+      "log_price_median": 10.017130253384355,
+      "log_price_mad": 0.4870431699129494,
+      "log_amount_median": 10.17239370173176,
+      "log_amount_mad": 0.5036241342202228,
+      "quantity_p995": 3.0,
+      "price_median_kes": 22407.04,
+      "amount_median_kes": 26170.65
+    },
+    "Groceries": {
+      "n": 1764,
+      "log_price_median": 5.848459832308433,
+      "log_price_mad": 0.38885836860980794,
+      "log_amount_median": 7.143629413844687,
+      "log_amount_mad": 0.4662502426265611,
+      "quantity_p995": 9.0,
+      "price_median_kes": 346.7,
+      "amount_median_kes": 1266.01
+    },
+    "Household": {
+      "n": 1041,
+      "log_price_median": 7.78887054464767,
+      "log_price_mad": 0.4264632154888339,
+      "log_amount_median": 8.328629794807915,
+      "log_amount_mad": 0.5409863916966788,
+      "quantity_p995": 5.7999999999999545,
+      "price_median_kes": 2413.59,
+      "amount_median_kes": 4140.74
+    },
+    "Stationery": {
+      "n": 524,
+      "log_price_median": 5.313687297446838,
+      "log_price_mad": 0.3604094625571501,
+      "log_amount_median": 6.812528697748702,
+      "log_amount_mad": 0.46978595581305926,
+      "quantity_p995": 10.384999999999991,
+      "price_median_kes": 203.1,
+      "amount_median_kes": 909.17
+    }
+  }
+}

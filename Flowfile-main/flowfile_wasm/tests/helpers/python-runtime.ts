@@ -1,0 +1,66 @@
+/**
+ * Find a CPython interpreter for suites that shell out to real Python.
+ *
+ * Resolution order: FLOWFILE_TEST_PYTHON, the PATH pythons, this checkout's
+ * Poetry venv, then any monorepo Poetry venv — a git worktree gets its own
+ * (often empty) venv, so `poetry env info` alone can point at an interpreter
+ * with no Polars while the main checkout's venv has one.
+ */
+
+import { execFileSync } from 'node:child_process'
+import { existsSync, readdirSync } from 'node:fs'
+import { join, resolve } from 'node:path'
+
+/** The Poetry venv for whichever checkout we are in, if Poetry is installed. */
+function poetryPython(): string | null {
+  try {
+    return execFileSync('poetry', ['env', 'info', '--executable'], {
+      cwd: resolve(__dirname, '../../..'),
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore']
+    }).trim()
+  } catch {
+    return null
+  }
+}
+
+function poetryVenvPythons(): string[] {
+  const root = join(process.env.HOME ?? '', '.cache/pypoetry/virtualenvs')
+  if (!existsSync(root)) return []
+  return readdirSync(root)
+    .filter(name => name.startsWith('flowfile-'))
+    .map(name => join(root, name, 'bin', 'python'))
+    .filter(existsSync)
+}
+
+export interface FindPythonOptions {
+  requirePolars?: boolean
+  /** Import to run instead — an interpreter that cannot run it is skipped. */
+  probe?: string
+  /** Environment for the probe. Give a probe with side effects an isolated one. */
+  env?: NodeJS.ProcessEnv
+}
+
+export function findPython(options: FindPythonOptions = {}): string | null {
+  const probe = options.probe ?? (options.requirePolars ? 'import polars' : '')
+  const candidates = [process.env.FLOWFILE_TEST_PYTHON, 'python3', 'python', poetryPython(), ...poetryVenvPythons()]
+  for (const candidate of candidates) {
+    if (!candidate) continue
+    try {
+      execFileSync(candidate, ['-c', probe], { stdio: 'ignore', env: options.env ?? process.env })
+      return candidate
+    } catch {
+      /* try the next one */
+    }
+  }
+  // The CI parity job sets this so a mis-provisioned environment FAILS the
+  // suite instead of silently skipping every comparison (green-while-proving-
+  // nothing). Local runs without it keep today's skip behavior.
+  if (process.env.FLOWFILE_REQUIRE_TEST_PYTHON) {
+    throw new Error(
+      `FLOWFILE_REQUIRE_TEST_PYTHON is set but no interpreter passed the probe ${JSON.stringify(probe)} — ` +
+      'the parity suites would silently skip; fix the environment instead'
+    )
+  }
+  return null
+}

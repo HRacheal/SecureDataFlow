@@ -1,0 +1,258 @@
+from collections.abc import Callable, Iterable
+from functools import wraps
+
+from pl_fuzzy_frame_match.models import FuzzyMapping
+
+from flowfile_core.flowfile.filter_expressions import build_filter_expression, resolve_filter_field_type
+from flowfile_core.flowfile.flow_data_engine.flow_file_column.main import FlowfileColumn
+from flowfile_core.flowfile.setting_generator.setting_generator import SettingGenerator, SettingUpdator
+from flowfile_core.schemas import input_schema, transform_schema
+from flowfile_core.schemas.output_model import NodeData
+
+setting_generator = SettingGenerator()
+setting_updator = SettingUpdator()
+
+
+_NODE_FIELDS = ("description", "node_reference", "cache_results", "group_id", "pos_x", "pos_y")
+
+
+def _carry_node_fields(promise: input_schema.NodePromise, proposal) -> None:
+    """Keep what the user already set on the placeholder (e.g. its description) in the generated proposal."""
+    for field in _NODE_FIELDS:
+        if field in type(proposal).model_fields and getattr(promise, field, None) is not None:
+            setattr(proposal, field, getattr(promise, field))
+
+
+def setting_generator_method(f: callable) -> Callable:
+    @wraps(f)
+    def inner(node_data: NodeData) -> NodeData:
+        promise = node_data.setting_input
+        if promise is None or isinstance(promise, input_schema.NodePromise):
+            f(node_data)
+            if promise is not None and node_data.setting_input is not promise:
+                _carry_node_fields(promise, node_data.setting_input)
+        return node_data
+
+    setting_generator.add_setting_generator_func(inner)
+    return inner
+
+
+def setting_updator_method(f: callable) -> Callable:
+    """Register an updator that refreshes settings for display; it edits a copy, never the node's own settings."""
+
+    @wraps(f)
+    def inner(node_data: NodeData) -> NodeData:
+        if node_data.setting_input is not None and not isinstance(node_data.setting_input, input_schema.NodePromise):
+            node_data.setting_input = node_data.setting_input.model_copy(deep=True)
+            f(node_data)
+        return node_data
+
+    setting_updator.add_setting_updator_func(inner)
+    return inner
+
+
+@setting_generator_method
+def join(node_data: "NodeData") -> NodeData:
+    if node_data.right_input and node_data.main_input:
+        overlapping_cols = list(set(node_data.main_input.columns) & set(node_data.right_input.columns))
+        if len(overlapping_cols) > 0:
+            join_key = overlapping_cols[0]
+        else:
+            join_key = ""
+        join_input_manager = transform_schema.JoinInputManager(
+            transform_schema.JoinInput(
+                join_mapping=join_key,
+                left_select=node_data.main_input.columns,
+                right_select=node_data.right_input.columns,
+            )
+        )
+        join_input_manager.auto_rename()
+        ji = join_input_manager.to_join_input()
+        node_data.setting_input = input_schema.NodeJoin(
+            flow_id=node_data.flow_id, node_id=node_data.node_id, join_input=ji
+        )
+    return node_data
+
+
+@setting_generator_method
+def cross_join(node_data: "NodeData") -> NodeData:
+    if node_data.right_input and node_data.main_input:
+        cj_input_manager = transform_schema.CrossJoinInputManager(
+            transform_schema.CrossJoinInput(
+                left_select=node_data.main_input.columns, right_select=node_data.right_input.columns
+            )
+        )
+        cj_input_manager.auto_rename()
+        cj = cj_input_manager.to_cross_join_input()
+        node_data.setting_input = input_schema.NodeCrossJoin(
+            flow_id=node_data.flow_id, node_id=node_data.node_id, cross_join_input=cj
+        )
+    return node_data
+
+
+@setting_generator_method
+def filter(node_data: "NodeData") -> NodeData:
+    if node_data.main_input:
+        basic_filter = transform_schema.BasicFilter(
+            field="",
+            operator=transform_schema.FilterOperator.EQUALS,
+            value="",
+        )
+        fi = transform_schema.FilterInput(basic_filter=basic_filter, mode="basic")
+        node_data.setting_input = input_schema.NodeFilter(
+            flow_id=node_data.flow_id, node_id=node_data.node_id, filter_input=fi
+        )
+    return node_data
+
+
+@setting_updator_method
+def join(node_data: NodeData):  # noqa: F811
+    if node_data.right_input and node_data.main_input:
+        setting_input: input_schema.NodeJoin = node_data.setting_input
+        left_columns = set(node_data.main_input.columns)
+        right_columns = set(node_data.right_input.columns)
+        left_select = setting_input.join_input.left_select
+        right_select = setting_input.join_input.right_select
+        for ls in left_select.renames:
+            ls.is_available = ls.old_name in left_columns
+        for rs in right_select.renames:
+            rs.is_available = rs.old_name in right_columns
+        # Check ALL columns in renames to prevent duplicates
+        existing_columns_left = set(r.old_name for r in left_select.renames)
+        existing_columns_right = set(r.old_name for r in right_select.renames)
+        missing_incoming_left_columns = [ilc for ilc in left_columns if ilc not in existing_columns_left]
+        missing_incoming_right_columns = [irc for irc in right_columns if irc not in existing_columns_right]
+        if not hasattr(setting_input, "auto_keep_left"):
+            setting_input.auto_keep_left = False
+        if not hasattr(setting_input, "auto_keep_right"):
+            setting_input.auto_keep_right = False
+        for milc in missing_incoming_left_columns:
+            select_input = transform_schema.SelectInput(old_name=milc, keep=setting_input.auto_keep_left)
+            setting_input.join_input.add_new_select_column(select_input, "left")
+        for mirc in missing_incoming_right_columns:
+            select_input = transform_schema.SelectInput(old_name=mirc, keep=setting_input.auto_keep_right)
+            setting_input.join_input.add_new_select_column(select_input, "right")
+    return node_data
+
+
+@setting_updator_method
+def cross_join(node_data: NodeData):  # noqa: F811
+    if node_data.right_input and node_data.main_input:
+        setting_input: input_schema.NodeCrossJoin = node_data.setting_input
+        left_columns = set(node_data.main_input.columns)
+        right_columns = set(node_data.right_input.columns)
+        left_select = setting_input.cross_join_input.left_select
+        right_select = setting_input.cross_join_input.right_select
+        for ls in left_select.renames:
+            ls.is_available = ls.old_name in left_columns
+        for rs in right_select.renames:
+            rs.is_available = rs.old_name in right_columns
+        # Check ALL columns in renames to prevent duplicates
+        existing_columns_left = set(r.old_name for r in left_select.renames)
+        existing_columns_right = set(r.old_name for r in right_select.renames)
+        missing_incoming_left_columns = [ilc for ilc in left_columns if ilc not in existing_columns_left]
+        missing_incoming_right_columns = [irc for irc in right_columns if irc not in existing_columns_right]
+        if not hasattr(setting_input, "auto_keep_left"):
+            setting_input.auto_keep_left = False
+        if not hasattr(setting_input, "auto_keep_right"):
+            setting_input.auto_keep_right = False
+        for milc in missing_incoming_left_columns:
+            select_input = transform_schema.SelectInput(old_name=milc, keep=setting_input.auto_keep_left)
+            setting_input.cross_join_input.add_new_select_column(select_input, "left")
+        for mirc in missing_incoming_right_columns:
+            select_input = transform_schema.SelectInput(old_name=mirc, keep=setting_input.auto_keep_right)
+            setting_input.cross_join_input.add_new_select_column(select_input, "right")
+    return node_data
+
+
+@setting_updator_method
+def filter(node_data: NodeData):  # noqa: F811
+    """Show a basic filter's run-time expression as ``advanced_filter`` so the advanced editor opens pre-filled."""
+    filter_input: transform_schema.FilterInput = node_data.setting_input.filter_input
+    basic_filter = filter_input.basic_filter
+    if filter_input.is_advanced() or basic_filter is None or not basic_filter.field:
+        return node_data
+    schema = node_data.main_input.table_schema if node_data.main_input else []
+    column = next((c for c in schema if c.name == basic_filter.field), None)
+    field_type = resolve_filter_field_type(FlowfileColumn.from_input(column.name, column.data_type)) if column else None
+    try:
+        filter_input.advanced_filter = build_filter_expression(basic_filter, field_type)
+    except Exception:
+        # An incomplete basic filter (e.g. "between" without its upper bound) must not stop the drawer loading.
+        pass
+    return node_data
+
+
+@setting_updator_method
+def select(node_data: NodeData):
+    """Mark the columns the input no longer has, and list the ones it gained as the run treats them.
+
+    A run works on a copy and never flags them itself. A column the settings do not list is kept only
+    with ``keep_missing``, so it is listed with that ``keep``, as the join updater does with ``auto_keep_left``.
+    Each one is positioned after every listed column, in input order, where the run puts it, with its input
+    position and type: a missing position sorts as 0 in the drawer and the run, ahead of the listed columns.
+    """
+    if node_data.main_input:
+        setting_input: input_schema.NodeSelect = node_data.setting_input
+        columns = set(node_data.main_input.columns)
+        for select_input in setting_input.select_input:
+            select_input.is_available = select_input.old_name in columns
+        listed = {select_input.old_name for select_input in setting_input.select_input}
+        data_types = {field.name: field.data_type for field in node_data.main_input.table_schema}
+        position = max((s.position for s in setting_input.select_input if s.position is not None), default=0) + 1
+        for index, column in enumerate(node_data.main_input.columns):
+            if column not in listed:
+                setting_input.select_input.append(
+                    transform_schema.SelectInput(
+                        old_name=column,
+                        new_name=column,
+                        keep=setting_input.keep_missing,
+                        position=position,
+                        original_position=index,
+                        data_type=data_types.get(column),
+                    )
+                )
+                position += 1
+    return node_data
+
+
+def check_if_fuzzy_match_is_valid(
+    left_columns: Iterable[str], right_columns: Iterable[str], fuzzy_map: FuzzyMapping
+) -> bool:
+    if fuzzy_map.left_col not in left_columns:
+        return False
+    if fuzzy_map.right_col not in right_columns:
+        return False
+    return True
+
+
+@setting_updator_method
+def fuzzy_match(node_data: NodeData):
+    if node_data.right_input and node_data.main_input:
+        setting_input: input_schema.NodeFuzzyMatch = node_data.setting_input
+        left_columns = set(node_data.main_input.columns)
+        right_columns = set(node_data.right_input.columns)
+        left_select = setting_input.join_input.left_select
+        right_select = setting_input.join_input.right_select
+        for fuzzy_map in setting_input.join_input.join_mapping:
+            fuzzy_map.valid = check_if_fuzzy_match_is_valid(left_columns, right_columns, fuzzy_map)
+        for ls in left_select.renames:
+            ls.is_available = ls.old_name in left_columns
+        for rs in right_select.renames:
+            rs.is_available = rs.old_name in right_columns
+        # Check ALL columns in renames to prevent duplicates
+        existing_columns_left = set(r.old_name for r in left_select.renames)
+        existing_columns_right = set(r.old_name for r in right_select.renames)
+        missing_incoming_left_columns = [ilc for ilc in left_columns if ilc not in existing_columns_left]
+        missing_incoming_right_columns = [irc for irc in right_columns if irc not in existing_columns_right]
+        if not hasattr(setting_input, "auto_keep_left"):
+            setting_input.auto_keep_left = False
+        if not hasattr(setting_input, "auto_keep_right"):
+            setting_input.auto_keep_right = False
+        for milc in missing_incoming_left_columns:
+            select_input = transform_schema.SelectInput(old_name=milc, keep=setting_input.auto_keep_left)
+            setting_input.join_input.add_new_select_column(select_input, "left")
+        for mirc in missing_incoming_right_columns:
+            select_input = transform_schema.SelectInput(old_name=mirc, keep=setting_input.auto_keep_right)
+            setting_input.join_input.add_new_select_column(select_input, "right")
+    return node_data

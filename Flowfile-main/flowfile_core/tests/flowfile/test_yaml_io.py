@@ -1,0 +1,1320 @@
+"""
+Tests for YAML save/load functionality.
+
+Run with:
+    pytest flowfile_core/tests/flowfile/test_yaml_io.py -v
+
+These tests use real file I/O - NO MOCKING.
+"""
+import tempfile
+from pathlib import Path
+from typing import Literal
+
+import pytest
+import yaml
+
+from flowfile_core.configs import settings
+from flowfile_core.flowfile.flow_data_engine.flow_data_engine import FlowDataEngine
+from flowfile_core.flowfile.flow_graph import FlowGraph, add_connection
+from flowfile_core.flowfile.handler import FlowfileHandler
+from flowfile_core.flowfile.manage.io_flowfile import _flowfile_data_to_flow_information, open_flow
+from flowfile_core.schemas import input_schema, schemas, transform_schema
+from flowfile_core.schemas.cloud_storage_schemas import CloudStorageReadSettings, CloudStorageWriteSettings
+from flowfile_core.schemas.output_model import RunInformation
+
+
+def find_parent_directory(target_dir_name: str) -> Path:
+    """Navigate up directories until finding the target directory."""
+    current_path = Path(__file__)
+    while current_path.parent != current_path:
+        current_path = current_path.parent
+        if current_path.name == target_dir_name:
+            return current_path
+    raise FileNotFoundError(f"Could not find directory: {target_dir_name}")
+
+
+def create_graph(flow_id: int = 1, execution_mode: Literal['Development', 'Performance'] = 'Development') -> FlowGraph:
+    """Create a new FlowGraph for testing."""
+    handler = FlowfileHandler()
+    handler.register_flow(schemas.FlowSettings(
+        flow_id=flow_id,
+        name='test_flow',
+        path='.',
+        execution_mode=execution_mode
+    ))
+    return handler.get_flow(flow_id)
+
+
+def add_manual_input(graph: FlowGraph, data, node_id: int = 1):
+    """Add a manual input node with data."""
+    node_promise = input_schema.NodePromise(flow_id=graph.flow_id, node_id=node_id, node_type='manual_input')
+    graph.add_node_promise(node_promise)
+    input_file = input_schema.NodeManualInput(
+        flow_id=graph.flow_id,
+        node_id=node_id,
+        raw_data_format=input_schema.RawData.from_pylist(data)
+    )
+    graph.add_manual_input(input_file)
+    return graph
+
+
+def add_node_promise(graph: FlowGraph, node_type: str, node_id: int):
+    """Add a node promise."""
+    node_promise = input_schema.NodePromise(
+        flow_id=graph.flow_id,
+        node_id=node_id,
+        node_type=node_type
+    )
+    graph.add_node_promise(node_promise)
+
+
+def handle_run_info(run_info: RunInformation):
+    """Check run info for errors."""
+    if run_info is None:
+        raise ValueError("Run info is None")
+    if not run_info.success:
+        errors = 'errors:'
+        for node_step in run_info.node_step_result:
+            if not node_step.success:
+                errors += f'\n node_id:{node_step.node_id}, error: {node_step.error}'
+        raise ValueError(f'Graph should run successfully:\n{errors}')
+
+
+# FIXTURES
+
+@pytest.fixture
+def temp_dir():
+    """Create a temporary directory for test files."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        yield Path(tmpdir)
+
+
+@pytest.fixture
+def simple_graph() -> FlowGraph:
+    """Create a simple graph with manual input and select."""
+    graph = create_graph(flow_id=100)
+
+    data = [
+        {'name': 'Alice', 'age': 30, 'city': 'NYC'},
+        {'name': 'Bob', 'age': 25, 'city': 'LA'},
+        {'name': 'Charlie', 'age': 35, 'city': 'Chicago'},
+    ]
+    add_manual_input(graph, data, node_id=1)
+
+    add_node_promise(graph, 'select', node_id=2)
+    connection = input_schema.NodeConnection.create_from_simple_input(1, 2)
+    add_connection(graph, connection)
+
+    select_inputs = [
+        transform_schema.SelectInput(old_name='name', new_name='full_name', keep=True),
+        transform_schema.SelectInput(old_name='age', keep=True),
+        transform_schema.SelectInput(old_name='city', keep=False),  # Drop city
+    ]
+    node_select = input_schema.NodeSelect(
+        flow_id=graph.flow_id,
+        node_id=2,
+        depending_on_id=1,
+        select_input=select_inputs,
+    )
+    graph.add_select(node_select)
+
+    return graph
+
+
+@pytest.fixture
+def graph_with_filter() -> FlowGraph:
+    """Create a graph with filter node."""
+    graph = create_graph(flow_id=101)
+
+    data = [
+        {'product': 'Apple', 'price': 1.50, 'quantity': 100},
+        {'product': 'Banana', 'price': 0.75, 'quantity': 150},
+        {'product': 'Orange', 'price': 2.00, 'quantity': 80},
+    ]
+    add_manual_input(graph, data, node_id=1)
+
+    add_node_promise(graph, 'filter', node_id=2)
+    connection = input_schema.NodeConnection.create_from_simple_input(1, 2)
+    add_connection(graph, connection)
+
+    filter_input = transform_schema.FilterInput(
+        filter_type='basic',
+        basic_filter=transform_schema.BasicFilter(
+            field='price',
+            filter_type='>',
+            filter_value='1.0'
+        )
+    )
+    node_filter = input_schema.NodeFilter(
+        flow_id=graph.flow_id,
+        node_id=2,
+        depending_on_id=1,
+        filter_input=filter_input,
+    )
+    graph.add_filter(node_filter)
+
+    return graph
+
+
+@pytest.fixture
+def graph_with_group_by() -> FlowGraph:
+    """Create a graph with group by node."""
+    graph = create_graph(flow_id=102)
+
+    input_data = (
+        FlowDataEngine.create_random(100)
+        .apply_flowfile_formula('random_int(0, 4)', 'groups')
+        .select_columns(['groups', 'Country', 'sales_data'])
+    )
+    add_manual_input(graph, data=input_data.to_pylist(), node_id=1)
+
+    add_node_promise(graph, 'group_by', node_id=2)
+    connection = input_schema.NodeConnection.create_from_simple_input(1, 2)
+    add_connection(graph, connection)
+
+    group_by_input = transform_schema.GroupByInput([
+        transform_schema.AggColl('groups', 'groupby'),
+        transform_schema.AggColl('sales_data', 'sum', 'total_sales')
+    ])
+    node_group_by = input_schema.NodeGroupBy(
+        flow_id=graph.flow_id,
+        node_id=2,
+        groupby_input=group_by_input,
+    )
+    graph.add_group_by(node_group_by)
+
+    return graph
+
+
+@pytest.fixture
+def graph_with_join() -> FlowGraph:
+    """Create a graph with join node."""
+    graph = create_graph(flow_id=103)
+
+    left_data = [
+        {'id': 1, 'name': 'Alice'},
+        {'id': 2, 'name': 'Bob'},
+        {'id': 3, 'name': 'Charlie'},
+    ]
+    add_manual_input(graph, left_data, node_id=1)
+
+    right_data = [
+        {'id': 1, 'department': 'Sales'},
+        {'id': 2, 'department': 'Engineering'},
+        {'id': 4, 'department': 'Marketing'},
+    ]
+    add_node_promise(graph, 'manual_input', node_id=2)
+    input_file = input_schema.NodeManualInput(
+        flow_id=graph.flow_id,
+        node_id=2,
+        raw_data_format=input_schema.RawData.from_pylist(right_data)
+    )
+    graph.add_manual_input(input_file)
+
+    add_node_promise(graph, 'join', node_id=3)
+
+    left_conn = input_schema.NodeConnection.create_from_simple_input(1, 3)
+    add_connection(graph, left_conn)
+
+    right_conn = input_schema.NodeConnection.create_from_simple_input(2, 3, input_type='right')
+    add_connection(graph, right_conn)
+
+    join_input = transform_schema.JoinInput(
+        join_mapping=[transform_schema.JoinMap(left_col='id', right_col='id')],
+        how='inner',
+        left_select=transform_schema.JoinInputs(renames=[
+            transform_schema.SelectInput(old_name='id', keep=True),
+            transform_schema.SelectInput(old_name='name', keep=True),
+        ]),
+        right_select=transform_schema.JoinInputs(renames=[
+            transform_schema.SelectInput(old_name='id', keep=False),  # Drop duplicate key
+            transform_schema.SelectInput(old_name='department', keep=True),
+        ]),
+    )
+    node_join = input_schema.NodeJoin(
+        flow_id=graph.flow_id,
+        node_id=3,
+        join_input=join_input,
+        auto_generate_selection=False,
+    )
+    graph.add_join(node_join)
+
+    return graph
+
+
+# BASIC SAVE/LOAD TESTS
+
+class TestYamlSave:
+    """Test saving flows to YAML."""
+
+    def test_save_simple_graph_to_yaml(self, simple_graph: FlowGraph, temp_dir: Path):
+        """Test saving a simple graph to YAML."""
+        yaml_path = temp_dir / "simple_flow.yaml"
+        simple_graph.save_flow(str(yaml_path))
+        assert yaml_path.exists(), f"YAML file should exist at {yaml_path}"
+
+        with open(yaml_path) as f:
+            data = yaml.safe_load(f)
+
+        assert data is not None, "YAML should parse successfully"
+        assert 'flowfile_version' in data, "Should have version"
+        assert 'nodes' in data, "Should have nodes"
+        assert len(data['nodes']) == 2, "Should have 2 nodes"
+
+        print("\n=== Saved YAML ===")
+        print(yaml.dump(data, default_flow_style=False))
+
+    def test_save_graph_with_filter(self, graph_with_filter: FlowGraph, temp_dir: Path):
+        """Test saving a graph with filter node."""
+        yaml_path = temp_dir / "filter_flow.yaml"
+
+        graph_with_filter.save_flow(str(yaml_path))
+
+        with open(yaml_path) as f:
+            data = yaml.safe_load(f)
+        filter_node = next((n for n in data['nodes'] if n['type'] == 'filter'), None)
+        assert filter_node is not None, "Should have filter node"
+        assert 'setting_input' in filter_node, "Filter node should have settings"
+
+        print("\n=== Filter Node ===")
+        print(yaml.dump(filter_node, default_flow_style=False))
+
+    def test_save_graph_with_group_by(self, graph_with_group_by: FlowGraph, temp_dir: Path):
+        """Test saving a graph with group by node."""
+        yaml_path = temp_dir / "groupby_flow.yaml"
+
+        graph_with_group_by.save_flow(str(yaml_path))
+
+        with open(yaml_path) as f:
+            data = yaml.safe_load(f)
+
+        groupby_node = next((n for n in data['nodes'] if n['type'] == 'group_by'), None)
+        assert groupby_node is not None, "Should have group_by node"
+
+        print("\n=== Group By Node ===")
+        print(yaml.dump(groupby_node, default_flow_style=False))
+
+    def test_save_graph_with_join(self, graph_with_join: FlowGraph, temp_dir: Path):
+        """Test saving a graph with join node."""
+        yaml_path = temp_dir / "join_flow.yaml"
+        graph_with_join.save_flow(str(yaml_path))
+
+        with open(yaml_path) as f:
+            data = yaml.safe_load(f)
+
+        assert len(data['nodes']) == 3, "Should have 3 nodes (2 inputs + join)"
+
+        join_node = next((n for n in data['nodes'] if n['type'] == 'join'), None)
+        assert join_node is not None, "Should have join node"
+        assert 'setting_input' in join_node, "Join node should have settings"
+
+        print("\n=== Join Node ===")
+        print(yaml.dump(join_node, default_flow_style=False))
+
+
+class TestYamlLoad:
+    """Test loading flows from YAML."""
+
+    def test_load_simple_graph_from_yaml(self, simple_graph: FlowGraph, temp_dir: Path):
+        """Test loading a simple graph from YAML."""
+        yaml_path = temp_dir / "simple_flow.yaml"
+
+        simple_graph.save_flow(str(yaml_path))
+
+        loaded_flow = open_flow(yaml_path)
+
+        assert loaded_flow is not None, "Should load flow"
+        assert len(loaded_flow.nodes) == 2, "Should have 2 nodes"
+
+        node_types = {n.node_type for n in loaded_flow.nodes}
+        assert 'manual_input' in node_types, "Should have manual_input"
+        assert 'select' in node_types, "Should have select"
+
+        print("\n=== Loaded Flow ===")
+        print(f"Flow ID: {loaded_flow.flow_id}")
+        print(f"Nodes: {[n.node_id for n in loaded_flow.nodes]}")
+
+    def test_load_graph_with_join(self, graph_with_join: FlowGraph, temp_dir: Path):
+        """Test loading a graph with join from YAML."""
+        yaml_path = temp_dir / "join_flow.yaml"
+
+        graph_with_join.save_flow(str(yaml_path))
+        loaded_flow = open_flow(yaml_path)
+
+        assert len(loaded_flow.nodes) == 3, "Should have 3 nodes"
+
+        join_node = next((n for n in loaded_flow.nodes if n.node_type == 'join'), None)
+        assert join_node is not None, "Should have join node"
+        assert join_node.setting_input is not None, "Join should have settings"
+
+        join_settings = join_node.setting_input
+        assert hasattr(join_settings, 'join_input'), "Should have join_input"
+
+
+class TestRoundTrip:
+    """Test save -> load -> verify cycle."""
+
+    def test_roundtrip_simple_graph(self, simple_graph: FlowGraph, temp_dir: Path):
+        """Test full round trip for simple graph."""
+        yaml_path = temp_dir / "roundtrip.yaml"
+
+        original_result = simple_graph.run_graph()
+        handle_run_info(original_result)
+        original_data = simple_graph.get_node(2).get_resulting_data().to_pylist()
+
+        simple_graph.save_flow(str(yaml_path))
+
+        loaded_flow = open_flow(yaml_path)
+        loaded_result = loaded_flow.run_graph()
+        handle_run_info(loaded_result)
+        loaded_data = loaded_flow.get_node(2).get_resulting_data().to_pylist()
+
+        assert len(original_data) == len(loaded_data), "Should have same number of rows"
+        assert original_data == loaded_data, "Data should match"
+
+        print("\n=== Round Trip Success ===")
+        print(f"Original rows: {len(original_data)}")
+        print(f"Loaded rows: {len(loaded_data)}")
+
+    def test_roundtrip_preserves_connections(self, graph_with_join: FlowGraph, temp_dir: Path):
+        """Test that connections are preserved in round trip."""
+        yaml_path = temp_dir / "connections.yaml"
+
+        original_connections = set(graph_with_join.node_connections)
+
+        graph_with_join.save_flow(str(yaml_path))
+        loaded_flow = open_flow(yaml_path)
+
+        loaded_connections = set(loaded_flow.node_connections)
+
+        assert original_connections == loaded_connections, "Connections should match"
+
+        print("\n=== Connections ===")
+        print(f"Original: {original_connections}")
+        print(f"Loaded: {loaded_connections}")
+
+    def test_roundtrip_with_execution(self, graph_with_group_by: FlowGraph, temp_dir: Path):
+        """Test that loaded graph executes correctly."""
+        yaml_path = temp_dir / "executable.yaml"
+
+        graph_with_group_by.save_flow(str(yaml_path))
+
+        loaded_flow = open_flow(yaml_path)
+
+        result = loaded_flow.run_graph()
+        handle_run_info(result)
+
+        output_node = loaded_flow.get_node(2)
+        output_data = output_node.get_resulting_data()
+
+        assert output_data is not None, "Should have output data"
+        # count() resolves a lazy result; number_of_records is only pre-populated on a remote run.
+        assert output_data.count() > 0, "Should have records"
+
+        print("\n=== Execution Result ===")
+        print(f"Records: {output_data.count()}")
+
+
+class TestLegacyPickleLoad:
+    """Test loading legacy pickle files."""
+
+    def test_load_existing_pickle_file(self):
+        """Test loading an existing pickle file."""
+        flowfile_path = (
+                find_parent_directory("Flowfile")
+                / "flowfile_core/tests/support_files/flows/read_csv.flowfile"
+        )
+
+        if not flowfile_path.exists():
+            pytest.skip(f"Test file not found: {flowfile_path}")
+
+        flow = open_flow(flowfile_path)
+
+        assert flow is not None, "Should load pickle file"
+        assert len(flow.nodes) > 0, "Should have nodes"
+
+        print("\n=== Loaded Pickle ===")
+        print(f"Flow ID: {flow.flow_id}")
+        print(f"Nodes: {len(flow.nodes)}")
+        for node in flow.nodes:
+            print(f"  - {node.node_id}: {node.node_type}")
+
+    def test_convert_pickle_to_yaml(self, temp_dir: Path):
+        """Test converting a pickle file to YAML."""
+        flowfile_path = (
+                find_parent_directory("Flowfile")
+                / "flowfile_core/tests/support_files/flows/read_csv.flowfile"
+        )
+        if not flowfile_path.exists():
+            pytest.skip(f"Test file not found: {flowfile_path}")
+
+        yaml_path = temp_dir / "converted.yaml"
+
+        flow = open_flow(flowfile_path)
+
+        flow.save_flow(str(yaml_path))
+
+        assert yaml_path.exists(), "YAML file should exist"
+
+        with open(yaml_path) as f:
+            data = yaml.safe_load(f)
+
+        assert data is not None, "Should parse YAML"
+        assert 'nodes' in data, "Should have nodes"
+
+        print("\n=== Converted YAML ===")
+        print(f"Nodes: {len(data['nodes'])}")
+        print(yaml.dump(data, default_flow_style=False)[:1000] + "...")
+
+
+class TestFlowfileDataModel:
+    """Test FlowfileData Pydantic model."""
+
+    def test_flowfile_data_model_validation(self, simple_graph: FlowGraph):
+        """Test that FlowfileData validates correctly."""
+        flowfile_data = simple_graph.get_flowfile_data()
+
+        assert flowfile_data is not None, "Should create FlowfileData"
+        assert flowfile_data.flowfile_version is not None, "Should have version"
+        assert len(flowfile_data.nodes) == 2, "Should have 2 nodes"
+
+        data = flowfile_data.model_dump(mode='json')
+        restored = schemas.FlowfileData.model_validate(data)
+
+        assert restored.flowfile_id == flowfile_data.flowfile_id
+        assert len(restored.nodes) == len(flowfile_data.nodes)
+
+        print("\n=== FlowfileData ===")
+        print(f"Version: {flowfile_data.flowfile_version}")
+        print(f"ID: {flowfile_data.flowfile_id}")
+        print(f"Nodes: {len(flowfile_data.nodes)}")
+
+    def test_node_settings_validation(self, graph_with_join: FlowGraph):
+        """Test that node settings are properly validated."""
+        flowfile_data = graph_with_join.get_flowfile_data()
+
+        join_node = next((n for n in flowfile_data.nodes if n.type == 'join'), None)
+        assert join_node is not None, "Should have join node"
+
+        settings = join_node.setting_input
+        assert isinstance(settings, input_schema.NodeJoin), f"Expected NodeJoin, got {type(settings)}"
+
+        print("\n=== Join Settings ===")
+        print(f"Type: {type(settings).__name__}")
+        print(f"Has join_input: {hasattr(settings, 'join_input')}")
+
+
+class TestEdgeCases:
+    """Test edge cases and error handling."""
+
+    def test_save_empty_graph(self, temp_dir: Path):
+        """Test saving an empty graph."""
+        graph = create_graph(flow_id=999)
+        yaml_path = temp_dir / "empty.yaml"
+
+        graph.save_flow(str(yaml_path))
+
+        with open(yaml_path) as f:
+            data = yaml.safe_load(f)
+
+        assert data['nodes'] == [], "Empty graph should have no nodes"
+
+    def test_load_nonexistent_file(self, temp_dir: Path):
+        """Test loading a file that doesn't exist."""
+        fake_path = temp_dir / "nonexistent.yaml"
+
+        with pytest.raises(FileNotFoundError):
+            open_flow(fake_path)
+
+    def test_json_format(self, simple_graph: FlowGraph, temp_dir: Path):
+        """Test saving/loading JSON format."""
+        json_path = temp_dir / "flow.json"
+
+        simple_graph.save_flow(str(json_path))
+
+        assert json_path.exists(), "JSON file should exist"
+
+        loaded = open_flow(json_path)
+        assert len(loaded.nodes) == 2, "Should have 2 nodes"
+
+
+class TestFlowfileRoundTrip:
+    """Test that flows can be saved and loaded without data loss."""
+
+    def test_simple_manual_input_roundtrip(self, temp_dir: Path):
+        """Test saving and loading a simple manual input node."""
+        flow = create_graph(flow_id=200, execution_mode="Performance")
+        add_node_promise(flow, 'manual_input', node_id=1)
+        manual_input = input_schema.NodeManualInput(
+            flow_id=flow.flow_id,
+            node_id=1,
+            pos_x=100.0,
+            pos_y=200.0,
+            cache_results=True,
+            description='Test manual input',
+            raw_data_format=input_schema.RawData.from_pylist([
+                {'name': 'John', 'age': 30},
+                {'name': 'Jane', 'age': 25},
+            ])
+        )
+        flow.add_manual_input(manual_input)
+
+        path = temp_dir / 'test.yaml'
+        flow.save_flow(str(path))
+        loaded_flow = open_flow(path)
+
+        assert loaded_flow.__name__ == 'test'
+        node = loaded_flow.get_node(1)
+        assert node is not None
+        assert node.setting_input.pos_x == 100.0
+        assert node.setting_input.pos_y == 200.0
+        assert node.setting_input.cache_results
+        assert node.setting_input.description == 'Test manual input'
+        assert len(node.setting_input.raw_data_format.columns) == 2
+        assert node.setting_input.raw_data_format.columns[0].name == 'name'
+        assert node.setting_input.raw_data_format.columns[1].name == 'age'
+
+    def test_filter_node_roundtrip(self, temp_dir: Path):
+        """Test saving and loading a filter node."""
+        flow = create_graph(flow_id=201)
+
+        add_manual_input(flow, data=[
+            {'name': 'John', 'status': 'active'},
+            {'name': 'Jane', 'status': 'inactive'},
+        ], node_id=1)
+
+        add_node_promise(flow, 'filter', node_id=2)
+        connection = input_schema.NodeConnection.create_from_simple_input(1, 2)
+        add_connection(flow, connection)
+
+        filter_settings = input_schema.NodeFilter(
+            flow_id=flow.flow_id,
+            node_id=2,
+            depending_on_id=1,
+            filter_input=transform_schema.FilterInput(
+                advanced_filter='[status] = "active"',
+                filter_type='advanced'
+            )
+        )
+        flow.add_filter(filter_settings)
+
+        path = temp_dir / 'test.yaml'
+        flow.save_flow(str(path))
+        loaded_flow = open_flow(path)
+
+        loaded_filter = loaded_flow.get_node(2)
+        assert loaded_filter is not None
+        assert loaded_filter.setting_input.filter_input.advanced_filter == '[status] = "active"'
+        assert loaded_filter.setting_input.filter_input.mode == 'advanced'
+
+        assert loaded_filter.setting_input.depending_on_id == 1
+
+    def test_select_node_roundtrip(self, temp_dir: Path):
+        """Test saving and loading a select node with renames."""
+        flow = create_graph(flow_id=202)
+
+        add_manual_input(flow, data=[
+            {'customer_id': 'C001', 'full_name': 'John'},
+        ], node_id=1)
+
+        add_node_promise(flow, 'select', node_id=2)
+        connection = input_schema.NodeConnection.create_from_simple_input(1, 2)
+        add_connection(flow, connection)
+
+        select_settings = input_schema.NodeSelect(
+            flow_id=flow.flow_id,
+            node_id=2,
+            depending_on_id=1,
+            keep_missing=False,
+            select_input=[
+                transform_schema.SelectInput(old_name='customer_id', new_name='id', keep=True),
+                transform_schema.SelectInput(old_name='full_name', new_name='name', keep=True),
+            ],
+            sorted_by='none'
+        )
+        flow.add_select(select_settings)
+
+        path = temp_dir / 'test.yaml'
+        flow.save_flow(str(path))
+        loaded_flow = open_flow(path)
+
+        loaded_select = loaded_flow.get_node(2)
+        assert loaded_select is not None
+        assert loaded_select.setting_input.keep_missing == False
+        assert len(loaded_select.setting_input.select_input) == 2
+        assert loaded_select.setting_input.select_input[0].old_name == 'customer_id'
+        assert loaded_select.setting_input.select_input[0].new_name == 'id'
+        assert loaded_select.setting_input.select_input[1].old_name == 'full_name'
+        assert loaded_select.setting_input.select_input[1].new_name == 'name'
+
+    def test_join_node_roundtrip(self, temp_dir: Path):
+        """Test saving and loading a join node."""
+        flow = create_graph(flow_id=203, execution_mode="Performance")
+
+        add_manual_input(flow, data=[{'id': 1, 'name': 'John'}], node_id=1)
+
+        add_node_promise(flow, 'manual_input', node_id=2)
+        right_input = input_schema.NodeManualInput(
+            flow_id=flow.flow_id,
+            node_id=2,
+            raw_data_format=input_schema.RawData.from_pylist([{'id': 1, 'city': 'NYC'}])
+        )
+        flow.add_manual_input(right_input)
+
+        add_node_promise(flow, 'join', node_id=3)
+        left_conn = input_schema.NodeConnection.create_from_simple_input(1, 3)
+        add_connection(flow, left_conn)
+        right_conn = input_schema.NodeConnection.create_from_simple_input(2, 3, input_type='right')
+        add_connection(flow, right_conn)
+
+        join_settings = input_schema.NodeJoin(
+            flow_id=flow.flow_id,
+            node_id=3,
+            depending_on_ids=[1, 2],
+            join_input=transform_schema.JoinInput(
+                how='inner',
+                join_mapping=[
+                    transform_schema.JoinMap(left_col='id', right_col='id')
+                ],
+                left_select=transform_schema.JoinInputs(renames=[
+                    transform_schema.SelectInput(old_name='id', new_name='id', keep=True, join_key=True),
+                    transform_schema.SelectInput(old_name='name', new_name='name', keep=True),
+                ]),
+                right_select=transform_schema.JoinInputs(renames=[
+                    transform_schema.SelectInput(old_name='city', new_name='city', keep=True),
+                ])
+            ),
+            auto_generate_selection=False,
+        )
+        flow.add_join(join_settings)
+
+        path = temp_dir / 'test.yaml'
+        flow.save_flow(str(path))
+        loaded_flow = open_flow(path)
+
+        loaded_join = loaded_flow.get_node(3)
+        assert loaded_join is not None
+        assert loaded_join.setting_input.join_input.how == 'inner'
+        assert len(loaded_join.setting_input.join_input.join_mapping) == 1
+        assert loaded_join.setting_input.join_input.join_mapping[0].left_col == 'id'
+        assert loaded_join.setting_input.join_input.join_mapping[0].right_col == 'id'
+
+    def test_connections_preserved(self, temp_dir: Path):
+        """Test that node connections are preserved after round-trip."""
+        flow = create_graph(flow_id=204, execution_mode="Performance")
+
+        add_manual_input(flow, data=[{'x': 1}], node_id=1)
+
+        add_node_promise(flow, 'filter', node_id=2)
+        add_node_promise(flow, 'select', node_id=3)
+
+        conn1 = input_schema.NodeConnection.create_from_simple_input(1, 2)
+        conn2 = input_schema.NodeConnection.create_from_simple_input(2, 3)
+        add_connection(flow, conn1)
+        add_connection(flow, conn2)
+
+        filter_settings = input_schema.NodeFilter(
+            flow_id=flow.flow_id,
+            node_id=2,
+            depending_on_id=1,
+            filter_input=transform_schema.FilterInput(advanced_filter='[x] > 0', filter_type='advanced')
+        )
+        flow.add_filter(filter_settings)
+
+        select_settings = input_schema.NodeSelect(
+            flow_id=flow.flow_id,
+            node_id=3,
+            depending_on_id=2,
+            select_input=[]
+        )
+        flow.add_select(select_settings)
+
+        original_connections = set(flow.node_connections)
+        assert (1, 2) in original_connections
+        assert (2, 3) in original_connections
+
+        path = temp_dir / 'test.yaml'
+        flow.save_flow(str(path))
+        loaded_flow = open_flow(path)
+
+        loaded_connections = set(loaded_flow.node_connections)
+        assert (1, 2) in loaded_connections
+        assert (2, 3) in loaded_connections
+
+    def test_start_nodes_preserved(self, temp_dir: Path):
+        """Test that start nodes are correctly identified after round-trip."""
+        flow = create_graph(flow_id=205, execution_mode="Performance")
+
+        add_manual_input(flow, data=[{'a': 1}], node_id=1)
+
+        add_node_promise(flow, 'manual_input', node_id=2)
+        input2 = input_schema.NodeManualInput(
+            flow_id=flow.flow_id,
+            node_id=2,
+            raw_data_format=input_schema.RawData.from_pylist([{'b': 2}])
+        )
+        flow.add_manual_input(input2)
+
+        original_starts = {n.node_id for n in flow._flow_starts}
+        assert 1 in original_starts
+        assert 2 in original_starts
+
+        path = temp_dir / 'test.yaml'
+        flow.save_flow(str(path))
+        loaded_flow = open_flow(path)
+
+        loaded_starts = {n.node_id for n in loaded_flow._flow_starts}
+        assert 1 in loaded_starts
+        assert 2 in loaded_starts
+
+    def test_flow_settings_preserved(self, temp_dir: Path):
+        """Test that flow settings are preserved after round-trip."""
+        flow = create_graph(flow_id=206, execution_mode="Performance")
+        flow.flow_settings.description = 'Test description'
+        flow.flow_settings.execution_mode = 'Development'
+        flow.flow_settings.execution_location = 'remote'
+        flow.flow_settings.auto_save = True
+        flow.flow_settings.show_detailed_progress = False
+
+        add_manual_input(flow, data=[{'x': 1}], node_id=1)
+
+        path = temp_dir / 'test.yaml'
+        flow.save_flow(str(path))
+        loaded_flow = open_flow(path)
+
+        assert loaded_flow.flow_settings.description == 'Test description'
+        assert loaded_flow.flow_settings.execution_mode == 'Development'
+        reopened_on = 'auto' if settings.FLOWFILE_COMPUTE_PROTOCOL else 'remote'
+        assert loaded_flow.flow_settings.execution_location == reopened_on
+        assert loaded_flow.flow_settings.auto_save == True
+        assert loaded_flow.flow_settings.show_detailed_progress == False
+
+    def test_group_by_roundtrip(self, temp_dir: Path):
+        """Test saving and loading a group_by node."""
+        flow = create_graph(flow_id=207, execution_mode="Performance")
+
+        add_manual_input(flow, data=[
+            {'country': 'US', 'sales': 100},
+            {'country': 'UK', 'sales': 200},
+        ], node_id=1)
+
+        add_node_promise(flow, 'group_by', node_id=2)
+        connection = input_schema.NodeConnection.create_from_simple_input(1, 2)
+        add_connection(flow, connection)
+
+        groupby_settings = input_schema.NodeGroupBy(
+            flow_id=flow.flow_id,
+            node_id=2,
+            depending_on_id=1,
+            groupby_input=transform_schema.GroupByInput(
+                agg_cols=[
+                    transform_schema.AggColl('country', 'groupby', 'country'),
+                    transform_schema.AggColl('sales', 'sum', 'total_sales'),
+                    transform_schema.AggColl('sales', 'mean', 'avg_sales', output_type='Float64'),
+                ]
+            )
+        )
+        flow.add_group_by(groupby_settings)
+
+        path = temp_dir / 'test.yaml'
+        flow.save_flow(str(path))
+        loaded_flow = open_flow(path)
+
+        loaded_gb = loaded_flow.get_node(2)
+        assert loaded_gb is not None
+        agg_cols = loaded_gb.setting_input.groupby_input.agg_cols
+        assert len(agg_cols) == 3
+        assert agg_cols[0].agg == 'groupby'
+        assert agg_cols[1].agg == 'sum'
+        assert agg_cols[1].new_name == 'total_sales'
+        assert agg_cols[2].output_type == 'Float64'
+
+    def test_output_node_roundtrip(self, temp_dir: Path):
+        """Test saving and loading an output node."""
+        flow = create_graph(flow_id=208, execution_mode="Performance")
+
+        add_manual_input(flow, data=[{'x': 1}], node_id=1)
+
+        add_node_promise(flow, 'output', node_id=2)
+        connection = input_schema.NodeConnection.create_from_simple_input(1, 2)
+        add_connection(flow, connection)
+
+        output_settings = input_schema.NodeOutput(
+            flow_id=flow.flow_id,
+            node_id=2,
+            depending_on_id=1,
+            output_settings=input_schema.OutputSettings(
+                name='output.csv',
+                directory='/tmp',
+                file_type='csv',
+                write_mode='overwrite',
+                table_settings=input_schema.OutputCsvTable(
+                    delimiter=';',
+                    encoding='utf-8'
+                )
+            )
+        )
+        flow.add_output(output_settings)
+
+        path = temp_dir / 'test.yaml'
+        flow.save_flow(str(path))
+        loaded_flow = open_flow(path)
+
+        loaded_output = loaded_flow.get_node(2)
+        assert loaded_output is not None
+        assert loaded_output.setting_input.output_settings.name == 'output.csv'
+        assert loaded_output.setting_input.output_settings.file_type == 'csv'
+        assert loaded_output.setting_input.output_settings.write_mode == 'overwrite'
+        assert loaded_output.setting_input.output_settings.table_settings.delimiter == ';'
+
+    def test_output_node_without_write_mode_defaults_to_overwrite(self, temp_dir: Path):
+        """A flow persisted without write_mode must load as the historical 'overwrite', never as a new mode."""
+        flow = create_graph(flow_id=210, execution_mode="Performance")
+
+        add_manual_input(flow, data=[{'x': 1}], node_id=1)
+
+        add_node_promise(flow, 'output', node_id=2)
+        connection = input_schema.NodeConnection.create_from_simple_input(1, 2)
+        add_connection(flow, connection)
+
+        output_settings = input_schema.NodeOutput(
+            flow_id=flow.flow_id,
+            node_id=2,
+            depending_on_id=1,
+            output_settings=input_schema.OutputSettings(
+                name='output.xlsx',
+                directory='/tmp',
+                file_type='excel',
+                write_mode='update',
+                table_settings=input_schema.OutputExcelTable(sheet_name='Results')
+            )
+        )
+        flow.add_output(output_settings)
+
+        path = temp_dir / 'test.yaml'
+        flow.save_flow(str(path))
+        with open(path) as f:
+            data = yaml.safe_load(f)
+        persisted = next(n for n in data['nodes'] if n['type'] == 'output')['setting_input']['output_settings']
+        del persisted['write_mode']
+        with open(path, 'w') as f:
+            yaml.dump(data, f)
+
+        loaded_output = open_flow(path).get_node(2)
+        assert loaded_output.setting_input.output_settings.write_mode == 'overwrite'
+        assert loaded_output.setting_input.output_settings.table_settings.sheet_name == 'Results'
+
+
+@pytest.fixture
+def protocol_flag(protocol, monkeypatch) -> bool:
+    """The compute protocol flag, off and then on (``protocol``), with a default backend that is not core's own, so a
+    saved ``remote`` is not turned into ``local``."""
+    monkeypatch.setenv('FLOWFILE_COMPUTE_BACKEND', 'worker')
+    return protocol
+
+
+class TestExecutionLocationRoundTrip:
+    """A flow's execution location through save and load: ``auto`` and a backend id are kept, and with the compute
+    protocol on a flow saved ``local`` or ``remote``, or with no location, opens as ``auto``."""
+
+    @pytest.mark.parametrize('suffix', ['.yaml', '.json'])
+    def test_a_flow_on_a_backend_id_reopens_on_that_backend(self, protocol_flag, temp_dir: Path, suffix):
+        flow = create_graph(flow_id=230)
+        flow.execution_location = 'worker:team'
+        path = temp_dir / f'on_team{suffix}'
+        flow.save_flow(str(path))
+
+        loaded_flow = open_flow(path)
+
+        assert loaded_flow.execution_location == 'worker:team'
+        assert loaded_flow.execution_context.backend_id == 'worker:team'
+
+    def test_a_flow_on_auto_reopens_on_auto_with_the_protocol_on(self, protocol_flag, temp_dir: Path):
+        flow = create_graph(flow_id=231)
+        flow.execution_location = 'auto'
+        path = temp_dir / 'on_auto.yaml'
+        flow.save_flow(str(path))
+
+        assert open_flow(path).execution_location == ('auto' if protocol_flag else 'remote')
+
+    @pytest.mark.parametrize(
+        ('saved', 'opened_with_the_flag_off'),
+        [('local', 'local'), ('remote', 'remote'), (None, 'local')],
+        ids=['local', 'remote', 'no-key'],
+    )
+    def test_a_file_saved_local_or_remote_opens_as_auto_with_the_protocol_on(
+        self, protocol_flag, temp_dir: Path, saved, opened_with_the_flag_off
+    ):
+        path = temp_dir / 'saved.yaml'
+        create_graph(flow_id=232).save_flow(str(path))
+        with open(path) as f:
+            data = yaml.safe_load(f)
+        del data['flowfile_settings']['execution_location']
+        if saved is not None:
+            data['flowfile_settings']['execution_location'] = saved
+        with open(path, 'w') as f:
+            yaml.dump(data, f)
+
+        assert open_flow(path).execution_location == ('auto' if protocol_flag else opened_with_the_flag_off)
+
+    def test_a_legacy_pickle_saved_remote_opens_as_auto_with_the_protocol_on(self, protocol_flag):
+        flowfile_path = (
+                find_parent_directory("Flowfile")
+                / "flowfile_core/tests/support_files/flows/read_csv.flowfile"
+        )
+
+        assert open_flow(flowfile_path).execution_location == ('auto' if protocol_flag else 'remote')
+
+
+def build_flow_with_every_hand_written_yaml_dict(flow_id: int) -> FlowGraph:
+    """Two inputs, then a select, a join, a cross join, a fuzzy match and an output, the node types whose settings
+    write their own YAML dict, each on a backend id of its own; input 2 keeps the default. Nothing runs."""
+    flow = create_graph(flow_id=flow_id)
+    add_manual_input(flow, [{'id': 1, 'name': 'Ann'}], node_id=1)
+    add_manual_input(flow, [{'id': 1, 'name': 'Anne'}], node_id=2)
+
+    def wire(node_id: int, node_type: str, right: bool = True):
+        add_node_promise(flow, node_type, node_id)
+        add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, node_id))
+        if right:
+            add_connection(flow, input_schema.NodeConnection.create_from_simple_input(2, node_id, input_type='right'))
+
+    def both_sides():
+        return dict(
+            left_select=transform_schema.JoinInputs(renames=[transform_schema.SelectInput(old_name='id')]),
+            right_select=transform_schema.JoinInputs(renames=[transform_schema.SelectInput(old_name='name')]),
+        )
+
+    wire(3, 'select', right=False)
+    flow.add_select(input_schema.NodeSelect(
+        flow_id=flow_id, node_id=3, depending_on_id=1, execution_location='worker:n3',
+        select_input=[transform_schema.SelectInput(old_name='id')],
+    ))
+    wire(4, 'join')
+    flow.add_join(input_schema.NodeJoin(
+        flow_id=flow_id, node_id=4, depending_on_ids=[1, 2], execution_location='worker:n4',
+        auto_generate_selection=False,
+        join_input=transform_schema.JoinInput(
+            join_mapping=[transform_schema.JoinMap(left_col='id', right_col='id')], how='inner', **both_sides()
+        ),
+    ))
+    wire(5, 'cross_join')
+    flow.add_cross_join(input_schema.NodeCrossJoin(
+        flow_id=flow_id, node_id=5, depending_on_ids=[1, 2], execution_location='worker:n5',
+        auto_generate_selection=False, cross_join_input=transform_schema.CrossJoinInput(**both_sides()),
+    ))
+    wire(6, 'fuzzy_match')
+    flow.add_fuzzy_match(input_schema.NodeFuzzyMatch(
+        flow_id=flow_id, node_id=6, depending_on_ids=[1, 2], execution_location='worker:n6',
+        auto_generate_selection=False,
+        join_input=transform_schema.FuzzyMatchInput(
+            join_mapping=[transform_schema.FuzzyMap('name')], how='inner', **both_sides()
+        ),
+    ))
+    add_node_promise(flow, 'output', 7)
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(3, 7))
+    flow.add_output(input_schema.NodeOutput(
+        flow_id=flow_id, node_id=7, depending_on_id=3, execution_location='worker:n7',
+        output_settings=input_schema.OutputSettings(
+            name='out.csv', directory='.', file_type='csv', table_settings=input_schema.OutputCsvTable()
+        ),
+    ))
+    flow.get_node(1).setting_input.execution_location = 'worker:n1'
+    return flow
+
+
+class TestNodeExecutionLocationRoundTrip:
+    """A node's own execution location through save and load: a backend id is kept as saved, and a node saved
+    without one opens on ``auto``."""
+
+    @pytest.mark.parametrize('suffix', ['.yaml', '.json'])
+    def test_each_node_reopens_on_the_backend_it_was_saved_on(self, temp_dir: Path, suffix):
+        path = temp_dir / f'nodes{suffix}'
+        build_flow_with_every_hand_written_yaml_dict(240).save_flow(str(path))
+
+        loaded_flow = open_flow(path)
+
+        assert {node.node_id: node.setting_input.execution_location for node in loaded_flow.nodes} == {
+            1: 'worker:n1', 2: 'auto', 3: 'worker:n3', 4: 'worker:n4', 5: 'worker:n5', 6: 'worker:n6', 7: 'worker:n7',
+        }
+
+    def test_a_node_saved_without_a_location_opens_on_auto(self, temp_dir: Path):
+        path = temp_dir / 'nodes.yaml'
+        build_flow_with_every_hand_written_yaml_dict(241).save_flow(str(path))
+        with open(path) as f:
+            data = yaml.safe_load(f)
+        for node in data['nodes']:
+            del node['setting_input']['execution_location']
+        with open(path, 'w') as f:
+            yaml.dump(data, f)
+
+        assert {node.setting_input.execution_location for node in open_flow(path).nodes} == {'auto'}
+
+
+class TestJsonRoundTrip:
+    """Test JSON format produces same results as YAML."""
+
+    def test_json_roundtrip(self, temp_dir: Path):
+        """Test that JSON round-trip preserves data."""
+        flow = create_graph(flow_id=209, execution_mode="Performance")
+
+        add_node_promise(flow, 'manual_input', node_id=1)
+        manual_input = input_schema.NodeManualInput(
+            flow_id=flow.flow_id,
+            node_id=1,
+            pos_x=150.0,
+            pos_y=250.0,
+            raw_data_format=input_schema.RawData.from_pylist([
+                {'name': 'Test', 'value': 42},
+            ])
+        )
+        flow.add_manual_input(manual_input)
+
+        path = temp_dir / 'test.json'
+        flow.save_flow(str(path))
+        loaded_flow = open_flow(path)
+
+        node = loaded_flow.get_node(1)
+        assert node.setting_input.pos_x == 150.0
+        assert node.setting_input.pos_y == 250.0
+        assert node.setting_input.raw_data_format.columns[0].name == 'name'
+
+
+class TestNodeReferenceYaml:
+    """Test node_reference field YAML serialization."""
+
+    def test_node_reference_yaml_roundtrip(self, temp_dir: Path):
+        """Test that node_reference is preserved through YAML save/load."""
+        flow = create_graph(flow_id=210, execution_mode="Performance")
+
+        add_node_promise(flow, 'manual_input', node_id=1)
+        manual_input = input_schema.NodeManualInput(
+            flow_id=flow.flow_id,
+            node_id=1,
+            node_reference="my_custom_data",
+            raw_data_format=input_schema.RawData.from_pylist([
+                {'name': 'Test', 'value': 42},
+            ])
+        )
+        flow.add_manual_input(manual_input)
+
+        path = temp_dir / 'test_reference.yaml'
+        flow.save_flow(str(path))
+
+        with open(path) as f:
+            data = yaml.safe_load(f)
+
+        node_data = data['nodes'][0]
+        assert node_data.get('node_reference') == 'my_custom_data', \
+            "node_reference should be saved in YAML"
+
+        loaded_flow = open_flow(path)
+        node = loaded_flow.get_node(1)
+        assert node.setting_input.node_reference == 'my_custom_data', \
+            "node_reference should be restored after loading"
+
+    def test_node_reference_none_yaml_roundtrip(self, temp_dir: Path):
+        """Test that None node_reference is handled correctly."""
+        flow = create_graph(flow_id=211, execution_mode="Performance")
+
+        add_node_promise(flow, 'manual_input', node_id=1)
+        manual_input = input_schema.NodeManualInput(
+            flow_id=flow.flow_id,
+            node_id=1,
+            node_reference=None,  # Explicitly None
+            raw_data_format=input_schema.RawData.from_pylist([
+                {'name': 'Test', 'value': 42},
+            ])
+        )
+        flow.add_manual_input(manual_input)
+
+        path = temp_dir / 'test_reference_none.yaml'
+        flow.save_flow(str(path))
+        loaded_flow = open_flow(path)
+
+        node = loaded_flow.get_node(1)
+        assert node.setting_input.node_reference is None or node.setting_input.node_reference == "", \
+            "None node_reference should be handled correctly"
+
+
+class TestMultiOutputRoundtrip:
+    """Multi-output node connections must preserve their source output handle on round-trip."""
+
+    def test_random_split_preserves_output_handle_routing(self, tmp_path: Path):
+        graph = create_graph(flow_id=600)
+        add_manual_input(graph, [{"id": i} for i in range(50)], node_id=1)
+
+        add_node_promise(graph, "random_split", node_id=2)
+        add_connection(graph, input_schema.NodeConnection.create_from_simple_input(1, 2))
+        graph.add_random_split(
+            input_schema.NodeRandomSplit(
+                flow_id=graph.flow_id,
+                node_id=2,
+                depending_on_id=1,
+                splits=[
+                    input_schema.RandomSplitGroup(name="train", percentage=70.0),
+                    input_schema.RandomSplitGroup(name="test", percentage=20.0),
+                    input_schema.RandomSplitGroup(name="validate", percentage=10.0),
+                ],
+                seed=42,
+            )
+        )
+
+        # Three downstream record_count nodes, one wired to each output handle.
+        for downstream_id, handle in [(3, "output-0"), (4, "output-1"), (5, "output-2")]:
+            add_node_promise(graph, "record_count", node_id=downstream_id)
+            add_connection(
+                graph,
+                input_schema.NodeConnection(
+                    input_connection=input_schema.NodeInputConnection(
+                        node_id=downstream_id, connection_class="input-0"
+                    ),
+                    output_connection=input_schema.NodeOutputConnection(
+                        node_id=2, connection_class=handle,
+                    ),
+                ),
+            )
+            graph.add_record_count(
+                input_schema.NodeRecordCount(
+                    flow_id=graph.flow_id, node_id=downstream_id, depending_on_id=2
+                )
+            )
+
+        yaml_path = tmp_path / "random_split.yaml"
+        graph.save_flow(str(yaml_path))
+        loaded = open_flow(yaml_path)
+
+        for downstream_id, expected_handle in [(3, "output-0"), (4, "output-1"), (5, "output-2")]:
+            assert loaded.get_node(downstream_id)._input_output_handles[2] == expected_handle, (
+                f"Node {downstream_id} should be wired to {expected_handle} after reload"
+            )
+
+
+class TestCloudStorageAutoAuthImport:
+    """Regression: cloud storage nodes saved with the default auth_mode='auto' must re-import.
+
+    auth_mode was typed as the connection-level AuthMethod literal (which has no 'auto').
+    Pydantic skips default validation on construction, so a node built with the 'auto' default
+    saved fine, but re-opening the persisted flow validated the explicit 'auto' and raised a
+    ValidationError deep in _flowfile_data_to_flow_information (the import crash path).
+    """
+
+    @staticmethod
+    def _flowfile_data_with_node(node_type: str, setting_input: dict) -> schemas.FlowfileData:
+        return schemas.FlowfileData(
+            flowfile_version="1.0",
+            flowfile_id=1,
+            flowfile_name="cloud_auto_auth",
+            flowfile_settings=schemas.FlowfileSettings(),
+            nodes=[
+                schemas.FlowfileNode(id=1, type=node_type, is_start_node=True, setting_input=setting_input),
+            ],
+        )
+
+    def test_read_settings_auto_auth_survives_model_roundtrip(self):
+        settings = CloudStorageReadSettings(
+            resource_path="s3://demo-bucket/data-lake/sales/*", scan_mode="directory", file_format="parquet"
+        )
+        assert settings.auth_mode == "auto", "default node-level auth_mode should be 'auto'"
+        restored = CloudStorageReadSettings.model_validate(settings.model_dump())
+        assert restored.auth_mode == "auto"
+
+    def test_write_settings_auto_auth_survives_model_roundtrip(self):
+        settings = CloudStorageWriteSettings(resource_path="s3://demo-bucket/out/summary.parquet")
+        assert settings.auth_mode == "auto"
+        restored = CloudStorageWriteSettings.model_validate(settings.model_dump())
+        assert restored.auth_mode == "auto"
+
+    def test_cloud_storage_reader_auto_auth_reimports(self):
+        read_settings = CloudStorageReadSettings(
+            resource_path="s3://demo-bucket/data-lake/sales/year=2024/month=*",
+            scan_mode="directory",
+            file_format="parquet",
+            connection_name=None,
+        )
+        node = input_schema.NodeCloudStorageReader(
+            flow_id=1, node_id=1, user_id=1, cloud_storage_settings=read_settings
+        )
+        flowfile_data = self._flowfile_data_with_node("cloud_storage_reader", node.model_dump())
+
+        # Exact function from the reported import crash traceback.
+        flow_info = _flowfile_data_to_flow_information(flowfile_data)
+
+        loaded = flow_info.data[1].setting_input
+        assert isinstance(loaded, input_schema.NodeCloudStorageReader)
+        assert loaded.cloud_storage_settings.auth_mode == "auto"
+
+    def test_cloud_storage_writer_auto_auth_reimports(self):
+        write_settings = CloudStorageWriteSettings(
+            resource_path="s3://demo-bucket/data-lake/aggregated/summary.parquet",
+            write_mode="overwrite",
+            file_format="parquet",
+        )
+        node = input_schema.NodeCloudStorageWriter(
+            flow_id=1, node_id=1, user_id=1, cloud_storage_settings=write_settings
+        )
+        flowfile_data = self._flowfile_data_with_node("cloud_storage_writer", node.model_dump())
+
+        flow_info = _flowfile_data_to_flow_information(flowfile_data)
+
+        loaded = flow_info.data[1].setting_input
+        assert isinstance(loaded, input_schema.NodeCloudStorageWriter)
+        assert loaded.cloud_storage_settings.auth_mode == "auto"
+
+
+class TestSaveDoesNotRenameSamePathFlow:
+    """A save only adopts the file stem as the flow name when it RELOCATES the flow.
+
+    Regression: flows opened from disk have no save_location, so the back-fill
+    branch fired on the first save and overwrote the name with the file stem —
+    silently reverting a catalog rename.
+    """
+
+    def _opened_flow_shape(self, path: Path, name: str) -> FlowGraph:
+        """A graph shaped like open_flow leaves it: path set, save_location unset."""
+        graph = create_graph()
+        graph.flow_settings.path = str(path)
+        graph.flow_settings.save_location = None
+        graph.flow_settings.name = name
+        graph.__name__ = name
+        return graph
+
+    def test_same_path_save_backfills_save_location_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'house_price.yaml'
+            graph = self._opened_flow_shape(path, 'My renamed flow')
+            add_manual_input(graph, [{'a': 1}])
+
+            graph.save_flow(str(path))
+
+            assert graph.flow_settings.name == 'My renamed flow'
+            assert graph.__name__ == 'My renamed flow'
+            assert graph.flow_settings.save_location == str(path.absolute())
+
+    def test_relocating_save_adopts_the_new_stem(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            original = Path(tmp) / 'house_price.yaml'
+            target = Path(tmp) / 'sales_report.yaml'
+            graph = self._opened_flow_shape(original, 'My renamed flow')
+            add_manual_input(graph, [{'a': 1}])
+
+            graph.save_flow(str(target))
+
+            assert graph.flow_settings.name == 'sales_report'
+            assert graph.__name__ == 'sales_report'
+            assert graph.flow_settings.save_location == str(target.absolute())
+
+    def test_nameless_flow_still_adopts_the_stem(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'house_price.yaml'
+            graph = self._opened_flow_shape(path, '')
+            add_manual_input(graph, [{'a': 1}])
+
+            graph.save_flow(str(path))
+
+            assert graph.flow_settings.name == 'house_price'
+            assert graph.__name__ == 'house_price'
+
+
+if __name__ == '__main__':
+    pytest.main([__file__, '-v'])

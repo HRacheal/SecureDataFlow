@@ -1,0 +1,463 @@
+<template>
+  <div v-if="isLoaded && nodeFilter">
+    <generic-node-settings
+      v-model="nodeFilter"
+      @update:model-value="handleGenericSettingsUpdate"
+      @request-save="saveSettings"
+    >
+      <div class="listbox-wrapper">
+        <div style="border-radius: 20px">
+          <el-switch
+            v-model="isAdvancedFilter"
+            class="mb-2"
+            size="small"
+            active-text="Advanced filter options"
+            inactive-text="Basic filter"
+          />
+        </div>
+        <div class="split-mode-row">
+          <el-switch
+            v-model="splitModeEnabled"
+            size="small"
+            active-text="Split into pass/fail outputs"
+            inactive-text="Single output"
+          />
+          <div class="split-mode-hint">
+            Emit matching rows on handle P (pass) and non-matching rows on handle F (fail). Rows
+            with a null predicate are dropped from both.
+          </div>
+        </div>
+        <div v-if="isAdvancedFilter">
+          Advanced filter
+          <mainEditorRef ref="editorChild" :editor-string="editorString" />
+        </div>
+        <div v-if="!isAdvancedFilter">
+          <div class="filter-section">
+            <div v-if="nodeFilter?.filter_input.basic_filter" class="filter-row">
+              <!-- Column Selector -->
+              <div class="filter-field">
+                <label class="filter-label">Column</label>
+                <column-selector
+                  v-model="nodeFilter.filter_input.basic_filter.field"
+                  :value="nodeFilter.filter_input.basic_filter.field"
+                  :column-options="nodeData?.main_input?.columns"
+                  @update:value="(value: string) => handleFieldChange(value)"
+                />
+              </div>
+
+              <!-- Operator Selector -->
+              <div class="filter-field">
+                <label class="filter-label">Operator</label>
+                <column-selector
+                  v-model="operatorDisplayValue"
+                  :value="getOperatorLabel(nodeFilter.filter_input.basic_filter.operator)"
+                  :column-options="operatorLabels"
+                  @update:value="(value: string) => handleOperatorChange(value)"
+                />
+              </div>
+
+              <!-- Value Input (shown for most operators) -->
+              <div v-if="showValueInput" class="filter-field">
+                <label class="filter-label">Value</label>
+                <el-date-picker
+                  v-if="useDatePicker"
+                  v-model="nodeFilter.filter_input.basic_filter.value"
+                  :type="datePickerType"
+                  :value-format="datePickerValueFormat"
+                  :placeholder="valuePlaceholder"
+                />
+                <input
+                  v-else
+                  v-model="nodeFilter.filter_input.basic_filter.value"
+                  type="text"
+                  class="input-field"
+                  :placeholder="valuePlaceholder"
+                />
+              </div>
+
+              <!-- Second Value Input (for BETWEEN) -->
+              <div v-if="showValue2Input" class="filter-field">
+                <label class="filter-label">And</label>
+                <el-date-picker
+                  v-if="useDatePicker"
+                  v-model="nodeFilter.filter_input.basic_filter.value2"
+                  :type="datePickerType"
+                  :value-format="datePickerValueFormat"
+                  placeholder="End value"
+                />
+                <input
+                  v-else
+                  v-model="nodeFilter.filter_input.basic_filter.value2"
+                  type="text"
+                  class="input-field"
+                  placeholder="End value"
+                />
+              </div>
+            </div>
+
+            <!-- Help text for special operators -->
+            <div v-if="operatorHelpText" class="help-text">
+              {{ operatorHelpText }}
+            </div>
+          </div>
+        </div>
+      </div>
+    </generic-node-settings>
+  </div>
+  <CodeLoader v-else />
+</template>
+
+<script lang="ts" setup>
+import { ref, computed, nextTick, watch } from "vue";
+import { CodeLoader } from "vue-content-loader";
+import { ElMessage } from "element-plus";
+
+import ColumnSelector from "../../../baseNode/page_objects/dropDown.vue";
+import { useNodeStore } from "../../../../../stores/node-store";
+import { useFlowStore } from "../../../../../stores/flow-store";
+import { useNodeSettings } from "../../../../../composables/useNodeSettings";
+import mainEditorRef from "../../../../../features/designer/editor/fullEditor.vue";
+import { NodeFilter } from "../../../baseNode/nodeInput";
+import { NodeData } from "../../../baseNode/nodeInterfaces";
+import { buildOutputHandles } from "../../../../../utils/nodeHandles";
+import GenericNodeSettings from "../../../baseNode/genericNodeSettings.vue";
+import { advancedFilterError } from "./filterValidation";
+import {
+  FilterOperator,
+  FILTER_OPERATOR_LABELS,
+  getFilterOperatorLabel,
+  OPERATORS_NO_VALUE,
+  OPERATORS_WITH_VALUE2,
+} from "../../../../../types/node.types";
+
+const editorString = ref<string>("");
+const isLoaded = ref<boolean>(false);
+const isAdvancedFilter = ref<boolean>(false);
+const splitModeEnabled = ref<boolean>(false);
+const nodeStore = useNodeStore();
+const flowStore = useFlowStore();
+const nodeFilter = ref<NodeFilter | null>(null);
+const nodeData = ref<NodeData | null>(null);
+
+// Shows the saved split mode (on load and after a save), never an unsaved toggle.
+const updateNodeOutputHandles = () => {
+  const vfInstance = flowStore.vueFlowInstance;
+  if (!vfInstance || !nodeFilter.value) return;
+  const vfNode = vfInstance.findNode(String(nodeFilter.value.node_id));
+  if (!vfNode) return;
+  // Same derivation the canvas uses on flow open (NodeFilter.output_names).
+  vfNode.data.outputs = nodeFilter.value.split_mode
+    ? buildOutputHandles(2, ["pass", "fail"])
+    : buildOutputHandles(1);
+};
+
+const { saveSettings, pushNodeData, handleGenericSettingsUpdate } = useNodeSettings({
+  nodeRef: nodeFilter,
+  onBeforeSave: () => {
+    if (nodeFilter.value) {
+      if (isAdvancedFilter.value) {
+        const error = advancedFilterError(nodeStore.inputCode);
+        if (error) {
+          ElMessage.error(error);
+          return false;
+        }
+        updateAdvancedFilter();
+        nodeFilter.value.filter_input.mode = "advanced";
+        nodeFilter.value.filter_input.filter_type = "advanced";
+      } else {
+        nodeFilter.value.filter_input.mode = "basic";
+        nodeFilter.value.filter_input.filter_type = "basic";
+      }
+      nodeFilter.value.split_mode = splitModeEnabled.value;
+    }
+    return true;
+  },
+  onAfterSave: () => updateNodeOutputHandles(),
+});
+
+interface EditorChildType {
+  showHideOptions: () => void;
+  showTools: boolean;
+}
+const editorChild = ref<EditorChildType | null>(null);
+
+const operatorLabels = Object.keys(FILTER_OPERATOR_LABELS);
+
+const currentOperator = computed((): FilterOperator => {
+  const op = nodeFilter.value?.filter_input?.basic_filter?.operator;
+  if (!op) return "equals";
+  if (typeof op === "string") {
+    if (Object.values(FILTER_OPERATOR_LABELS).includes(op as FilterOperator)) {
+      return op as FilterOperator;
+    }
+    return convertLegacyOperator(op);
+  }
+  return op as FilterOperator;
+});
+
+const operatorDisplayValue = computed({
+  get: () => getOperatorLabel(nodeFilter.value?.filter_input?.basic_filter?.operator),
+  set: (val: string) => handleOperatorChange(val),
+});
+
+function convertLegacyOperator(symbol: string): FilterOperator {
+  const legacyMapping: Record<string, FilterOperator> = {
+    "=": "equals",
+    "==": "equals",
+    "!=": "not_equals",
+    "<>": "not_equals",
+    ">": "greater_than",
+    ">=": "greater_than_or_equals",
+    "<": "less_than",
+    "<=": "less_than_or_equals",
+    contains: "contains",
+    not_contains: "not_contains",
+    starts_with: "starts_with",
+    ends_with: "ends_with",
+    is_null: "is_null",
+    is_not_null: "is_not_null",
+    in: "in",
+    not_in: "not_in",
+    between: "between",
+    not_equals: "not_equals",
+    greater_than: "greater_than",
+    greater_than_or_equals: "greater_than_or_equals",
+    less_than: "less_than",
+    less_than_or_equals: "less_than_or_equals",
+  };
+  return legacyMapping[symbol] || "equals";
+}
+
+function getOperatorLabel(operator: FilterOperator | string | undefined): string {
+  if (!operator) return "Equals";
+  const op = typeof operator === "string" ? convertLegacyOperator(operator) : operator;
+  return getFilterOperatorLabel(op);
+}
+
+const showValueInput = computed((): boolean => {
+  return !OPERATORS_NO_VALUE.includes(currentOperator.value);
+});
+
+const showValue2Input = computed((): boolean => {
+  return OPERATORS_WITH_VALUE2.includes(currentOperator.value);
+});
+
+// "date" | "datetime" for a temporal column (parametrized "Datetime(...)" included), else null.
+const selectedColumnTemporalKind = computed((): "date" | "datetime" | null => {
+  const field = nodeFilter.value?.filter_input?.basic_filter?.field;
+  const column = nodeData.value?.main_input?.table_schema?.find((c) => c.name === field);
+  const base = column?.data_type?.split("(", 1)[0];
+  if (base === "Date") return "date";
+  if (base === "Datetime") return "datetime";
+  return null;
+});
+
+const useDatePicker = computed((): boolean => {
+  if (!selectedColumnTemporalKind.value) return false;
+  return !["in", "not_in"].includes(currentOperator.value);
+});
+
+// Keep a value picked for a Date column readable when the user switches to a
+// Datetime column (and vice versa); the picker shows nothing for a format mismatch.
+watch(selectedColumnTemporalKind, (kind) => {
+  const bf = nodeFilter.value?.filter_input?.basic_filter;
+  if (!bf || !kind) return;
+  for (const key of ["value", "value2"] as const) {
+    const v = bf[key];
+    if (!v) continue;
+    if (kind === "datetime" && /^\d{4}-\d{2}-\d{2}$/.test(v)) bf[key] = `${v} 00:00:00`;
+    if (kind === "date" && /^\d{4}-\d{2}-\d{2}[ T]/.test(v)) bf[key] = v.slice(0, 10);
+  }
+});
+
+const datePickerType = computed(() =>
+  selectedColumnTemporalKind.value === "datetime" ? "datetime" : "date",
+);
+
+const datePickerValueFormat = computed(() =>
+  selectedColumnTemporalKind.value === "datetime" ? "YYYY-MM-DD HH:mm:ss" : "YYYY-MM-DD",
+);
+
+const valuePlaceholder = computed((): string => {
+  switch (currentOperator.value) {
+    case "in":
+    case "not_in":
+      return selectedColumnTemporalKind.value ? "2024-01-01, 2024-02-01" : "value1, value2, value3";
+    case "between":
+      return useDatePicker.value ? "Start date" : "Start value";
+    default:
+      return useDatePicker.value ? "Select date" : "Enter value";
+  }
+});
+
+const operatorHelpText = computed((): string => {
+  switch (currentOperator.value) {
+    case "in":
+    case "not_in":
+      return selectedColumnTemporalKind.value
+        ? "Enter comma-separated dates (YYYY-MM-DD)"
+        : "Enter comma-separated values";
+    case "between":
+      return "Enter the range boundaries (inclusive)";
+    case "is_null":
+      return "Filters rows where the column value is null";
+    case "is_not_null":
+      return "Filters rows where the column value is not null";
+    default:
+      return "";
+  }
+});
+
+const handleFieldChange = (newValue: string) => {
+  if (nodeFilter.value?.filter_input.basic_filter) {
+    nodeFilter.value.filter_input.basic_filter.field = newValue;
+  }
+};
+
+const handleOperatorChange = (newLabel: string) => {
+  if (nodeFilter.value?.filter_input.basic_filter) {
+    const operator = FILTER_OPERATOR_LABELS[newLabel];
+    if (operator) {
+      nodeFilter.value.filter_input.basic_filter.operator = operator;
+      if (!OPERATORS_WITH_VALUE2.includes(operator)) {
+        nodeFilter.value.filter_input.basic_filter.value2 = undefined;
+      }
+      if (OPERATORS_NO_VALUE.includes(operator)) {
+        nodeFilter.value.filter_input.basic_filter.value = "";
+      }
+    }
+  }
+};
+
+const loadNodeData = async (nodeId: number) => {
+  nodeData.value = await nodeStore.getNodeData(nodeId, false);
+  if (nodeData.value) {
+    nodeFilter.value = nodeData.value.setting_input;
+
+    if (nodeFilter.value?.filter_input.advanced_filter) {
+      editorString.value = nodeFilter.value?.filter_input.advanced_filter;
+    }
+
+    const mode = nodeFilter.value?.filter_input.mode || nodeFilter.value?.filter_input.filter_type;
+    isAdvancedFilter.value = mode === "advanced";
+    splitModeEnabled.value = Boolean(nodeFilter.value?.split_mode);
+
+    // Migrate legacy basic_filter fields
+    if (nodeFilter.value?.filter_input.basic_filter) {
+      const bf = nodeFilter.value.filter_input.basic_filter;
+      if (bf.filter_type && !bf.operator) {
+        bf.operator = convertLegacyOperator(bf.filter_type);
+      }
+      if (bf.filter_value && !bf.value) {
+        bf.value = bf.filter_value;
+      }
+      if (!bf.operator) {
+        bf.operator = "equals";
+      }
+    }
+  }
+  isLoaded.value = true;
+  await nextTick();
+  updateNodeOutputHandles();
+};
+
+const updateAdvancedFilter = () => {
+  if (nodeFilter.value) {
+    nodeFilter.value.filter_input.advanced_filter = nodeStore.inputCode;
+  }
+};
+
+defineExpose({ loadNodeData, pushNodeData, saveSettings });
+</script>
+
+<style lang="scss" scoped>
+.filter-section {
+  padding: 10px 0;
+}
+
+.filter-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: flex-end;
+}
+
+.filter-field {
+  flex: 1;
+  min-width: 150px;
+  max-width: 250px;
+}
+
+.filter-label {
+  display: block;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--color-text-secondary);
+  margin-bottom: 4px;
+}
+
+.input-field {
+  width: 100%;
+  padding: 8px 12px;
+  font-size: 14px;
+  line-height: 1.4;
+  border: 1px solid var(--color-border-primary);
+  border-radius: 4px;
+  box-shadow: none;
+  outline: none;
+  transition:
+    border-color 0.2s,
+    box-shadow 0.2s;
+
+  &:focus {
+    border-color: var(--color-accent);
+    box-shadow: 0 0 0 2px rgba(64, 158, 255, 0.1);
+  }
+
+  &::placeholder {
+    color: var(--color-text-muted);
+  }
+}
+
+// Element Plus pins the editor to 220px and 32px; match the text input instead.
+.filter-field :deep(.el-date-editor.el-input) {
+  --el-input-height: 38px;
+  width: 100%;
+  height: 38px;
+}
+
+.filter-field :deep(.el-date-editor .el-input__wrapper) {
+  border: 1px solid var(--color-border-primary);
+  border-radius: 4px;
+  box-shadow: none;
+  padding: 0 12px;
+}
+
+.filter-field :deep(.el-date-editor .el-input__wrapper.is-focus) {
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 2px rgba(64, 158, 255, 0.1);
+}
+
+.help-text {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+  font-style: italic;
+}
+
+.x-flip {
+  transform: scaleX(-100%);
+}
+
+.split-mode-row {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--el-border-color-lighter, #e4e7ed);
+}
+
+.split-mode-hint {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+}
+</style>

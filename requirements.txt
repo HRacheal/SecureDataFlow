@@ -1,0 +1,8 @@
+# SecureDataFlow - versions used and verified on 10 Nov 2026 (Python 3.12.0, Windows 11)
+Flowfile==0.24.0        # pipeline foundation (downstream summary flows); pulls in polars, pydantic, etc.
+pydantic==2.14.3        # record schema validation
+pandas==3.1.1           # ingestion, batch checks, reporting
+numpy==2.5.4            # synthetic data generation
+matplotlib==3.11.2      # result charts
+python-pptx==1.0.2      # presentation generation
+pytest==9.2.0           # automated tests

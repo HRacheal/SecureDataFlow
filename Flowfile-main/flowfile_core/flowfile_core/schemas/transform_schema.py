@@ -1,0 +1,2114 @@
+import builtins
+import re
+from collections.abc import Callable
+from copy import deepcopy
+from dataclasses import asdict
+from enum import Enum
+from typing import Any, Literal, NamedTuple, get_args
+
+import polars as pl
+from pl_fuzzy_frame_match.models import FuzzyMapping
+from polars import selectors
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from flowfile_core.flowfile.param_types import FlowParameter, coerce_param_value
+from flowfile_core.schemas.yaml_types import (
+    BasicFilterYaml,
+    CrossJoinInputYaml,
+    FilterInputYaml,
+    FuzzyMatchInputYaml,
+    JoinInputsYaml,
+    JoinInputYaml,
+    SelectInputYaml,
+)
+from flowfile_core.types import DataType, DataTypeStr
+
+
+class FilterOperator(str, Enum):
+    """Supported filter comparison operators."""
+
+    EQUALS = "equals"
+    NOT_EQUALS = "not_equals"
+    GREATER_THAN = "greater_than"
+    GREATER_THAN_OR_EQUALS = "greater_than_or_equals"
+    LESS_THAN = "less_than"
+    LESS_THAN_OR_EQUALS = "less_than_or_equals"
+    CONTAINS = "contains"
+    NOT_CONTAINS = "not_contains"
+    STARTS_WITH = "starts_with"
+    ENDS_WITH = "ends_with"
+    IS_NULL = "is_null"
+    IS_NOT_NULL = "is_not_null"
+    IN = "in"
+    NOT_IN = "not_in"
+    BETWEEN = "between"
+
+    def __str__(self) -> str:
+        return self.value
+
+    @classmethod
+    def from_symbol(cls, symbol: str) -> "FilterOperator":
+        """Convert UI symbol to FilterOperator enum."""
+        symbol_mapping = {
+            "=": cls.EQUALS,
+            "==": cls.EQUALS,
+            "!=": cls.NOT_EQUALS,
+            "<>": cls.NOT_EQUALS,
+            ">": cls.GREATER_THAN,
+            ">=": cls.GREATER_THAN_OR_EQUALS,
+            "<": cls.LESS_THAN,
+            "<=": cls.LESS_THAN_OR_EQUALS,
+            "contains": cls.CONTAINS,
+            "not_contains": cls.NOT_CONTAINS,
+            "starts_with": cls.STARTS_WITH,
+            "ends_with": cls.ENDS_WITH,
+            "is_null": cls.IS_NULL,
+            "is_not_null": cls.IS_NOT_NULL,
+            "in": cls.IN,
+            "not_in": cls.NOT_IN,
+            "between": cls.BETWEEN,
+        }
+        if symbol in symbol_mapping:
+            return symbol_mapping[symbol]
+        # Try to match by value directly
+        try:
+            return cls(symbol)
+        except ValueError:
+            raise ValueError(f"Unknown filter operator symbol: {symbol}") from None
+
+    def to_symbol(self) -> str:
+        """Convert FilterOperator to UI-friendly symbol."""
+        symbol_mapping = {
+            FilterOperator.EQUALS: "=",
+            FilterOperator.NOT_EQUALS: "!=",
+            FilterOperator.GREATER_THAN: ">",
+            FilterOperator.GREATER_THAN_OR_EQUALS: ">=",
+            FilterOperator.LESS_THAN: "<",
+            FilterOperator.LESS_THAN_OR_EQUALS: "<=",
+            FilterOperator.CONTAINS: "contains",
+            FilterOperator.NOT_CONTAINS: "not_contains",
+            FilterOperator.STARTS_WITH: "starts_with",
+            FilterOperator.ENDS_WITH: "ends_with",
+            FilterOperator.IS_NULL: "is_null",
+            FilterOperator.IS_NOT_NULL: "is_not_null",
+            FilterOperator.IN: "in",
+            FilterOperator.NOT_IN: "not_in",
+            FilterOperator.BETWEEN: "between",
+        }
+        return symbol_mapping.get(self, self.value)
+
+
+FilterModeLiteral = Literal["basic", "advanced"]
+
+FuzzyMap = FuzzyMapping
+
+AUTO_DATA_TYPE = "Auto"
+
+
+def get_func_type_mapping(func: str):
+    """Infers the output data type of common aggregation functions."""
+    if func in ["mean", "avg", "median", "std", "var"]:
+        return "Float64"
+    elif func in ["min", "max", "first", "last", "cumsum", "sum"]:
+        return None
+    elif func in ["count", "n_unique"]:
+        return "Int64"
+    elif func in ["concat"]:
+        return "Utf8"
+
+
+STRING_CONCAT_DELIMITER = ","
+
+
+def string_concat(*column: str):
+    """A simple wrapper to concatenate string columns in Polars."""
+    return pl.col(column).cast(pl.Utf8).str.join(STRING_CONCAT_DELIMITER)
+
+
+SideLit = Literal["left", "right"]
+JoinStrategy = Literal["inner", "left", "right", "full", "semi", "anti", "cross", "outer"]
+"""Polars join-strategy enum — broad superset retained for backward
+compat with code-generator / flow-data-engine plumbing that still
+threads ``"cross"`` through ``DataFrame.join(how="cross")`` directly.
+The ``join`` node itself uses :data:`JoinKeyStrategy` (below) which
+excludes ``"cross"`` so cross/Cartesian joins route through the
+dedicated ``cross_join`` node type — making the choice unambiguous
+for the AI agent and preventing the ``join + how="cross"`` shape
+that bypasses the dedicated cross_join node.
+"""
+
+JoinKeyStrategy = Literal["inner", "left", "right", "full", "semi", "anti", "outer"]
+"""Key-based join strategies — every option requires ``join_mapping``
+to specify the equality keys. Used by :class:`JoinInput.how` so the
+LLM (and the Pydantic validator) cannot pick ``"cross"`` on a
+``join`` node — Cartesian joins are the dedicated ``cross_join``
+node type's job.
+"""
+FuzzyTypeLiteral = Literal["levenshtein", "jaro", "jaro_winkler", "hamming", "damerau_levenshtein", "indel"]
+
+
+def construct_join_key_name(side: SideLit, column_name: str) -> str:
+    """Creates a temporary, unique name for a join key column."""
+    return "_FLOWFILE_JOIN_KEY_" + side.upper() + "_" + column_name
+
+
+class JoinKeyRename(NamedTuple):
+    """Represents the renaming of a join key from its original to a temporary name."""
+
+    original_name: str
+    temp_name: str
+
+
+class JoinKeyRenameResponse(NamedTuple):
+    """Contains a list of join key renames for one side of a join."""
+
+    side: SideLit
+    join_key_renames: list[JoinKeyRename]
+
+
+class FullJoinKeyResponse(NamedTuple):
+    """Holds the join key rename responses for both sides of a join."""
+
+    left: JoinKeyRenameResponse
+    right: JoinKeyRenameResponse
+
+
+class SelectInput(BaseModel):
+    """Defines how a single column should be selected, renamed, or type-cast.
+
+    This is a core building block for any operation that involves column manipulation.
+    It holds all the configuration for a single field in a selection operation.
+    """
+
+    model_config = ConfigDict(frozen=False)
+
+    old_name: str
+    original_position: int | None = None
+    new_name: str | None = None
+    data_type: str | None = None
+    data_type_change: bool = False
+    join_key: bool = False
+    is_altered: bool = False
+    position: int | None = None
+    is_available: bool = True
+    keep: bool = True
+
+    def __init__(self, old_name: str = None, new_name: str = None, **data):
+        if old_name is not None:
+            data["old_name"] = old_name
+        if new_name is not None:
+            data["new_name"] = new_name
+        super().__init__(**data)
+
+    def to_yaml_dict(self) -> SelectInputYaml:
+        """Serialize for YAML output - only user-relevant fields."""
+        result: SelectInputYaml = {"old_name": self.old_name}
+        if self.new_name != self.old_name:
+            result["new_name"] = self.new_name
+        if not self.keep:
+            result["keep"] = self.keep
+        # data_type travels even without a cast; data_type_change says whether it is one (older files infer it).
+        if self.data_type:
+            result["data_type"] = self.data_type
+            result["data_type_change"] = self.data_type_change
+        return result
+
+    @classmethod
+    def from_yaml_dict(cls, data: dict) -> "SelectInput":
+        """Load from slim YAML format."""
+        old_name = data["old_name"]
+        new_name = data.get("new_name", old_name)
+        data_type = data.get("data_type")
+        data_type_change = data.get("data_type_change", data_type is not None)
+        # is_altered marks a user rename or cast so updateNodeSelect in the frontend won't overwrite it
+        is_altered = (old_name != new_name) or data_type_change
+        return cls(
+            old_name=old_name,
+            new_name=new_name,
+            keep=data.get("keep", True),
+            data_type=data_type,
+            data_type_change=data_type_change,
+            is_altered=is_altered,
+        )
+
+    @model_validator(mode="before")
+    @classmethod
+    def infer_data_type_change(cls, data):
+        """Infer data_type_change when loading from YAML.
+
+        When data_type is present but data_type_change is not explicitly set,
+        infer that the user explicitly set the data_type (e.g., when loading from YAML).
+        This ensures is_altered will be set correctly in the after validator.
+        """
+        if isinstance(data, dict):
+            if data.get("data_type") is not None and "data_type_change" not in data:
+                data["data_type_change"] = True
+        return data
+
+    @model_validator(mode="after")
+    def set_default_new_name(self):
+        """Default a missing or blank new_name to old_name; is_altered then only reflects a type change.
+
+        A cleared rename box arrives as "" while the drawer shows old_name as its placeholder (#815).
+        """
+        if self.new_name is None:
+            self.new_name = self.old_name
+        elif not self.new_name.strip():
+            self.new_name = self.old_name
+            self.is_altered = self.data_type_change
+        if self.old_name != self.new_name:
+            self.is_altered = True
+        if self.data_type_change:
+            self.is_altered = True
+        return self
+
+    def __hash__(self):
+        """Allow SelectInput to be used in sets and as dict keys."""
+        return hash(self.old_name)
+
+    def __eq__(self, other):
+        """Required when implementing __hash__."""
+        if not isinstance(other, SelectInput):
+            return False
+        return self.old_name == other.old_name
+
+    @property
+    def polars_type(self) -> str:
+        """Translates a user-friendly type name to a Polars data type string."""
+        data_type_lower = self.data_type.lower()
+        if data_type_lower == "string":
+            return "Utf8"
+        elif data_type_lower == "integer":
+            return "Int64"
+        elif data_type_lower == "double":
+            return "Float64"
+        return self.data_type
+
+
+class FieldInput(BaseModel):
+    """Represents a single field with its name and data type, typically for defining an output column."""
+
+    name: str
+    data_type: DataType | Literal["Auto"] | DataTypeStr | None = AUTO_DATA_TYPE
+
+
+class FunctionInput(BaseModel):
+    """Defines a formula to be applied, including the output field information."""
+
+    field: FieldInput
+    function: str = Field(json_schema_extra={"expression": True})
+
+    def __init__(self, field: FieldInput = None, function: str = None, **data):
+        if field is not None:
+            data["field"] = field
+        if function is not None:
+            data["function"] = function
+        super().__init__(**data)
+
+
+class BasicFilter(BaseModel):
+    """Defines a simple, single-condition filter (e.g., 'column' 'equals' 'value').
+
+    Attributes:
+        field: The column name to filter on.
+        operator: The comparison operator (FilterOperator enum value or symbol).
+        value: The value to compare against.
+        value2: Second value for BETWEEN operator (optional).
+    """
+
+    field: str = ""
+    operator: FilterOperator | str = FilterOperator.EQUALS
+    value: str = ""
+    value2: str | None = None  # For BETWEEN operator
+
+    # Keep old field names for backward compatibility
+    filter_type: str | None = None
+    filter_value: str | None = None
+
+    def __init__(
+        self,
+        field: str = None,
+        operator: FilterOperator | str = None,
+        value: str = None,
+        value2: str = None,
+        # Backward compatibility parameters
+        filter_type: str = None,
+        filter_value: str = None,
+        **data,
+    ):
+        # Handle backward compatibility
+        if filter_type is not None and operator is None:
+            data["operator"] = filter_type
+        elif operator is not None:
+            data["operator"] = operator
+
+        if filter_value is not None and value is None:
+            data["value"] = filter_value
+        elif value is not None:
+            data["value"] = value
+
+        if field is not None:
+            data["field"] = field
+        if value2 is not None:
+            data["value2"] = value2
+
+        super().__init__(**data)
+
+    @model_validator(mode="after")
+    def normalize_operator(self):
+        """Normalize the operator to FilterOperator enum."""
+        if isinstance(self.operator, str):
+            try:
+                self.operator = FilterOperator.from_symbol(self.operator)
+            except ValueError:
+                # Keep as string if conversion fails (for backward compat)
+                pass
+        return self
+
+    def get_operator(self) -> FilterOperator:
+        """Get the operator as FilterOperator enum."""
+        if isinstance(self.operator, FilterOperator):
+            return self.operator
+        return FilterOperator.from_symbol(self.operator)
+
+    def to_yaml_dict(self) -> BasicFilterYaml:
+        """Serialize for YAML output."""
+        result: BasicFilterYaml = {
+            "field": self.field,
+            "operator": self.operator.value if isinstance(self.operator, FilterOperator) else self.operator,
+            "value": self.value,
+        }
+        if self.value2:
+            result["value2"] = self.value2
+        return result
+
+    @classmethod
+    def from_yaml_dict(cls, data: dict) -> "BasicFilter":
+        """Load from YAML format."""
+        return cls(
+            field=data.get("field", ""),
+            operator=data.get("operator", FilterOperator.EQUALS),
+            value=data.get("value", ""),
+            value2=data.get("value2"),
+        )
+
+
+class FilterInput(BaseModel):
+    """Defines the settings for a filter operation, supporting basic or advanced (expression-based) modes.
+
+    Attributes:
+        mode: The filter mode - "basic" or "advanced".
+        basic_filter: The basic filter configuration (used when mode="basic").
+        advanced_filter: The advanced filter expression string (used when mode="advanced").
+    """
+
+    mode: FilterModeLiteral = "basic"
+    basic_filter: BasicFilter | None = None
+    advanced_filter: str = Field(default="", json_schema_extra={"expression": True})
+
+    # Keep old field name for backward compatibility
+    filter_type: str | None = None
+
+    def __init__(
+        self,
+        mode: FilterModeLiteral = None,
+        basic_filter: BasicFilter = None,
+        advanced_filter: str = None,
+        # Backward compatibility
+        filter_type: str = None,
+        **data,
+    ):
+        # Handle backward compatibility: filter_type -> mode
+        if filter_type is not None and mode is None:
+            data["mode"] = filter_type
+        elif mode is not None:
+            data["mode"] = mode
+
+        if advanced_filter is not None:
+            data["advanced_filter"] = advanced_filter
+        if basic_filter is not None:
+            data["basic_filter"] = basic_filter
+
+        super().__init__(**data)
+
+    @model_validator(mode="after")
+    def ensure_basic_filter(self):
+        """Ensure basic_filter exists when mode is basic."""
+        if self.mode == "basic" and self.basic_filter is None:
+            self.basic_filter = BasicFilter()
+        return self
+
+    def is_advanced(self) -> bool:
+        """Check if filter is in advanced mode."""
+        return self.mode == "advanced"
+
+    def to_yaml_dict(self) -> FilterInputYaml:
+        """Serialize for YAML output."""
+        result: FilterInputYaml = {"mode": self.mode}
+        if self.mode == "basic" and self.basic_filter:
+            result["basic_filter"] = self.basic_filter.to_yaml_dict()
+        elif self.mode == "advanced" and self.advanced_filter:
+            result["advanced_filter"] = self.advanced_filter
+        return result
+
+    @classmethod
+    def from_yaml_dict(cls, data: dict) -> "FilterInput":
+        """Load from YAML format."""
+        mode = data.get("mode", "basic")
+        basic_filter = None
+        if "basic_filter" in data:
+            basic_filter = BasicFilter.from_yaml_dict(data["basic_filter"])
+        return cls(
+            mode=mode,
+            basic_filter=basic_filter,
+            advanced_filter=data.get("advanced_filter", ""),
+        )
+
+
+class SelectInputs(BaseModel):
+    """A container for a list of `SelectInput` objects (pure data, no logic)."""
+
+    renames: list[SelectInput] = Field(default_factory=list)
+
+    def __init__(self, renames: list[SelectInput] = None, **kwargs):
+        if renames is not None:
+            kwargs["renames"] = renames
+        else:
+            kwargs["renames"] = []
+        super().__init__(**kwargs)
+
+    def to_yaml_dict(self) -> JoinInputsYaml:
+        """Serialize for YAML output."""
+        return {"select": [r.to_yaml_dict() for r in self.renames]}
+
+    @classmethod
+    def from_yaml_dict(cls, data: dict) -> "SelectInputs":
+        """Load from slim YAML format. Supports both 'select' (new) and 'renames' (internal)."""
+        items = data.get("select", data.get("renames", []))
+        return cls(renames=[SelectInput.from_yaml_dict(item) for item in items])
+
+    @classmethod
+    def create_from_list(cls, col_list: list[str]) -> "SelectInputs":
+        """Creates a SelectInputs object from a simple list of column names."""
+        return cls(renames=[SelectInput(old_name=c) for c in col_list])
+
+    @classmethod
+    def create_from_pl_df(cls, df: pl.DataFrame | pl.LazyFrame) -> "SelectInputs":
+        """Creates a SelectInputs object from a Polars DataFrame's columns."""
+        return cls(renames=[SelectInput(old_name=c) for c in df.collect_schema().names()])
+
+    def remove_select_input(self, old_key: str) -> None:
+        """Removes a SelectInput from the list based on its original name."""
+        self.renames = [rename for rename in self.renames if rename.old_name != old_key]
+
+
+class JoinInputs(SelectInputs):
+    """Data model for join-specific select inputs (extends SelectInputs)."""
+
+    def __init__(self, renames: list[SelectInput] = None, **kwargs):
+        if renames is not None:
+            kwargs["renames"] = renames
+        else:
+            kwargs["renames"] = []
+        super().__init__(**kwargs)
+
+
+class JoinMap(BaseModel):
+    """Defines a single mapping between a left and right column for a join key."""
+
+    left_col: str | None = None
+    right_col: str | None = None
+
+    def __init__(self, left_col: str = None, right_col: str = None, **data):
+        if left_col is not None:
+            data["left_col"] = left_col
+        if right_col is not None:
+            data["right_col"] = right_col
+        super().__init__(**data)
+
+    @model_validator(mode="after")
+    def set_default_right_col(self):
+        """If right_col is None, default it to left_col."""
+        if self.right_col is None:
+            self.right_col = self.left_col
+        return self
+
+
+class CrossJoinInput(BaseModel):
+    """Data model for cross join operations."""
+
+    left_select: JoinInputs
+    right_select: JoinInputs
+
+    @model_validator(mode="before")
+    @classmethod
+    def parse_inputs(cls, data: Any) -> Any:
+        """Parse flexible input formats before validation."""
+        if isinstance(data, dict):
+            if "join_mapping" in data:
+                data["join_mapping"] = cls._parse_join_mapping(data["join_mapping"])
+
+            if "left_select" in data:
+                data["left_select"] = cls._parse_select(data["left_select"])
+
+            if "right_select" in data:
+                data["right_select"] = cls._parse_select(data["right_select"])
+
+        return data
+
+    @staticmethod
+    def _parse_join_mapping(join_mapping: Any) -> list[JoinMap]:
+        """Parse various join_mapping formats."""
+        if isinstance(join_mapping, list):
+            result = []
+            for jm in join_mapping:
+                if isinstance(jm, JoinMap):
+                    result.append(jm)
+                elif isinstance(jm, dict):
+                    result.append(JoinMap(**jm))
+                elif isinstance(jm, tuple | list) and len(jm) == 2:
+                    result.append(JoinMap(left_col=jm[0], right_col=jm[1]))
+                elif isinstance(jm, str):
+                    result.append(JoinMap(left_col=jm, right_col=jm))
+                else:
+                    raise ValueError(f"Invalid join mapping item: {jm}")
+            return result
+
+        if isinstance(join_mapping, JoinMap):
+            return [join_mapping]
+
+        # String: same column on both sides
+        if isinstance(join_mapping, str):
+            return [JoinMap(left_col=join_mapping, right_col=join_mapping)]
+
+        # Tuple: (left, right)
+        if isinstance(join_mapping, tuple) and len(join_mapping) == 2:
+            return [JoinMap(left_col=join_mapping[0], right_col=join_mapping[1])]
+
+        raise ValueError(f"Invalid join_mapping format: {type(join_mapping)}")
+
+    @staticmethod
+    def _parse_select(select: Any) -> JoinInputs:
+        """Parse various select input formats."""
+        if isinstance(select, JoinInputs):
+            return select
+
+        if isinstance(select, list):
+            if all(isinstance(s, SelectInput) for s in select):
+                return JoinInputs(renames=select)
+            elif all(isinstance(s, str) for s in select):
+                return JoinInputs(renames=[SelectInput(old_name=s) for s in select])
+            elif all(isinstance(s, dict) for s in select):
+                return JoinInputs(renames=[SelectInput(**s) for s in select])
+
+        # Dict with 'select' (new YAML) or 'renames' (internal) key
+        if isinstance(select, dict):
+            if "select" in select:
+                return JoinInputs(renames=[SelectInput.from_yaml_dict(s) for s in select["select"]])
+            if "renames" in select:
+                return JoinInputs(**select)
+
+        raise ValueError(f"Invalid select format: {type(select)}")
+
+    def __init__(
+        self,
+        left_select: JoinInputs | list[SelectInput] | list[str] = None,
+        right_select: JoinInputs | list[SelectInput] | list[str] = None,
+        **data,
+    ):
+        """Custom init for backward compatibility with positional arguments."""
+        if left_select is not None:
+            data["left_select"] = left_select
+        if right_select is not None:
+            data["right_select"] = right_select
+        super().__init__(**data)
+
+    def to_yaml_dict(self) -> CrossJoinInputYaml:
+        """Serialize for YAML output."""
+        return {
+            "left_select": self.left_select.to_yaml_dict(),
+            "right_select": self.right_select.to_yaml_dict(),
+        }
+
+    def add_new_select_column(self, select_input: SelectInput, side: str) -> None:
+        """Adds a new column to the selection for either the left or right side."""
+        target_input = self.right_select if side == "right" else self.left_select
+        if select_input.new_name is None:
+            select_input.new_name = select_input.old_name
+        target_input.renames.append(select_input)
+
+
+class JoinInput(BaseModel):
+    """Data model for standard SQL-style join operations."""
+
+    join_mapping: list[JoinMap]
+    left_select: JoinInputs
+    right_select: JoinInputs
+    how: JoinKeyStrategy = "inner"
+
+    @model_validator(mode="before")
+    @classmethod
+    def parse_inputs(cls, data: Any) -> Any:
+        """Parse flexible input formats before validation."""
+        if isinstance(data, dict):
+            if "join_mapping" in data:
+                data["join_mapping"] = cls._parse_join_mapping(data["join_mapping"])
+
+            if "left_select" in data:
+                data["left_select"] = cls._parse_select(data["left_select"])
+
+            if "right_select" in data:
+                data["right_select"] = cls._parse_select(data["right_select"])
+
+        return data
+
+    @staticmethod
+    def _parse_join_mapping(join_mapping: Any) -> list[JoinMap]:
+        """Parse various join_mapping formats."""
+        if isinstance(join_mapping, list):
+            result = []
+            for jm in join_mapping:
+                if isinstance(jm, JoinMap):
+                    result.append(jm)
+                elif isinstance(jm, dict):
+                    result.append(JoinMap(**jm))
+                elif isinstance(jm, tuple | list) and len(jm) == 2:
+                    result.append(JoinMap(left_col=jm[0], right_col=jm[1]))
+                elif isinstance(jm, str):
+                    result.append(JoinMap(left_col=jm, right_col=jm))
+                else:
+                    raise ValueError(f"Invalid join mapping item: {jm}")
+            return result
+
+        if isinstance(join_mapping, JoinMap):
+            return [join_mapping]
+
+        # String: same column on both sides
+        if isinstance(join_mapping, str):
+            return [JoinMap(left_col=join_mapping, right_col=join_mapping)]
+
+        # Tuple: (left, right)
+        if isinstance(join_mapping, tuple) and len(join_mapping) == 2:
+            return [JoinMap(left_col=join_mapping[0], right_col=join_mapping[1])]
+
+        raise ValueError(f"Invalid join_mapping format: {type(join_mapping)}")
+
+    @staticmethod
+    def _parse_select(select: Any) -> JoinInputs:
+        """Parse various select input formats."""
+        if isinstance(select, JoinInputs):
+            return select
+
+        if isinstance(select, list):
+            if all(isinstance(s, SelectInput) for s in select):
+                return JoinInputs(renames=select)
+            elif all(isinstance(s, str) for s in select):
+                return JoinInputs(renames=[SelectInput(old_name=s) for s in select])
+            elif all(isinstance(s, dict) for s in select):
+                return JoinInputs(renames=[SelectInput(**s) for s in select])
+
+        # Dict with 'select' (new YAML) or 'renames' (internal) key
+        if isinstance(select, dict):
+            if "select" in select:
+                return JoinInputs(renames=[SelectInput.from_yaml_dict(s) for s in select["select"]])
+            if "renames" in select:
+                return JoinInputs(**select)
+
+        raise ValueError(f"Invalid select format: {type(select)}")
+
+    def __init__(
+        self,
+        join_mapping: list[JoinMap] | JoinMap | tuple[str, str] | str | list[tuple] | list[str] = None,
+        left_select: JoinInputs | list[SelectInput] | list[str] = None,
+        right_select: JoinInputs | list[SelectInput] | list[str] = None,
+        how: JoinKeyStrategy = "inner",
+        **data,
+    ):
+        """Custom init for backward compatibility with positional arguments."""
+        if join_mapping is not None:
+            data["join_mapping"] = join_mapping
+        if left_select is not None:
+            data["left_select"] = left_select
+        if right_select is not None:
+            data["right_select"] = right_select
+        if how is not None:
+            data["how"] = how
+
+        super().__init__(**data)
+
+    def to_yaml_dict(self) -> JoinInputYaml:
+        """Serialize for YAML output."""
+        return {
+            "join_mapping": [{"left_col": jm.left_col, "right_col": jm.right_col} for jm in self.join_mapping],
+            "left_select": self.left_select.to_yaml_dict(),
+            "right_select": self.right_select.to_yaml_dict(),
+            "how": self.how,
+        }
+
+    def add_new_select_column(self, select_input: SelectInput, side: str) -> None:
+        """Adds a new column to the selection for either the left or right side."""
+        target_input = self.right_select if side == "right" else self.left_select
+        if select_input.new_name is None:
+            select_input.new_name = select_input.old_name
+        target_input.renames.append(select_input)
+
+
+class FuzzyMatchInput(BaseModel):
+    """Data model for fuzzy matching join operations."""
+
+    join_mapping: list[FuzzyMapping]
+    left_select: JoinInputs
+    right_select: JoinInputs
+    how: JoinStrategy = "inner"
+    aggregate_output: bool = False
+
+    def __init__(
+        self,
+        left_select: JoinInputs | list[SelectInput] | list[str] = None,
+        right_select: JoinInputs | list[SelectInput] | list[str] = None,
+        **data,
+    ):
+        """Custom init for backward compatibility with positional arguments."""
+        if left_select is not None:
+            data["left_select"] = left_select
+        if right_select is not None:
+            data["right_select"] = right_select
+
+        super().__init__(**data)
+
+    def to_yaml_dict(self) -> FuzzyMatchInputYaml:
+        """Serialize for YAML output."""
+        return {
+            "join_mapping": [asdict(jm) for jm in self.join_mapping],
+            "left_select": self.left_select.to_yaml_dict(),
+            "right_select": self.right_select.to_yaml_dict(),
+            "how": self.how,
+            "aggregate_output": self.aggregate_output,
+        }
+
+    def add_new_select_column(self, select_input: SelectInput, side: str) -> None:
+        """Adds a new column to the selection for either the left or right side."""
+        target_input = self.right_select if side == "right" else self.left_select
+        if select_input.new_name is None:
+            select_input.new_name = select_input.old_name
+        target_input.renames.append(select_input)
+
+    @staticmethod
+    def _parse_select(select: Any) -> JoinInputs:
+        """Parse various select input formats."""
+        if isinstance(select, JoinInputs):
+            return select
+
+        if isinstance(select, list):
+            if all(isinstance(s, SelectInput) for s in select):
+                return JoinInputs(renames=select)
+            elif all(isinstance(s, str) for s in select):
+                return JoinInputs(renames=[SelectInput(old_name=s) for s in select])
+            elif all(isinstance(s, dict) for s in select):
+                return JoinInputs(renames=[SelectInput(**s) for s in select])
+
+        # Dict with 'select' (new YAML) or 'renames' (internal) key
+        if isinstance(select, dict):
+            if "select" in select:
+                return JoinInputs(renames=[SelectInput.from_yaml_dict(s) for s in select["select"]])
+            if "renames" in select:
+                return JoinInputs(**select)
+
+        raise ValueError(f"Invalid select format: {type(select)}")
+
+    @model_validator(mode="before")
+    @classmethod
+    def parse_inputs(cls, data: Any) -> Any:
+        """Parse flexible input formats before validation."""
+        if isinstance(data, dict):
+            if "left_select" in data:
+                data["left_select"] = cls._parse_select(data["left_select"])
+
+            if "right_select" in data:
+                data["right_select"] = cls._parse_select(data["right_select"])
+
+        return data
+
+
+class AggColl(BaseModel):
+    """
+    A data class that represents a single aggregation operation for a group by operation.
+
+    Attributes
+    ----------
+    old_name : str
+        The name of the column in the original DataFrame to be aggregated.
+
+    agg : str
+        The aggregation function to use. This can be a string representing a built-in function or a custom function.
+
+    new_name : Optional[str]
+        The name of the resulting aggregated column in the output DataFrame. If not provided, it will default to the
+        old_name appended with the aggregation function.
+
+    output_type : Optional[str]
+        The type of the output values of the aggregation. If not provided, it is inferred from the aggregation function
+        using the `get_func_type_mapping` function.
+
+    Example
+    --------
+    agg_col = AggColl(
+        old_name='col1',
+        agg='sum',
+        new_name='sum_col1',
+        output_type='float'
+    )
+    """
+
+    old_name: str
+    agg: str
+    new_name: str | None = None
+    output_type: str | None = None
+
+    def __init__(self, old_name: str, agg: str, new_name: str | None = None, output_type: str | None = None):
+        data = {"old_name": old_name, "agg": agg}
+        if new_name is not None:
+            data["new_name"] = new_name
+        if output_type is not None:
+            data["output_type"] = output_type
+
+        super().__init__(**data)
+
+    @model_validator(mode="after")
+    def set_defaults(self):
+        """Set default new_name and output_type based on agg function."""
+        if self.new_name is None:
+            if self.agg != "groupby":
+                self.new_name = self.old_name + "_" + self.agg
+            else:
+                self.new_name = self.old_name
+
+        if self.output_type is None:
+            self.output_type = get_func_type_mapping(self.agg)
+
+        self.old_name = str(self.old_name)
+
+        return self
+
+    @property
+    def agg_func(self):
+        """Returns the corresponding Polars aggregation function from the `agg` string."""
+        if self.agg == "groupby":
+            return self.agg
+        elif self.agg == "concat":
+            return string_concat
+        else:
+            return getattr(pl, self.agg) if isinstance(self.agg, str) else self.agg
+
+
+class GroupByInput(BaseModel):
+    """
+    A data class that represents the input for a group by operation.
+
+    Attributes
+    ----------
+    agg_cols : List[AggColl]
+        A list of `AggColl` objects that specify the aggregation operations to perform on the DataFrame columns
+        after grouping. Each `AggColl` object should specify the column to be aggregated and the aggregation
+        function to use.
+
+    Example
+    --------
+    group_by_input = GroupByInput(
+        agg_cols=[AggColl(old_name='ix', agg='groupby'), AggColl(old_name='groups', agg='groupby'),
+                  AggColl(old_name='col1', agg='sum'), AggColl(old_name='col2', agg='mean')]
+    )
+    """
+
+    agg_cols: list[AggColl]
+
+    def __init__(self, agg_cols: list[AggColl]):
+        """Backwards compatibility implementation"""
+        super().__init__(agg_cols=agg_cols)
+
+
+class PivotInput(BaseModel):
+    """Defines the settings for a pivot (long-to-wide) operation."""
+
+    index_columns: list[str]
+    pivot_column: str
+    value_col: str
+    aggregations: list[str]
+
+    @property
+    def grouped_columns(self) -> list[str]:
+        """Returns the list of columns to be used for the initial grouping stage of the pivot."""
+        return self.index_columns + [self.pivot_column]
+
+    def get_group_by_input(self) -> GroupByInput:
+        """Constructs the `GroupByInput` needed for the pre-aggregation step of the pivot."""
+        group_by_cols = [AggColl(old_name=c, agg="groupby") for c in self.grouped_columns]
+        agg_cols = [
+            AggColl(old_name=self.value_col, agg=aggregation, new_name=aggregation) for aggregation in self.aggregations
+        ]
+        return GroupByInput(agg_cols=group_by_cols + agg_cols)
+
+    def get_index_columns(self) -> list[pl.col]:
+        """Returns the index columns as Polars column expressions."""
+        return [pl.col(c) for c in self.index_columns]
+
+    def get_pivot_column(self) -> pl.Expr:
+        """Returns the pivot column as a Polars column expression."""
+        return pl.col(self.pivot_column)
+
+    def get_values_expr(self) -> pl.Expr:
+        """Creates the struct expression used to gather the values for pivoting."""
+        return pl.struct([pl.col(c) for c in self.aggregations]).alias("vals")
+
+
+def is_descending(how: str | None) -> bool:
+    """Whether a sort-direction string means descending.
+
+    Accepts both the programmatic ``"asc"``/``"desc"`` form (flowfile_frame) and the
+    visual editor's ``"Ascending"``/``"Descending"`` form (case-insensitive).
+    """
+    return (how or "").lower() in ("desc", "descending")
+
+
+class SortByInput(BaseModel):
+    """Defines a single sort condition on a column, including the direction."""
+
+    column: str
+    how: str | None = "asc"
+
+    @property
+    def descending(self) -> bool:
+        """Resolve ``how`` to the boolean Polars expects, accepting both conventions."""
+        return is_descending(self.how)
+
+
+class RecordIdInput(BaseModel):
+    """Defines settings for adding a record ID (row number) column to the data."""
+
+    output_column_name: str = "record_id"
+    offset: int = 1
+    group_by: bool | None = False
+    group_by_columns: list[str] | None = Field(default_factory=list)
+
+
+WindowFunctionName = Literal[
+    "rolling_sum",
+    "rolling_mean",
+    "rolling_min",
+    "rolling_max",
+    "rolling_std",
+    "cum_sum",
+    "cum_count",
+    "cum_min",
+    "cum_max",
+    "rank",
+    "tile",
+    "mean",
+    "sum",
+    "min",
+    "max",
+    "count",
+    "std",
+    "median",
+]
+
+RankMethod = Literal["ordinal", "dense", "min", "max", "average"]
+
+RollingEdgeBehavior = Literal["require_full", "partial", "fill_zero"]
+
+_ROLLING_FUNCTIONS = {"rolling_sum", "rolling_mean", "rolling_min", "rolling_max", "rolling_std"}
+_CUMULATIVE_FUNCTIONS = {"cum_sum", "cum_count", "cum_min", "cum_max"}
+AGGREGATE_WINDOW_FUNCTIONS = frozenset({"mean", "sum", "min", "max", "count", "std", "median"})
+"""Partition-wide aggregates broadcast to every row (SQL ``AVG(x) OVER (PARTITION BY g)``)."""
+
+
+def _is_rolling(func: str) -> bool:
+    return func in _ROLLING_FUNCTIONS
+
+
+def _is_cumulative(func: str) -> bool:
+    return func in _CUMULATIVE_FUNCTIONS
+
+
+def is_aggregate_window_function(func: str) -> bool:
+    return func in AGGREGATE_WINDOW_FUNCTIONS
+
+
+def get_window_output_type(func: str, input_type: str | None = None) -> str | None:
+    """Infers the output data type of window functions."""
+    if func in {"rolling_mean", "rolling_std", "mean", "std", "median"}:
+        return "Float64"
+    if func in {"rolling_sum", "rolling_min", "rolling_max", "cum_sum", "cum_min", "cum_max", "sum", "min", "max"}:
+        return input_type
+    if func in {"cum_count", "tile"}:
+        return "Int64"
+    if func in {"rank", "count"}:
+        return str(pl.get_index_type())
+    return input_type
+
+
+class WindowFunctionInput(BaseModel):
+    """A single window-function operation producing one new column.
+
+    `column` is the source column for rolling, cumulative, rank and
+    partition-aggregate functions. The aggregates (``mean``, ``sum``, ``min``,
+    ``max``, ``count``, ``std``, ``median``) take no window and broadcast one
+    value per partition to every row of it. For `tile`, `column` is ignored
+    (ordering comes from the outer ``WindowFunctionsInput.order_by``).
+    """
+
+    column: str | None = None
+    function: WindowFunctionName
+    new_column_name: str
+    window_size: int | None = None
+    min_periods: int | None = None
+    edge_behavior: RollingEdgeBehavior | None = "require_full"
+    number_of_groups: int | None = None
+    rank_method: RankMethod | None = "ordinal"
+    output_type: str | None = None
+
+    @model_validator(mode="after")
+    def _validate(self) -> "WindowFunctionInput":
+        if _is_rolling(self.function):
+            if self.window_size is None or self.window_size < 1:
+                raise ValueError(f"{self.function!r} requires a positive window_size")
+            if self.column is None:
+                raise ValueError(f"{self.function!r} requires a source column")
+        elif _is_cumulative(self.function) or self.function == "rank" or is_aggregate_window_function(self.function):
+            if self.column is None:
+                raise ValueError(f"{self.function!r} requires a source column")
+        elif self.function == "tile":
+            if self.number_of_groups is None or self.number_of_groups < 1:
+                raise ValueError("'tile' requires a positive number_of_groups")
+        if self.output_type is None:
+            self.output_type = get_window_output_type(self.function)
+        return self
+
+
+class WindowFunctionsInput(BaseModel):
+    """Defines the settings for a window-functions node.
+
+    Attributes
+    ----------
+    partition_by : list[str]
+        Optional list of columns to partition by (equivalent to ``.over(...)``).
+    order_by : list[SortByInput]
+        Ordering within each partition. Required for rolling and tile
+        functions; optional (but usually wanted) for cumulative functions.
+    window_functions : list[WindowFunctionInput]
+        Ordered list of per-column window operations to apply. Each produces
+        one new column; all are applied in a single ``with_columns`` call.
+    """
+
+    partition_by: list[str] = Field(default_factory=list)
+    order_by: list[SortByInput] = Field(default_factory=list)
+    window_functions: list[WindowFunctionInput] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate(self) -> "WindowFunctionsInput":
+        needs_order = any(_is_rolling(w.function) or w.function == "tile" for w in self.window_functions)
+        if needs_order and not self.order_by:
+            raise ValueError("Rolling and tile functions require at least one order_by column")
+        seen: set[str] = set()
+        for w in self.window_functions:
+            if w.new_column_name in seen:
+                raise ValueError(f"Duplicate new_column_name: {w.new_column_name!r}")
+            seen.add(w.new_column_name)
+        return self
+
+
+class TextToRowsInput(BaseModel):
+    """Defines settings for splitting a text column into multiple rows based on a delimiter."""
+
+    column_to_split: str
+    output_column_name: str | None = None
+    split_by_fixed_value: bool | None = True
+    split_fixed_value: str | None = ","
+    split_by_column: str | None = None
+
+
+UnpivotDataType = Literal["float", "all", "date", "numeric", "string"]
+UNPIVOT_DATA_TYPES: tuple[str, ...] = get_args(UnpivotDataType)
+
+
+def unpivot_selector_name(data_type: str) -> str:
+    """The ``flowfile`` selector of an unpivot data type: Polars' name, with a trailing ``_`` where a builtin has it."""
+    return f"{data_type}_" if hasattr(builtins, data_type) else data_type
+
+
+class UnpivotInput(BaseModel):
+    """Defines settings for an unpivot (wide-to-long) operation."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    index_columns: list[str] = Field(default_factory=list)
+    value_columns: list[str] = Field(default_factory=list)
+    data_type_selector: UnpivotDataType | None = None
+    data_type_selector_mode: Literal["data_type", "column"] = "column"
+
+    @model_validator(mode="after")
+    def keep_the_active_mode(self):
+        """Hold only what the active mode reads, so two settings that unpivot alike are equal.
+
+        A data-type unpivot names its type (``all`` when none is set) and no columns; a column unpivot no type.
+        """
+        if self.data_type_selector_mode == "data_type":
+            self.data_type_selector = self.data_type_selector or "all"
+            self.value_columns = []
+        else:
+            self.data_type_selector = None
+        return self
+
+    @property
+    def data_type_selector_expr(self) -> Callable | None:
+        """Returns a Polars selector function based on the `data_type_selector` string."""
+        if self.data_type_selector_mode == "data_type":
+            if self.data_type_selector is not None:
+                try:
+                    return getattr(selectors, self.data_type_selector)
+                except Exception:
+                    print(f"Could not find the selector: {self.data_type_selector}")
+                    return selectors.all
+            return selectors.all
+        return None
+
+
+class UnionInput(BaseModel):
+    """Defines settings for a union (concatenation) operation."""
+
+    mode: Literal["selective", "relaxed"] = "relaxed"
+
+
+GateOperator = Literal["equals", "not_equals", "in", "not_in", "is_true", "is_false", "is_set"]
+
+
+class GateInput(BaseModel):
+    """Defines a gate node's condition.
+
+    Two condition sources:
+
+    * ``parameter`` (default) — a structured rule over a flow parameter
+      (operator + value). Data-independent: decided before the run starts and
+      exported as a plain ``if`` over the pipeline's parameter arguments.
+    * ``formula`` — a flowfile formula (the Filter node's expression language)
+      applied as a row predicate when the gate executes: the gate opens iff
+      **at least one row matches**. The predicate runs against the optional
+      second "control" input when one is connected, otherwise against the data
+      input itself, so a branch can gate on its own data or on a signal
+      computed anywhere else in the graph. ``${param}`` references resolve
+      like in any other node setting.
+
+    The gate passes its data input through when the condition holds; when it
+    does not, every node downstream of the gate is deliberately skipped
+    (reported as skipped, not failed). ``value`` is stored as a string — like
+    parameter defaults — and coerced with the referenced parameter's declared
+    type at evaluation time; for ``in`` / ``not_in`` it is a comma-separated
+    list. For an if/else, enable ``NodeGate.else_output`` — one condition,
+    two exits (then/else) — instead of maintaining two complementary gates.
+
+    Legacy settings (the pre-formula shape) are migrated on load: the removed
+    ``control_input`` source becomes ``formula``, and a parameter gate saved
+    with the removed ``invert`` flag gets its operator flipped to the
+    complement so its meaning is preserved.
+    """
+
+    condition_source: Literal["parameter", "formula"] = "parameter"
+    parameter: str = ""
+    operator: GateOperator = "equals"
+    value: str = ""
+    formula: str = Field(default="", json_schema_extra={"expression": True})
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_shape(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        if data.get("condition_source") == "control_input":
+            data = {**data, "condition_source": "formula"}
+        if data.get("invert") and data.get("condition_source", "parameter") == "parameter":
+            complements = {
+                "equals": "not_equals",
+                "not_equals": "equals",
+                "in": "not_in",
+                "not_in": "in",
+                "is_true": "is_false",
+                "is_false": "is_true",
+            }
+            flipped = complements.get(data.get("operator", "equals"))
+            if flipped is not None:
+                data = {**data, "operator": flipped}
+        return data
+
+    def evaluate(self, parameters: dict[str, FlowParameter]) -> bool:
+        """Evaluate the parameter-mode condition against the flow's parameters.
+
+        Raises ValueError when the referenced parameter does not exist or the
+        configured value cannot be coerced to the parameter's type — a broken
+        condition must fail the gate node loudly, never silently pick a branch.
+        """
+        param = parameters.get(self.parameter)
+        if param is None:
+            raise ValueError(f"Gate references unknown flow parameter '{self.parameter}'")
+        return self._evaluate_operator(param)
+
+    def _evaluate_operator(self, param: FlowParameter) -> bool:
+        if self.operator == "is_set":
+            return param.default_value.strip() != ""
+        if self.operator in ("is_true", "is_false"):
+            truthy = coerce_param_value("boolean", param.default_value)
+            return truthy if self.operator == "is_true" else not truthy
+        current = param.typed_default()
+        if self.operator in ("equals", "not_equals"):
+            expected = coerce_param_value(param.type, self.value, param.enum_values)
+            matches = current == expected
+            return matches if self.operator == "equals" else not matches
+        expected_values = []
+        for raw_item in self.value.split(","):
+            raw_item = raw_item.strip()
+            if raw_item:
+                expected_values.append(coerce_param_value(param.type, raw_item, param.enum_values))
+        matches = current in expected_values
+        return matches if self.operator == "in" else not matches
+
+
+class UniqueInput(BaseModel):
+    """Defines settings for a uniqueness operation, specifying columns and which row to keep."""
+
+    columns: list[str] | None = None
+    strategy: Literal["first", "last", "any", "none"] = "any"
+
+
+class GraphSolverInput(BaseModel):
+    """Defines settings for a graph-solving operation (e.g., finding connected components)."""
+
+    col_from: str
+    col_to: str
+    output_column_name: str | None = "graph_group"
+
+
+HierarchyOutputDetail = Literal["totals", "levels", "paths"]
+MAX_HIERARCHY_DEPTH = 2**32 - 1
+
+
+class ExplodeHierarchyInput(BaseModel):
+    """Settings for exploding a parent -> child edge list into its transitive closure.
+
+    The output replaces the input table: one row per (ancestor, descendant) for ``totals``,
+    per (ancestor, descendant, level) for ``levels`` and per path for ``paths``. Quantities
+    multiply along a path and add up across paths; without a quantity column every edge counts 1.
+    ``max_depth`` is capped at ``MAX_HIERARCHY_DEPTH`` because polars-grouper reads it as a u32.
+    """
+
+    parent_column: str
+    child_column: str
+    quantity_column: str | None = None
+    output_detail: HierarchyOutputDetail = "totals"
+    top_level_only: bool = False
+    include_self: bool = False
+    max_depth: int | None = Field(default=None, ge=0, le=MAX_HIERARCHY_DEPTH)
+
+    def check_edge_columns(self) -> None:
+        """Raise ``ValueError`` unless parent and child are two different, non-empty columns.
+
+        Not a model validator: a freshly dropped node is saved with empty columns and must
+        still load. Building the plan calls this, so a bad pair fails the explode node itself
+        instead of surfacing later as a one-node cycle.
+        """
+        if not self.parent_column or not self.child_column:
+            raise ValueError("Explode hierarchy needs both a parent column and a child column")
+        if self.parent_column == self.child_column:
+            raise ValueError(
+                f"Explode hierarchy needs two different columns for parent and child, got '{self.parent_column}' twice"
+            )
+
+
+RenameMode = Literal["prefix", "suffix", "formula", "first_row"]
+ColumnSelectionMode = Literal["all", "list", "data_type"]
+ReadableDataTypeGroup = Literal["Numeric", "String", "Date", "Other", "Boolean", "Binary", "Complex"]
+
+
+class DynamicRenameInput(BaseModel):
+    """Defines settings for a dynamic rename operation.
+
+    Applies a single rule (prefix / suffix / formula / first_row) to a set of selected
+    columns, rather than requiring the user to rename columns one-by-one.
+
+    In formula mode, the flowfile formula syntax is evaluated with `[column_name]`
+    bound to each target column's current name; for example `uppercase([column_name])`
+    or `"v2_" + [column_name]`.
+
+    In first_row mode, the first row of the incoming table is promoted to column
+    headers and then dropped from the data. Non-string values are coerced to `str`;
+    null or empty values raise an error. Selection filters still apply — only selected
+    columns are renamed, but the first row is always dropped.
+    """
+
+    rename_mode: RenameMode = "prefix"
+    prefix: str = ""
+    suffix: str = ""
+    formula: str = Field(default="", json_schema_extra={"expression": True})
+
+    selection_mode: ColumnSelectionMode = "all"
+    selected_columns: list[str] = Field(default_factory=list)
+    selected_data_type: ReadableDataTypeGroup | None = None
+
+
+MultiFieldOutputMode = Literal["replace", "new"]
+
+MULTI_FIELD_CURRENT_FIELD = "_CurrentField_"
+MULTI_FIELD_CURRENT_FIELD_NAME = "_CurrentFieldName_"
+MULTI_FIELD_CURRENT_FIELD_TYPE = "_CurrentFieldType_"
+MULTI_FIELD_PLACEHOLDERS = (
+    MULTI_FIELD_CURRENT_FIELD,
+    MULTI_FIELD_CURRENT_FIELD_NAME,
+    MULTI_FIELD_CURRENT_FIELD_TYPE,
+)
+
+_MULTI_FIELD_CURRENT_FIELD_RE = re.compile(rf"\[{MULTI_FIELD_CURRENT_FIELD}\]", re.IGNORECASE)
+_MULTI_FIELD_CURRENT_FIELD_NAME_RE = re.compile(rf"\[{MULTI_FIELD_CURRENT_FIELD_NAME}\]", re.IGNORECASE)
+_MULTI_FIELD_CURRENT_FIELD_TYPE_RE = re.compile(rf"\[{MULTI_FIELD_CURRENT_FIELD_TYPE}\]", re.IGNORECASE)
+
+
+def bind_multi_field_formula(formula: str, column_name: str, data_type: str) -> str:
+    """Bind the three per-column placeholders of a multi-field formula to one column.
+
+    `[_CurrentField_]` becomes a column reference, `[_CurrentFieldName_]` a string literal
+    of the column's name and `[_CurrentFieldType_]` a string literal of the column's Polars
+    dtype base token (the part before any parameter list, so `Datetime(time_unit='us')`
+    binds as `Datetime`). Matching is case-insensitive, mirroring Alteryx.
+
+    The substitutions go through callables so a backslash inside a column name is inserted
+    literally instead of being read as a `re.sub` escape.
+
+    Args:
+        formula: The user's flowfile-formula text, still carrying placeholders.
+        column_name: Name of the column the formula is being bound to.
+        data_type: The column's Polars dtype as a string.
+
+    Returns:
+        The formula with every placeholder bound to this column.
+
+    Raises:
+        ValueError: If the column name contains a double quote and therefore cannot be written
+            as a string literal for `[_CurrentFieldName_]`. Single-quoting it would parse in
+            Python but not in polars-expr-transformer, whose `standardize_quotes` re-quotes the
+            literal without escaping, so such a name has no usable literal form at all.
+    """
+    bound = _MULTI_FIELD_CURRENT_FIELD_RE.sub(lambda _m: f"[{column_name}]", formula)
+    if _MULTI_FIELD_CURRENT_FIELD_NAME_RE.search(bound):
+        if '"' in column_name:
+            raise ValueError(f"Multi-field formula: column '{column_name}' cannot be written as a string literal")
+        literal = f'"{column_name}"'
+        bound = _MULTI_FIELD_CURRENT_FIELD_NAME_RE.sub(lambda _m: literal, bound)
+    type_token = (data_type or "").split("(", 1)[0]
+    return _MULTI_FIELD_CURRENT_FIELD_TYPE_RE.sub(lambda _m: f'"{type_token}"', bound)
+
+
+class MultiFieldFormulaInput(BaseModel):
+    """Defines settings for a multi-field formula operation.
+
+    Applies ONE flowfile-formula expression to MANY columns at once, rather than needing a
+    separate formula node per column. Inside the formula three placeholders bind to the
+    column currently being processed: `[_CurrentField_]` (its value), `[_CurrentFieldName_]`
+    (its name as a string literal) and `[_CurrentFieldType_]` (its Polars dtype base token
+    as a string literal).
+
+    Selection follows the same rules as `DynamicRenameInput`: all columns, a listed subset
+    (listed names that no longer exist are silently skipped, so stale UI state does not
+    break execution), or every column of one data-type group.
+
+    In `"replace"` output mode each result overwrites its source column, keeping the column
+    order. In `"new"` mode the results are written to `f"{output_prefix}{name}{output_suffix}"`
+    columns appended after the existing ones, and at least one affix is required. When
+    `output_data_type` is set to anything other than `"Auto"` the result is cast to that type.
+
+    Zero selected columns is a no-op: the frame passes through unchanged.
+    """
+
+    formula: str = Field(default="", json_schema_extra={"expression": True})
+
+    selection_mode: ColumnSelectionMode = "all"
+    selected_columns: list[str] = Field(default_factory=list)
+    selected_data_type: ReadableDataTypeGroup | None = None
+
+    output_mode: MultiFieldOutputMode = "replace"
+    output_prefix: str = ""
+    output_suffix: str = ""
+    output_data_type: DataType | Literal["Auto"] | DataTypeStr | None = AUTO_DATA_TYPE
+
+
+CleansingCaseMode = Literal["none", "uppercase", "lowercase", "titlecase"]
+CleansingSelectionMode = Literal["all", "list"]
+
+# The code generator interpolates these constants into exported scripts: never retype the patterns.
+CLEANSING_LETTERS_REGEX = r"\p{L}"
+CLEANSING_NUMBERS_REGEX = r"\d"
+# The four contiguous ASCII ranges that make up exactly `string.punctuation`.
+CLEANSING_PUNCTUATION_REGEX = r"[!-/:-@\[-`{-~]"
+CLEANSING_WHITESPACE_RUN_REGEX = r"\s+"
+CLEANSING_WHITESPACE_REGEX = r"\s"
+
+
+class DataCleansingInput(BaseModel):
+    """Defines settings for a data-cleansing operation.
+
+    Bundles the common "fix the obvious data quality problems" rules into one node:
+    dropping entirely-null rows and columns, replacing nulls with a neutral value,
+    stripping unwanted characters, and normalising casing.
+
+    Two rules are frame-wide and deliberately ignore the column selection, matching
+    Alteryx's Data Cleansing tool: `remove_null_rows` drops a row only when *every*
+    column is null, and `remove_null_columns` drops a column only when it is null in
+    *every* row. An empty string is not a null, so it keeps its row/column alive.
+
+    Every other rule applies only to the columns picked by `selection_mode` /
+    `selected_columns`, and only to columns of the matching data-type group: the
+    null-to-blank and character/case rules touch String columns, `replace_nulls_with_zero`
+    touches Numeric columns, and every other dtype passes through untouched. Selected
+    columns that no longer exist are silently ignored, mirroring `DynamicRenameInput`.
+
+    Within one string column the rules run in a fixed order: fill nulls, remove letters,
+    numbers and punctuation, then clean up whitespace (so gaps left by character removal
+    are collapsed too), then apply the casing rule. `remove_all_whitespace` supersedes
+    `normalize_whitespace` and `trim_whitespace`.
+
+    Data-type groups come from `FlowfileColumn.data_type_group`, which puts `Categorical`,
+    `Enum` and the all-null `Null` dtype in "Other" rather than "String" — so no rule fires
+    on them, including `replace_nulls_with_blank` on a column polars typed as `Null`.
+    """
+
+    remove_null_rows: bool = False
+    remove_null_columns: bool = False
+
+    selection_mode: CleansingSelectionMode = "all"
+    selected_columns: list[str] = Field(default_factory=list)
+
+    replace_nulls_with_blank: bool = True
+    replace_nulls_with_zero: bool = True
+
+    trim_whitespace: bool = True
+    normalize_whitespace: bool = False
+    remove_all_whitespace: bool = False
+
+    remove_letters: bool = False
+    remove_numbers: bool = False
+    remove_punctuation: bool = False
+
+    case_mode: CleansingCaseMode = "none"
+
+
+class PolarsCodeInput(BaseModel):
+    """A simple container for a string of user-provided Polars code to be executed."""
+
+    polars_code: str
+
+
+class SqlQueryInput(BaseModel):
+    """A container for a SQL query to execute against connected data sources.
+
+    Note: ``sql_code`` is *not* validated at schema-construction time. Construction
+    is a passive shape-check; the unsafe-SQL gate lives at the executor seam in
+    ``execute_sql_query`` (and is also enforced by the underlying
+    ``validate_sql_query`` utility callers can use directly). Validating here too
+    would block legitimate non-AI callers from drafting/testing SQL before
+    execution.
+    """
+
+    sql_code: str
+
+
+class SelectInputsManager:
+    """Manager class that provides all query and mutation operations."""
+
+    def __init__(self, select_inputs: SelectInputs):
+        self.select_inputs = select_inputs
+
+    # === Query Methods (read-only) ===
+
+    def get_old_cols(self) -> set[str]:
+        """Returns a set of original column names to be kept in the selection."""
+        return set(v.old_name for v in self.select_inputs.renames if v.keep)
+
+    def get_new_cols(self) -> set[str]:
+        """Returns a set of new (renamed) column names to be kept in the selection."""
+        return set(v.new_name for v in self.select_inputs.renames if v.keep)
+
+    def get_rename_table(self) -> dict[str, str]:
+        """Generates a dictionary for use in Polars' `.rename()` method."""
+        return {v.old_name: v.new_name for v in self.select_inputs.renames if v.is_available and (v.keep or v.join_key)}
+
+    def get_select_cols(self, include_join_key: bool = True) -> list[str]:
+        """Gets a list of original column names to select from the source DataFrame."""
+        return [
+            v.old_name
+            for v in self.select_inputs.renames
+            if v.is_available and (v.keep or (v.join_key and include_join_key))
+        ]
+
+    def has_drop_cols(self) -> bool:
+        """Checks if any column is marked to be dropped from the selection."""
+        return any(not v.keep for v in self.select_inputs.renames)
+
+    def get_drop_columns(self) -> list[SelectInput]:
+        """Returns a list of SelectInput objects that are marked to be dropped."""
+        return [v for v in self.select_inputs.renames if not v.keep and v.is_available]
+
+    def get_non_jk_drop_columns(self) -> list[SelectInput]:
+        """Returns drop columns that are not join keys."""
+        return [v for v in self.select_inputs.renames if not v.keep and v.is_available and not v.join_key]
+
+    def find_by_old_name(self, old_name: str) -> SelectInput | None:
+        """Find SelectInput by original column name."""
+        return next((v for v in self.select_inputs.renames if v.old_name == old_name), None)
+
+    def find_by_new_name(self, new_name: str) -> SelectInput | None:
+        """Find SelectInput by new column name."""
+        return next((v for v in self.select_inputs.renames if v.new_name == new_name), None)
+
+    # === Mutation Methods ===
+
+    def append(self, other: SelectInput) -> None:
+        """Appends a new SelectInput to the list of renames."""
+        self.select_inputs.renames.append(other)
+
+    def remove_select_input(self, old_key: str) -> None:
+        """Removes a SelectInput from the list based on its original name."""
+        self.select_inputs.renames = [rename for rename in self.select_inputs.renames if rename.old_name != old_key]
+
+    def unselect_field(self, old_key: str) -> None:
+        """Marks a field to be dropped from the final selection by setting `keep` to False."""
+        for rename in self.select_inputs.renames:
+            if old_key == rename.old_name:
+                rename.keep = False
+
+    # === Backward Compatibility Properties ===
+
+    @property
+    def old_cols(self) -> set[str]:
+        """Backward compatibility: Returns set of old column names."""
+        return self.get_old_cols()
+
+    @property
+    def new_cols(self) -> set[str]:
+        """Backward compatibility: Returns set of new column names."""
+        return self.get_new_cols()
+
+    @property
+    def rename_table(self) -> dict[str, str]:
+        """Backward compatibility: Returns rename table dictionary."""
+        return self.get_rename_table()
+
+    @property
+    def drop_columns(self) -> list[SelectInput]:
+        """Backward compatibility: Returns list of columns to drop."""
+        return self.get_drop_columns()
+
+    @property
+    def non_jk_drop_columns(self) -> list[SelectInput]:
+        """Backward compatibility: Returns non-join-key columns to drop."""
+        return self.get_non_jk_drop_columns()
+
+    @property
+    def renames(self) -> list[SelectInput]:
+        """Backward compatibility: Direct access to renames list."""
+        return self.select_inputs.renames
+
+    def get_select_input_on_old_name(self, old_name: str) -> SelectInput | None:
+        """Backward compatibility alias: Find SelectInput by original column name."""
+        return self.find_by_old_name(old_name)
+
+    def get_select_input_on_new_name(self, new_name: str) -> SelectInput | None:
+        """Backward compatibility alias: Find SelectInput by new column name."""
+        return self.find_by_new_name(new_name)
+
+    def __add__(self, other: SelectInput) -> "SelectInputsManager":
+        """Backward compatibility: Support += operator for appending."""
+        self.append(other)
+        return self
+
+
+class JoinInputsManager(SelectInputsManager):
+    """Manager for join-specific operations, extends SelectInputsManager."""
+
+    def __init__(self, join_inputs: JoinInputs):
+        super().__init__(join_inputs)
+        self.join_inputs = join_inputs
+
+    # === Query Methods ===
+
+    def get_join_key_selects(self) -> list[SelectInput]:
+        """Returns only the `SelectInput` objects that are marked as join keys."""
+        return [v for v in self.join_inputs.renames if v.join_key]
+
+    def get_join_key_renames(self, side: SideLit, filter_drop: bool = False) -> JoinKeyRenameResponse:
+        """Gets the temporary rename mapping for all join keys on one side of a join."""
+        join_key_selects = self.get_join_key_selects()
+        join_key_list = [
+            JoinKeyRename(jk.new_name, construct_join_key_name(side, jk.new_name))
+            for jk in join_key_selects
+            if jk.keep or not filter_drop
+        ]
+        return JoinKeyRenameResponse(side, join_key_list)
+
+    def get_join_key_rename_mapping(self, side: SideLit) -> dict[str, str]:
+        """Returns a dictionary mapping original join key names to their temporary names."""
+        join_key_response = self.get_join_key_renames(side)
+        return {jkr.original_name: jkr.temp_name for jkr in join_key_response.join_key_renames}
+
+    @property
+    def join_key_selects(self) -> list[SelectInput]:
+        """Backward compatibility: Returns join key SelectInputs."""
+        return self.get_join_key_selects()
+
+
+class JoinSelectManagerMixin:
+    """Mixin providing common methods for join-like operations."""
+
+    left_manager: JoinInputsManager
+    right_manager: JoinInputsManager
+    input: CrossJoinInput | JoinInput | FuzzyMatchInput
+
+    @staticmethod
+    def parse_select(select: list[SelectInput] | list[str] | list[dict] | dict) -> JoinInputs:
+        """Parses various input formats into a standardized `JoinInputs` object."""
+        if not select:
+            return JoinInputs(renames=[])
+
+        if all(isinstance(c, SelectInput) for c in select):
+            return JoinInputs(renames=select)
+        elif all(isinstance(c, dict) for c in select):
+            return JoinInputs(renames=[SelectInput(**c) for c in select])
+        elif isinstance(select, dict):
+            renames = select.get("renames")
+            if renames:
+                return JoinInputs(renames=[SelectInput(**c) for c in renames])
+            return JoinInputs(renames=[])
+        elif all(isinstance(c, str) for c in select):
+            return JoinInputs(renames=[SelectInput(old_name=s, new_name=s) for s in select])
+
+        raise ValueError(f"Unable to parse select input: {type(select)}")
+
+    def get_overlapping_columns(self) -> set[str]:
+        """Finds column names that would conflict after the join."""
+        return self.left_manager.get_new_cols() & self.right_manager.get_new_cols()
+
+    def auto_generate_new_col_name(self, old_col_name: str, side: str) -> str:
+        """Generates a new, non-conflicting column name by adding a suffix if necessary."""
+        current_names = self.get_overlapping_columns()
+        if old_col_name not in current_names:
+            return old_col_name
+
+        new_name = old_col_name
+        while new_name in current_names:
+            new_name = f"{side}_{new_name}"
+        return new_name
+
+    def add_new_select_column(self, select_input: SelectInput, side: str) -> None:
+        """Adds a new column to the selection for either the left or right side."""
+        target_input = self.input.right_select if side == "right" else self.input.left_select
+
+        select_input.new_name = self.auto_generate_new_col_name(select_input.old_name, side=side)
+
+        target_input.renames.append(select_input)
+
+
+class CrossJoinInputManager(JoinSelectManagerMixin):
+    """Manager for cross join operations."""
+
+    def __init__(self, cross_join_input: CrossJoinInput):
+        self.input = deepcopy(cross_join_input)
+        self.left_manager = JoinInputsManager(self.input.left_select)
+        self.right_manager = JoinInputsManager(self.input.right_select)
+
+    @classmethod
+    def create(
+        cls, left_select: list[SelectInput] | list[str], right_select: list[SelectInput] | list[str]
+    ) -> "CrossJoinInputManager":
+        """Factory method to create CrossJoinInput from various input formats."""
+        left_inputs = cls.parse_select(left_select)
+        right_inputs = cls.parse_select(right_select)
+
+        cross_join = CrossJoinInput(left_select=left_inputs, right_select=right_inputs)
+        return cls(cross_join)
+
+    def get_overlapping_records(self) -> set[str]:
+        """Finds column names that would conflict after the join."""
+        return self.get_overlapping_columns()
+
+    def auto_rename(self, rename_mode: Literal["suffix", "prefix"] = "prefix") -> None:
+        """Automatically renames columns on the right side to prevent naming conflicts."""
+        overlapping_records = self.get_overlapping_records()
+
+        while len(overlapping_records) > 0:
+            for right_col in self.input.right_select.renames:
+                if right_col.new_name in overlapping_records:
+                    if rename_mode == "prefix":
+                        right_col.new_name = "right_" + right_col.new_name
+                    elif rename_mode == "suffix":
+                        right_col.new_name = right_col.new_name + "_right"
+                    else:
+                        raise ValueError(f"Unknown rename_mode: {rename_mode}")
+            overlapping_records = self.get_overlapping_records()
+
+    # === Backward Compatibility Properties ===
+
+    @property
+    def left_select(self) -> JoinInputsManager:
+        """Backward compatibility: Access left_manager as left_select."""
+        return self.left_manager
+
+    @property
+    def right_select(self) -> JoinInputsManager:
+        """Backward compatibility: Access right_manager as right_select."""
+        return self.right_manager
+
+    @property
+    def overlapping_records(self) -> set[str]:
+        """Backward compatibility: Returns overlapping column names."""
+        return self.get_overlapping_records()
+
+    def to_cross_join_input(self) -> CrossJoinInput:
+        """Creates a new CrossJoinInput instance based on the current manager settings.
+
+        This is useful when you've modified the manager (e.g., via auto_rename) and
+        want to get a fresh CrossJoinInput with all the current settings applied.
+
+        Returns:
+            A new CrossJoinInput instance with current settings
+        """
+        return CrossJoinInput(
+            left_select=JoinInputs(renames=self.input.left_select.renames.copy()),
+            right_select=JoinInputs(renames=self.input.right_select.renames.copy()),
+        )
+
+
+class JoinInputManager(JoinSelectManagerMixin):
+    """Manager for standard SQL-style join operations."""
+
+    def __init__(self, join_input: JoinInput):
+        self.input = deepcopy(join_input)
+        self.left_manager = JoinInputsManager(self.input.left_select)
+        self.right_manager = JoinInputsManager(self.input.right_select)
+        self.set_join_keys()
+
+    @classmethod
+    def create(
+        cls,
+        join_mapping: list[JoinMap] | tuple[str, str] | str,
+        left_select: list[SelectInput] | list[str],
+        right_select: list[SelectInput] | list[str],
+        how: JoinKeyStrategy = "inner",
+    ) -> "JoinInputManager":
+        """Factory method to create JoinInput from various input formats."""
+        join_input = JoinInput(join_mapping=join_mapping, left_select=left_select, right_select=right_select, how=how)
+
+        manager = cls(join_input)
+        manager.set_join_keys()
+        return manager
+
+    def set_join_keys(self) -> None:
+        """Marks the `SelectInput` objects corresponding to join keys."""
+        left_join_keys = self._get_left_join_keys_set()
+        right_join_keys = self._get_right_join_keys_set()
+
+        for select_input in self.input.left_select.renames:
+            select_input.join_key = select_input.old_name in left_join_keys
+
+        for select_input in self.input.right_select.renames:
+            select_input.join_key = select_input.old_name in right_join_keys
+
+    def _get_left_join_keys_set(self) -> set[str]:
+        """Internal: Returns a set of the left-side join key column names."""
+        return {jm.left_col for jm in self.input.join_mapping}
+
+    def _get_right_join_keys_set(self) -> set[str]:
+        """Internal: Returns a set of the right-side join key column names."""
+        return {jm.right_col for jm in self.input.join_mapping}
+
+    def get_left_join_keys(self) -> set[str]:
+        """Returns a set of the left-side join key column names."""
+        return self._get_left_join_keys_set()
+
+    def get_right_join_keys(self) -> set[str]:
+        """Returns a set of the right-side join key column names."""
+        return self._get_right_join_keys_set()
+
+    def get_left_join_keys_list(self) -> list[str]:
+        """Returns an ordered list of the left-side join key column names."""
+        return [jm.left_col for jm in self.used_join_mapping]
+
+    def get_right_join_keys_list(self) -> list[str]:
+        """Returns an ordered list of the right-side join key column names."""
+        return [jm.right_col for jm in self.used_join_mapping]
+
+    def get_overlapping_records(self) -> set[str]:
+        """Finds column names that would conflict after the join."""
+        return self.get_overlapping_columns()
+
+    def auto_rename(self) -> None:
+        """Automatically renames columns on the right side to prevent naming conflicts."""
+        self.set_join_keys()
+        overlapping_records = self.get_overlapping_records()
+
+        while len(overlapping_records) > 0:
+            for right_col in self.input.right_select.renames:
+                if right_col.new_name in overlapping_records:
+                    right_col.new_name = right_col.new_name + "_right"
+            overlapping_records = self.get_overlapping_records()
+
+    def get_join_key_renames(self, filter_drop: bool = False) -> FullJoinKeyResponse:
+        """Gets the temporary rename mappings for the join keys on both sides."""
+        left_renames = self.left_manager.get_join_key_renames(side="left", filter_drop=filter_drop)
+        right_renames = self.right_manager.get_join_key_renames(side="right", filter_drop=filter_drop)
+        return FullJoinKeyResponse(left_renames, right_renames)
+
+    def get_names_for_table_rename(self) -> list[JoinMap]:
+        """Gets join mapping with renamed columns applied."""
+        new_mappings: list[JoinMap] = []
+        left_rename_table = self.left_manager.get_rename_table()
+        right_rename_table = self.right_manager.get_rename_table()
+
+        for join_map in self.input.join_mapping:
+            new_left = left_rename_table.get(join_map.left_col, join_map.left_col)
+            new_right = right_rename_table.get(join_map.right_col, join_map.right_col)
+            new_mappings.append(JoinMap(left_col=new_left, right_col=new_right))
+
+        return new_mappings
+
+    def get_used_join_mapping(self) -> list[JoinMap]:
+        """Returns the final join mapping after applying all renames and transformations."""
+        new_mappings: list[JoinMap] = []
+        left_rename_table = self.left_manager.get_rename_table()
+        right_rename_table = self.right_manager.get_rename_table()
+        left_join_rename_mapping = self.left_manager.get_join_key_rename_mapping("left")
+        right_join_rename_mapping = self.right_manager.get_join_key_rename_mapping("right")
+        for join_map in self.input.join_mapping:
+            left_col = left_rename_table.get(join_map.left_col, join_map.left_col)
+            right_col = right_rename_table.get(join_map.right_col, join_map.left_col)
+
+            final_left = left_join_rename_mapping.get(left_col, None)
+            final_right = right_join_rename_mapping.get(right_col, None)
+
+            new_mappings.append(JoinMap(left_col=final_left, right_col=final_right))
+
+        return new_mappings
+
+    def to_join_input(self) -> JoinInput:
+        """Creates a new JoinInput instance based on the current manager settings.
+
+        This is useful when you've modified the manager (e.g., via auto_rename) and
+        want to get a fresh JoinInput with all the current settings applied.
+
+        Returns:
+            A new JoinInput instance with current settings
+        """
+        return JoinInput(
+            join_mapping=self.input.join_mapping,
+            left_select=JoinInputs(renames=self.input.left_select.renames.copy()),
+            right_select=JoinInputs(renames=self.input.right_select.renames.copy()),
+            how=self.input.how,
+        )
+
+    @property
+    def left_select(self) -> JoinInputsManager:
+        """Backward compatibility: Access left_manager as left_select.
+
+        This returns the MANAGER, not the data model.
+        Usage: manager.left_select.join_key_selects
+        """
+        return self.left_manager
+
+    @property
+    def right_select(self) -> JoinInputsManager:
+        """Backward compatibility: Access right_manager as right_select.
+
+        This returns the MANAGER, not the data model.
+        Usage: manager.right_select.join_key_selects
+        """
+        return self.right_manager
+
+    @property
+    def how(self) -> JoinStrategy:
+        """Backward compatibility: Access join strategy."""
+        return self.input.how
+
+    @property
+    def join_mapping(self) -> list[JoinMap]:
+        """Backward compatibility: Access join mapping."""
+        return self.input.join_mapping
+
+    @property
+    def overlapping_records(self) -> set[str]:
+        """Backward compatibility: Returns overlapping column names."""
+        return self.get_overlapping_records()
+
+    @property
+    def used_join_mapping(self) -> list[JoinMap]:
+        """Backward compatibility: Returns used join mapping.
+
+        This property is critical - it's used by left_join_keys and right_join_keys.
+        """
+        return self.get_used_join_mapping()
+
+    @property
+    def left_join_keys(self) -> list[str]:
+        """Backward compatibility: Returns left join keys list.
+
+        IMPORTANT: Uses the used_join_mapping PROPERTY (not method).
+        """
+        return [jm.left_col for jm in self.used_join_mapping]
+
+    @property
+    def right_join_keys(self) -> list[str]:
+        """Backward compatibility: Returns right join keys list.
+
+        IMPORTANT: Uses the used_join_mapping PROPERTY (not method).
+        """
+        return [jm.right_col for jm in self.used_join_mapping]
+
+    @property
+    def _left_join_keys(self) -> set[str]:
+        """Backward compatibility: Private property for left join key set."""
+        return self._get_left_join_keys_set()
+
+    @property
+    def _right_join_keys(self) -> set[str]:
+        """Backward compatibility: Private property for right join key set."""
+        return self._get_right_join_keys_set()
+
+
+class FuzzyMatchInputManager(JoinInputManager):
+    """Manager for fuzzy matching join operations."""
+
+    def __init__(self, fuzzy_input: FuzzyMatchInput):
+        self.fuzzy_input = deepcopy(fuzzy_input)
+        super().__init__(
+            JoinInput(
+                join_mapping=[
+                    JoinMap(left_col=fm.left_col, right_col=fm.right_col) for fm in self.fuzzy_input.join_mapping
+                ],
+                left_select=self.fuzzy_input.left_select,
+                right_select=self.fuzzy_input.right_select,
+                how=self.fuzzy_input.how,
+            )
+        )
+
+    @classmethod
+    def create(
+        cls,
+        join_mapping: list[FuzzyMapping] | tuple[str, str] | str,
+        left_select: list[SelectInput] | list[str],
+        right_select: list[SelectInput] | list[str],
+        aggregate_output: bool = False,
+        how: JoinStrategy = "inner",
+    ) -> "FuzzyMatchInputManager":
+        """Factory method to create FuzzyMatchInput from various input formats."""
+        parsed_mapping = cls.parse_fuzz_mapping(join_mapping)
+        left_inputs = cls.parse_select(left_select)
+        right_inputs = cls.parse_select(right_select)
+
+        fuzzy_input = FuzzyMatchInput(
+            join_mapping=parsed_mapping,
+            left_select=left_inputs,
+            right_select=right_inputs,
+            how=how,
+            aggregate_output=aggregate_output,
+        )
+
+        manager = cls(fuzzy_input)
+
+        right_old_names = {v.old_name for v in fuzzy_input.right_select.renames}
+        left_old_names = {v.old_name for v in fuzzy_input.left_select.renames}
+
+        for jm in parsed_mapping:
+            if jm.right_col not in right_old_names:
+                manager.right_manager.append(SelectInput(old_name=jm.right_col, keep=False, join_key=True))
+            if jm.left_col not in left_old_names:
+                manager.left_manager.append(SelectInput(old_name=jm.left_col, keep=False, join_key=True))
+
+        manager.set_join_keys()
+        return manager
+
+    @staticmethod
+    def parse_fuzz_mapping(
+        fuzz_mapping: list[FuzzyMapping] | tuple[str, str] | str | FuzzyMapping | list[dict],
+    ) -> list[FuzzyMapping]:
+        """Parses various input formats into a list of FuzzyMapping objects."""
+        if isinstance(fuzz_mapping, tuple | list):
+            if len(fuzz_mapping) == 0:
+                raise ValueError("Fuzzy mapping cannot be empty")
+
+            if all(isinstance(fm, dict) for fm in fuzz_mapping):
+                return [FuzzyMapping(**fm) for fm in fuzz_mapping]
+
+            if all(isinstance(fm, FuzzyMapping) for fm in fuzz_mapping):
+                return fuzz_mapping
+
+            if len(fuzz_mapping) <= 2:
+                if len(fuzz_mapping) == 2:
+                    if isinstance(fuzz_mapping[0], str) and isinstance(fuzz_mapping[1], str):
+                        return [FuzzyMapping(left_col=fuzz_mapping[0], right_col=fuzz_mapping[1])]
+                elif len(fuzz_mapping) == 1 and isinstance(fuzz_mapping[0], str):
+                    return [FuzzyMapping(left_col=fuzz_mapping[0], right_col=fuzz_mapping[0])]
+
+        elif isinstance(fuzz_mapping, str):
+            return [FuzzyMapping(left_col=fuzz_mapping, right_col=fuzz_mapping)]
+
+        elif isinstance(fuzz_mapping, FuzzyMapping):
+            return [fuzz_mapping]
+
+        raise ValueError(f"No valid fuzzy mapping as input: {type(fuzz_mapping)}")
+
+    def get_fuzzy_maps(self) -> list[FuzzyMapping]:
+        """Returns the final fuzzy mappings after applying all column renames."""
+        new_mappings = []
+        left_rename_table = self.left_manager.get_rename_table()
+        right_rename_table = self.right_manager.get_rename_table()
+
+        for org_fuzzy_map in self.fuzzy_input.join_mapping:
+            right_col = right_rename_table.get(org_fuzzy_map.right_col, org_fuzzy_map.right_col)
+            left_col = left_rename_table.get(org_fuzzy_map.left_col, org_fuzzy_map.left_col)
+
+            if right_col != org_fuzzy_map.right_col or left_col != org_fuzzy_map.left_col:
+                new_mapping = deepcopy(org_fuzzy_map)
+                new_mapping.left_col = left_col
+                new_mapping.right_col = right_col
+                new_mappings.append(new_mapping)
+            else:
+                new_mappings.append(org_fuzzy_map)
+
+        return new_mappings
+
+    # === Backward Compatibility Properties ===
+
+    @property
+    def fuzzy_maps(self) -> list[FuzzyMapping]:
+        """Backward compatibility: Returns fuzzy mappings."""
+        return self.get_fuzzy_maps()
+
+    @property
+    def join_mapping(self) -> list[FuzzyMapping]:
+        """Backward compatibility: Access fuzzy join mapping."""
+        return self.get_fuzzy_maps()
+
+    @property
+    def aggregate_output(self) -> bool:
+        """Backward compatibility: Access aggregate_output setting."""
+        return self.fuzzy_input.aggregate_output
+
+    def to_fuzzy_match_input(self) -> FuzzyMatchInput:
+        """Creates a new FuzzyMatchInput instance based on the current manager settings.
+
+        This is useful when you've modified the manager (e.g., via auto_rename) and
+        want to get a fresh FuzzyMatchInput with all the current settings applied.
+
+        Returns:
+            A new FuzzyMatchInput instance with current settings
+        """
+        return FuzzyMatchInput(
+            join_mapping=self.fuzzy_input.join_mapping,
+            left_select=JoinInputs(renames=self.input.left_select.renames.copy()),
+            right_select=JoinInputs(renames=self.input.right_select.renames.copy()),
+            how=self.fuzzy_input.how,
+            aggregate_output=self.fuzzy_input.aggregate_output,
+        )

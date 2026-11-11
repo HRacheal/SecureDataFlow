@@ -1,0 +1,648 @@
+import asyncio
+import logging
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+
+from flowfile_core.auth.jwt import get_current_active_user
+from flowfile_core.kernel.models import (
+    ArtifactPersistenceInfo,
+    CleanupRequest,
+    CleanupResult,
+    ClearNodeArtifactsRequest,
+    ClearNodeArtifactsResult,
+    DockerStatus,
+    ExecuteRequest,
+    ExecuteResult,
+    FlavourInfo,
+    FlavourPackage,
+    ImageFlavour,
+    KernelConfig,
+    KernelImageStatus,
+    KernelInfo,
+    KernelMatchBatchRequest,
+    KernelMatchBatchResponse,
+    KernelMatchBatchSummary,
+    KernelMatchRequest,
+    KernelMatchResponse,
+    KernelMemoryInfo,
+    KernelSuggestion,
+    KernelUpdate,
+    RecoveryStatus,
+)
+from flowfile_core.lsp.feature_flag import is_lsp_enabled
+from flowfile_core.lsp.models import (
+    CompleteResponse,
+    DataframeSchemasRequest,
+    DataframeSchemasResponse,
+    DiagnosticsResponse,
+    HoverResponse,
+    LspRequest,
+    SignatureResponse,
+)
+
+logger = logging.getLogger(__name__)
+
+
+async def _get_manager():
+    from flowfile_core.kernel import get_kernel_manager
+
+    try:
+        # First call constructs the manager (Docker probe + container reclaim): keep it off the loop.
+        return await asyncio.to_thread(get_kernel_manager)
+    except Exception as exc:
+        logger.error("Kernel manager unavailable: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Docker is not available. Please ensure Docker is installed and running.",
+        ) from exc
+
+
+router = APIRouter(prefix="/kernels", dependencies=[Depends(get_current_active_user)])
+
+
+@router.get("/", response_model=list[KernelInfo])
+async def list_kernels(current_user=Depends(get_current_active_user)):
+    manager = await _get_manager()
+    return await manager.list_kernels(user_id=current_user.id)
+
+
+@router.post("/", response_model=KernelInfo)
+async def create_kernel(config: KernelConfig, current_user=Depends(get_current_active_user)):
+    manager = await _get_manager()
+    try:
+        return await manager.create_kernel(config, user_id=current_user.id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/flavours", response_model=list[FlavourInfo])
+async def list_flavours():
+    """Return the locked package versions baked into each kernel image flavour."""
+    from flowfile_core.kernel.flavours import get_flavour_packages
+    from flowfile_core.kernel.manager import _flavour_images
+
+    packages_by_flavour = get_flavour_packages()
+    images = _flavour_images()
+    return [
+        FlavourInfo(
+            flavour=flavour,
+            image=images.get(flavour),
+            packages=[FlavourPackage(name=n, version=v) for n, v in pkgs],
+        )
+        for flavour, pkgs in packages_by_flavour.items()
+    ]
+
+
+def _image_statuses(client, manager) -> DockerStatus:
+    """Per-flavour image inventory; Docker I/O, so callers run it off the loop."""
+    import docker as _docker
+
+    from flowfile_core.kernel.manager import _flavour_images, newest_installed_version, parse_image_version
+
+    flavour_images = _flavour_images()
+    images: list[KernelImageStatus] = []
+    for flavour, image_tag in flavour_images.items():
+        resolved: str | None = None
+        if manager is not None:
+            resolved = manager.resolve_local_image(flavour)
+        available = resolved is not None
+        if not available:
+            # Fall back to a direct check so the field still reflects reality
+            # when the manager helper is unavailable.
+            try:
+                client.images.get(image_tag)
+                available = True
+            except _docker.errors.ImageNotFound:
+                available = False
+            except Exception:
+                available = False
+
+        # Only expose ``resolved_image`` when it differs from the registry
+        # default — keeps the UI logic simple ("set => show 'Found locally'").
+        resolved_image = resolved if resolved and resolved != image_tag else None
+        pull_state = manager.get_pull_state(image_tag) if manager is not None else None
+
+        # Surface "update available" when an older official version is installed
+        # locally but the newer registry default isn't.
+        desired_version = parse_image_version(image_tag)
+        installed = newest_installed_version(image_tag.rsplit(":", 1)[0], client)
+        update_available = bool(
+            desired_version is not None and installed is not None and installed[1] < desired_version
+        )
+
+        images.append(
+            KernelImageStatus(
+                flavour=flavour,
+                image=image_tag,
+                available=available,
+                resolved_image=resolved_image,
+                pull_state=pull_state,
+                update_available=update_available,
+            )
+        )
+
+    base_available = any(i.available for i in images if i.flavour == ImageFlavour.BASE)
+
+    return DockerStatus(
+        available=True,
+        image_available=base_available,
+        images=images,
+    )
+
+
+@router.get("/docker-status", response_model=DockerStatus)
+async def docker_status():
+    """Check if Docker is reachable and which kernel images are pulled."""
+    import docker as _docker
+
+    from flowfile_core.kernel.manager import _DOCKER_PROBE_TIMEOUT_SECONDS
+
+    try:
+        client = await asyncio.to_thread(_docker.from_env, timeout=_DOCKER_PROBE_TIMEOUT_SECONDS)
+        await asyncio.to_thread(client.ping)
+    except Exception as exc:
+        return DockerStatus(available=False, image_available=False, error=str(exc))
+
+    # Manager may be unavailable (Docker not initialised yet); degrade
+    # gracefully — resolved_image / pull_state stay None, fallback discovery
+    # turns into "registry default only" until the manager comes up.
+    try:
+        manager = await _get_manager()
+    except HTTPException:
+        manager = None
+
+    return await asyncio.to_thread(_image_statuses, client, manager)
+
+
+async def _matchable_kernels(user_id: int):
+    """``(kernels, all_kernel_ids, docker_available)`` for matching.
+
+    Degrades without Docker: when no manager exists (daemon down or still
+    warming) the DB-persisted kernels are matched instead, so the picker and
+    the create-from-spec dialog keep working — only live state is lost.
+    """
+    from flowfile_core.kernel import get_kernel_manager_if_initialized
+
+    manager = get_kernel_manager_if_initialized()
+    if manager is not None:
+        kernels = await manager.list_kernels(user_id=user_id)
+        # Suggestion ids must dodge every kernel id, not just the caller's —
+        # create_kernel enforces global uniqueness.
+        existing_ids = {kernel.id for kernel in await manager.list_kernels()}
+        return kernels, existing_ids, True
+
+    from flowfile_core.database.connection import get_db_context
+    from flowfile_core.kernel import persistence
+
+    with get_db_context() as db:
+        rows = persistence.get_all_kernels(db)
+    kernels = [
+        KernelInfo(**config.model_dump(), resolved_packages=resolved)
+        for config, resolved, owner_id in rows
+        if owner_id == user_id
+    ]
+    existing_ids = {config.id for config, _, _ in rows}
+    return kernels, existing_ids, False
+
+
+@router.post("/match", response_model=KernelMatchResponse)
+async def match_kernels_for_spec(request: KernelMatchRequest, current_user=Depends(get_current_active_user)):
+    """Rank the caller's kernels against a node's dependency specs."""
+    from flowfile_core.kernel import matching
+
+    kernels, existing_ids, docker_available = await _matchable_kernels(current_user.id)
+    matches = matching.match_kernels(request.dependencies, kernels)
+    config = matching.suggest_kernel_config(request.dependencies, existing_ids, request.node_name)
+    return KernelMatchResponse(
+        matches=matches,
+        suggestion=KernelSuggestion(config=config),
+        docker_available=docker_available,
+    )
+
+
+@router.post("/match/batch", response_model=KernelMatchBatchResponse)
+async def match_kernels_batch(request: KernelMatchBatchRequest, current_user=Depends(get_current_active_user)):
+    """Best-match digest for many dependency lists at once.
+
+    Powers readiness badges on node lists: one call per palette/catalog view
+    instead of one per node. Same Docker degradation as /match.
+    """
+    from flowfile_core.kernel import matching
+
+    kernels, _existing_ids, docker_available = await _matchable_kernels(current_user.id)
+    results: dict[str, KernelMatchBatchSummary] = {}
+    for key, dependencies in request.items.items():
+        entries = matching.match_kernels(dependencies, kernels)
+        best = entries[0] if entries else None
+        useful = best is not None and best.level != "none"
+        results[key] = KernelMatchBatchSummary(
+            level=best.level if best is not None else "none",
+            best_kernel_id=best.kernel_id if useful else None,
+            best_kernel_name=best.kernel_name if useful else None,
+        )
+    return KernelMatchBatchResponse(results=results, docker_available=docker_available)
+
+
+@router.post("/images/{flavour}/pull", status_code=202)
+async def pull_kernel_image(flavour: ImageFlavour):
+    """Start a background pull for the given flavour's registry-default image.
+
+    Returns immediately (202). The UI polls ``/docker-status`` to track
+    progress via the ``pull_state`` field — ``"pulling"`` while in flight,
+    ``"error:<msg>"`` on failure, cleared once the image is available.
+    """
+    manager = await _get_manager()
+    try:
+        state = manager.start_image_pull(flavour)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"flavour": flavour.value, "pull_state": state}
+
+
+@router.get("/{kernel_id}", response_model=KernelInfo)
+async def get_kernel(kernel_id: str, current_user=Depends(get_current_active_user)):
+    manager = await _get_manager()
+    kernel = await manager.get_kernel(kernel_id)
+    if kernel is None:
+        raise HTTPException(status_code=404, detail=f"Kernel '{kernel_id}' not found")
+    if manager.get_kernel_owner(kernel_id) != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this kernel")
+    return kernel
+
+
+@router.patch("/{kernel_id}", response_model=KernelInfo)
+async def update_kernel(
+    kernel_id: str,
+    update: KernelUpdate,
+    current_user=Depends(get_current_active_user),
+):
+    """Update a kernel's editable fields: ``packages``.
+
+    The kernel must be stopped (rebuild of the derived image happens here).
+    """
+    manager = await _get_manager()
+    kernel = await manager.get_kernel(kernel_id)
+    if kernel is None:
+        raise HTTPException(status_code=404, detail=f"Kernel '{kernel_id}' not found")
+    if manager.get_kernel_owner(kernel_id) != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this kernel")
+    try:
+        return await manager.update_kernel(kernel_id, update.packages)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.delete("/{kernel_id}")
+async def delete_kernel(kernel_id: str, current_user=Depends(get_current_active_user)):
+    manager = await _get_manager()
+    kernel = await manager.get_kernel(kernel_id)
+    if kernel is None:
+        raise HTTPException(status_code=404, detail=f"Kernel '{kernel_id}' not found")
+    if manager.get_kernel_owner(kernel_id) != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this kernel")
+    try:
+        await manager.delete_kernel(kernel_id)
+        return {"status": "deleted", "kernel_id": kernel_id}
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/{kernel_id}/start", response_model=KernelInfo)
+async def start_kernel(kernel_id: str, current_user=Depends(get_current_active_user)):
+    manager = await _get_manager()
+    kernel = await manager.get_kernel(kernel_id)
+    if kernel is None:
+        raise HTTPException(status_code=404, detail=f"Kernel '{kernel_id}' not found")
+    if manager.get_kernel_owner(kernel_id) != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this kernel")
+    try:
+        return await manager.start_kernel(kernel_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/{kernel_id}/stop")
+async def stop_kernel(kernel_id: str, current_user=Depends(get_current_active_user)):
+    manager = await _get_manager()
+    kernel = await manager.get_kernel(kernel_id)
+    if kernel is None:
+        raise HTTPException(status_code=404, detail=f"Kernel '{kernel_id}' not found")
+    if manager.get_kernel_owner(kernel_id) != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this kernel")
+    try:
+        await manager.stop_kernel(kernel_id)
+        return {"status": "stopped", "kernel_id": kernel_id}
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/{kernel_id}/execute", response_model=ExecuteResult)
+async def execute_code(kernel_id: str, request: ExecuteRequest, current_user=Depends(get_current_active_user)):
+    manager = await _get_manager()
+    kernel = await manager.get_kernel(kernel_id)
+    if kernel is None:
+        raise HTTPException(status_code=404, detail=f"Kernel '{kernel_id}' not found")
+    if manager.get_kernel_owner(kernel_id) != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this kernel")
+    try:
+        request.exec_token = ""  # server-minted; a client must not address another cell
+        manager.resolve_node_paths(request)
+        return await manager.execute(kernel_id, request)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/{kernel_id}/execute_cell", response_model=ExecuteResult)
+async def execute_cell(kernel_id: str, request: ExecuteRequest, current_user=Depends(get_current_active_user)):
+    """Execute a single notebook cell interactively.
+
+    Same as /execute but sets interactive=True to enable auto-display of the last expression.
+    """
+    manager = await _get_manager()
+    kernel = await manager.get_kernel(kernel_id)
+    if kernel is None:
+        raise HTTPException(status_code=404, detail=f"Kernel '{kernel_id}' not found")
+    if manager.get_kernel_owner(kernel_id) != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this kernel")
+    try:
+        request.interactive = True
+        request.exec_token = ""  # server-minted; a client must not address another cell
+        manager.resolve_node_paths(request)
+        return await manager.execute(kernel_id, request)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/{kernel_id}/artifacts")
+async def get_artifacts(kernel_id: str, current_user=Depends(get_current_active_user)):
+    manager = await _get_manager()
+    kernel = await manager.get_kernel(kernel_id)
+    if kernel is None:
+        raise HTTPException(status_code=404, detail=f"Kernel '{kernel_id}' not found")
+    if manager.get_kernel_owner(kernel_id) != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this kernel")
+    if kernel.state.value not in ("idle", "executing"):
+        raise HTTPException(status_code=400, detail=f"Kernel '{kernel_id}' is not running")
+
+    try:
+        return await manager.list_kernel_artifacts(kernel_id)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/{kernel_id}/clear")
+async def clear_artifacts(kernel_id: str, current_user=Depends(get_current_active_user)):
+    manager = await _get_manager()
+    kernel = await manager.get_kernel(kernel_id)
+    if kernel is None:
+        raise HTTPException(status_code=404, detail=f"Kernel '{kernel_id}' not found")
+    if manager.get_kernel_owner(kernel_id) != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this kernel")
+    try:
+        await manager.clear_artifacts(kernel_id)
+        return {"status": "cleared", "kernel_id": kernel_id}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/{kernel_id}/clear_node_artifacts", response_model=ClearNodeArtifactsResult)
+async def clear_node_artifacts(
+    kernel_id: str,
+    request: ClearNodeArtifactsRequest,
+    current_user=Depends(get_current_active_user),
+):
+    """Clear only artifacts published by specific node IDs."""
+    manager = await _get_manager()
+    kernel = await manager.get_kernel(kernel_id)
+    if kernel is None:
+        raise HTTPException(status_code=404, detail=f"Kernel '{kernel_id}' not found")
+    if manager.get_kernel_owner(kernel_id) != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this kernel")
+    try:
+        return await manager.clear_node_artifacts(kernel_id, request.node_ids, flow_id=request.flow_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/{kernel_id}/clear_namespace")
+async def clear_namespace(
+    kernel_id: str,
+    flow_id: int,
+    current_user=Depends(get_current_active_user),
+):
+    """Clear the execution namespace for a flow (variables, imports, etc.)."""
+    manager = await _get_manager()
+    kernel = await manager.get_kernel(kernel_id)
+    if kernel is None:
+        raise HTTPException(status_code=404, detail=f"Kernel '{kernel_id}' not found")
+    if manager.get_kernel_owner(kernel_id) != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this kernel")
+    try:
+        await manager.clear_namespace(kernel_id, flow_id)
+        return {"status": "cleared", "kernel_id": kernel_id, "flow_id": flow_id}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/{kernel_id}/artifacts/node/{node_id}")
+async def get_node_artifacts(
+    kernel_id: str,
+    node_id: int,
+    current_user=Depends(get_current_active_user),
+):
+    """Get artifacts published by a specific node."""
+    manager = await _get_manager()
+    kernel = await manager.get_kernel(kernel_id)
+    if kernel is None:
+        raise HTTPException(status_code=404, detail=f"Kernel '{kernel_id}' not found")
+    if manager.get_kernel_owner(kernel_id) != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this kernel")
+    if kernel.state.value not in ("idle", "executing"):
+        raise HTTPException(status_code=400, detail=f"Kernel '{kernel_id}' is not running")
+    try:
+        return await manager.get_node_artifacts(kernel_id, node_id)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+# Code intelligence (Jedi) bridge. Editor-facing: owner-checked, but every not-ready
+# condition (flag off, no Docker, kernel missing/not-owned/idle-less, old image) degrades
+# to an empty 200 so the notebook editor silently falls back to its client-side sources.
+async def _lsp_forward(kernel_id: str, op: str, request: BaseModel, current_user) -> dict:
+    if not is_lsp_enabled():
+        return {}
+    try:
+        manager = await _get_manager()
+    except HTTPException:
+        return {}  # Docker unavailable -> no kernels -> degrade
+    kernel = await manager.get_kernel(kernel_id)
+    if kernel is None or manager.get_kernel_owner(kernel_id) != current_user.id:
+        return {}
+    return await manager.lsp_request(kernel_id, op, request.model_dump())
+
+
+@router.post("/{kernel_id}/lsp/complete", response_model=CompleteResponse)
+async def lsp_complete(kernel_id: str, request: LspRequest, current_user=Depends(get_current_active_user)):
+    return CompleteResponse(**(await _lsp_forward(kernel_id, "complete", request, current_user) or {}))
+
+
+@router.post("/{kernel_id}/lsp/hover", response_model=HoverResponse)
+async def lsp_hover(kernel_id: str, request: LspRequest, current_user=Depends(get_current_active_user)):
+    return HoverResponse(**(await _lsp_forward(kernel_id, "hover", request, current_user) or {}))
+
+
+@router.post("/{kernel_id}/lsp/signature", response_model=SignatureResponse)
+async def lsp_signature(kernel_id: str, request: LspRequest, current_user=Depends(get_current_active_user)):
+    return SignatureResponse(**(await _lsp_forward(kernel_id, "signature", request, current_user) or {}))
+
+
+@router.post("/{kernel_id}/lsp/diagnostics", response_model=DiagnosticsResponse)
+async def lsp_diagnostics(kernel_id: str, request: LspRequest, current_user=Depends(get_current_active_user)):
+    return DiagnosticsResponse(**(await _lsp_forward(kernel_id, "diagnostics", request, current_user) or {}))
+
+
+@router.post("/{kernel_id}/lsp/dataframe_schemas", response_model=DataframeSchemasResponse)
+async def lsp_dataframe_schemas(
+    kernel_id: str,
+    request: DataframeSchemasRequest,
+    current_user=Depends(get_current_active_user),
+):
+    return DataframeSchemasResponse(**(await _lsp_forward(kernel_id, "dataframe_schemas", request, current_user) or {}))
+
+
+@router.get("/{kernel_id}/display_outputs")
+async def get_display_outputs(
+    kernel_id: str,
+    flow_id: int,
+    node_id: int,
+    current_user=Depends(get_current_active_user),
+):
+    """Retrieve display outputs from the last execution of a node."""
+    manager = await _get_manager()
+    kernel = await manager.get_kernel(kernel_id)
+    if kernel is None:
+        raise HTTPException(status_code=404, detail=f"Kernel '{kernel_id}' not found")
+    if manager.get_kernel_owner(kernel_id) != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this kernel")
+    if kernel.state.value not in ("idle", "executing"):
+        return []
+    try:
+        return await manager.get_display_outputs(kernel_id, flow_id, node_id)
+    except Exception:
+        return []
+
+
+@router.get("/{kernel_id}/artifact_preview")
+async def get_artifact_preview(
+    kernel_id: str,
+    flow_id: int,
+    name: str,
+    current_user=Depends(get_current_active_user),
+):
+    """Proxy a session-only artifact preview blob from the kernel; core retains nothing."""
+    manager = await _get_manager()
+    kernel = await manager.get_kernel(kernel_id)
+    if kernel is None:
+        raise HTTPException(status_code=404, detail=f"Kernel '{kernel_id}' not found")
+    if manager.get_kernel_owner(kernel_id) != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this kernel")
+    if kernel.state.value not in ("idle", "executing"):
+        return None
+    try:
+        return await manager.get_artifact_preview(kernel_id, flow_id, name)
+    except Exception:
+        return None
+
+
+# Artifact Persistence & Recovery endpoints
+
+
+@router.post("/{kernel_id}/recover", response_model=RecoveryStatus)
+async def recover_artifacts(kernel_id: str, current_user=Depends(get_current_active_user)):
+    """Trigger manual artifact recovery from persisted storage."""
+    manager = await _get_manager()
+    kernel = await manager.get_kernel(kernel_id)
+    if kernel is None:
+        raise HTTPException(status_code=404, detail=f"Kernel '{kernel_id}' not found")
+    if manager.get_kernel_owner(kernel_id) != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this kernel")
+    try:
+        return await manager.recover_artifacts(kernel_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/{kernel_id}/recovery-status", response_model=RecoveryStatus)
+async def get_recovery_status(kernel_id: str, current_user=Depends(get_current_active_user)):
+    """Get the current artifact recovery status."""
+    manager = await _get_manager()
+    kernel = await manager.get_kernel(kernel_id)
+    if kernel is None:
+        raise HTTPException(status_code=404, detail=f"Kernel '{kernel_id}' not found")
+    if manager.get_kernel_owner(kernel_id) != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this kernel")
+    try:
+        return await manager.get_recovery_status(kernel_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/{kernel_id}/cleanup", response_model=CleanupResult)
+async def cleanup_artifacts(
+    kernel_id: str,
+    request: CleanupRequest,
+    current_user=Depends(get_current_active_user),
+):
+    """Clean up old persisted artifacts."""
+    manager = await _get_manager()
+    kernel = await manager.get_kernel(kernel_id)
+    if kernel is None:
+        raise HTTPException(status_code=404, detail=f"Kernel '{kernel_id}' not found")
+    if manager.get_kernel_owner(kernel_id) != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this kernel")
+    try:
+        return await manager.cleanup_artifacts(kernel_id, request)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/{kernel_id}/persistence", response_model=ArtifactPersistenceInfo)
+async def get_persistence_info(kernel_id: str, current_user=Depends(get_current_active_user)):
+    """Get persistence configuration and stats for a kernel."""
+    manager = await _get_manager()
+    kernel = await manager.get_kernel(kernel_id)
+    if kernel is None:
+        raise HTTPException(status_code=404, detail=f"Kernel '{kernel_id}' not found")
+    if manager.get_kernel_owner(kernel_id) != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this kernel")
+    try:
+        return await manager.get_persistence_info(kernel_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/{kernel_id}/memory", response_model=KernelMemoryInfo)
+async def get_memory_stats(kernel_id: str, current_user=Depends(get_current_active_user)):
+    """Get current memory usage for a running kernel container."""
+    manager = await _get_manager()
+    kernel = await manager.get_kernel(kernel_id)
+    if kernel is None:
+        raise HTTPException(status_code=404, detail=f"Kernel '{kernel_id}' not found")
+    if manager.get_kernel_owner(kernel_id) != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to access this kernel")
+    try:
+        return await manager.get_memory_stats(kernel_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.debug("Memory stats unavailable for kernel '%s': %s", kernel_id, exc)
+        raise HTTPException(status_code=502, detail=f"Memory stats unavailable: {exc}") from exc

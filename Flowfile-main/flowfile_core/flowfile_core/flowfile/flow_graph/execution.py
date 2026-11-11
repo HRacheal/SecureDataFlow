@@ -1,0 +1,1657 @@
+"""Running a `FlowGraph`: run claiming, freshness probes, gate routing, staged execution and fetch-one."""
+
+import contextvars
+import datetime
+import threading
+import uuid
+from collections.abc import Collection, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import ExitStack
+from contextvars import ContextVar
+from dataclasses import dataclass, replace
+from time import time
+from typing import Any, Literal
+
+import polars as pl
+from polars.exceptions import PanicException
+from polars_expr_transformer import simple_function_to_expr as to_expr
+
+from flowfile_core.configs import logger, settings
+from flowfile_core.configs.flow_logger import FlowLogger, NodeLogger
+from flowfile_core.database.connection import get_db_context
+from flowfile_core.events import publish
+from flowfile_core.flowfile.catalog_cdc import (
+    read_cursor,
+    resolve_consumer_key,
+)
+from flowfile_core.flowfile.execution import registry
+from flowfile_core.flowfile.execution.context import ExecutionContext, current_context, use_context
+from flowfile_core.flowfile.execution.errors import ComputeError, VersionMismatch
+from flowfile_core.flowfile.execution.exchange import ExchangeRun
+from flowfile_core.flowfile.execution.placement import (
+    Fallback,
+    MixedPlacementPolicy,
+    Placement,
+    Refusal,
+    SingleBackendPolicy,
+    place,
+    remedy_for,
+)
+from flowfile_core.flowfile.execution.protocol import CredentialRef, ResultRef
+from flowfile_core.flowfile.flow_data_engine.bounded import DEFERRED_HINTS, head_rows
+from flowfile_core.flowfile.flow_data_engine.flow_data_engine import (
+    FlowDataEngine,
+)
+from flowfile_core.flowfile.flow_data_engine.subprocess_operations import handshake
+from flowfile_core.flowfile.flow_graph._base import GraphMixinBase
+from flowfile_core.flowfile.flow_graph._root import root
+from flowfile_core.flowfile.flow_graph.cloud import _cloud_change_read_target, _is_cloud_change_read
+from flowfile_core.flowfile.flow_graph.freshness import (
+    _catalog_reader_source_fingerprint,
+    _cdc_since_param_state,
+    _delta_reader_fingerprint,
+    _probe_version_entry,
+)
+from flowfile_core.flowfile.flow_node.flow_node import (
+    FlowNode,
+)
+from flowfile_core.flowfile.flow_node.multi_output import DEFAULT_OUTPUT_HANDLE
+from flowfile_core.flowfile.param_types import ParamValue, typed_parameter_values
+from flowfile_core.flowfile.parameter_resolver import (
+    node_parameters_resolved,
+    resolve_expression_parameters,
+)
+from flowfile_core.flowfile.util.execution_orderer import ExecutionPlan, ExecutionStage, compute_execution_plan
+from flowfile_core.flowfile.util.skip_rules import (
+    GATE_NODE_TYPE,
+    NodeRunStatus,
+    classify_from_inputs,
+    dead_gate_handles,
+    effective_input_status,
+    gate_has_else_output,
+    parameter_gate_is_open,
+    uses_any_rule,
+)
+from flowfile_core.kernel.execution import (
+    KernelHold,
+)
+from flowfile_core.schemas import input_schema, schemas
+from flowfile_core.schemas.output_model import NodeResult, RunInformation
+from shared.compute_protocol import Capabilities
+
+ambient_kernel_hold: ContextVar[KernelHold | None] = ContextVar("ambient_kernel_hold", default=None)
+"""The ``kernel_hold`` of the run whose thread this is: ``run_graph`` sets it for its own thread and every node it
+executes, so a graph opened in-process during the run (a virtual table's producer) refuses the held kernels too.
+Schema prefetches copy their starting context, so they carry it as well.
+"""
+
+# Subclasses only: the base's name is also Polars' own ComputeError, a node's data error.
+_COMPUTE_ERRORS = frozenset(error.__name__ for error in ComputeError.__subclasses__())
+
+
+def _compute_error(node: FlowNode) -> str | None:
+    """The class name of the typed compute error that failed ``node`` this run, else ``None``.
+
+    Read from the class the executor records on the node for telemetry (``_last_exception_class``), so a run report
+    row says when a node failed on its compute (unreachable, another version) rather than on its own settings or data.
+    """
+    error_class = getattr(node, "_last_exception_class", None)
+    return error_class if error_class in _COMPUTE_ERRORS else None
+
+
+def _gate_formula_matches(source: FlowDataEngine, formula: str, graph: GraphMixinBase | None = None) -> bool:
+    """True when at least one row of *source* satisfies the gate's formula.
+
+    The formula is the Filter node's flowfile expression language applied as
+    a row predicate; matching is existence — ``filter(pred).head(1)``. With
+    ``FLOWFILE_COMPUTE_PROTOCOL`` on, that row is read through
+    ``bounded.head_rows`` on the backend of ``current_context(graph)``, so a
+    formula error comes back as its ``ComputeError``; off, it is collected in
+    core. An empty formula, a formula that does not parse, or one referencing
+    unknown columns raises, failing the gate visibly instead of silently
+    picking a branch. An empty input (zero rows) is simply "no match": the
+    gate closes.
+    """
+    if not formula.strip():
+        raise ValueError("Gate is set to route on a formula, but no formula is configured")
+    predicate = to_expr(formula)
+    data_frame = source.data_frame
+    lazy_frame = data_frame.lazy() if isinstance(data_frame, pl.DataFrame) else data_frame
+    if settings.FLOWFILE_COMPUTE_PROTOCOL:
+        return head_rows(current_context(graph).backend, lazy_frame.filter(predicate), 1).num_rows > 0
+    return lazy_frame.filter(predicate).head(1).collect().height > 0
+
+
+def skip_node_message(flow_logger: FlowLogger, nodes: list[FlowNode]) -> None:
+    """Logs a warning message listing all nodes that will be skipped during execution.
+
+    Args:
+        flow_logger: The logger instance for the flow.
+        nodes: A list of FlowNode objects to be skipped.
+    """
+    if len(nodes) > 0:
+        msg = "\n".join(str(node) for node in nodes)
+        flow_logger.warning(f"skipping nodes:\n{msg}")
+
+
+def execution_order_message(flow_logger: FlowLogger, stages: list[ExecutionStage]) -> None:
+    """Logs an informational message showing the determined execution order with parallel stages.
+
+    Args:
+        flow_logger: The logger instance for the flow.
+        stages: A list of ExecutionStage objects in execution order.
+    """
+    lines: list[str] = []
+    for i, stage in enumerate(stages):
+        node_strs = ", ".join(str(node) for node in stage)
+        parallel_tag = " (parallel)" if len(stage) > 1 else ""
+        lines.append(f"  Stage {i}{parallel_tag}: [{node_strs}]")
+    flow_logger.info("execution order:\n" + "\n".join(lines))
+
+
+@dataclass
+class BoundaryEdge:
+    """An input of ``target`` that crosses from another backend through the exchange store during one run.
+
+    ``source``'s output on ``handle``, held on ``source_backend_id``, is exported to ``uri`` and imported on
+    ``target_backend_id``, both with ``credential``, the first time ``target`` reads that input (``cross``); the import
+    is held as ``ref`` until ``release``. ``node_logger`` is the importing node's. ``cost`` is what core knows of the
+    output's size before the run.
+    """
+
+    source: FlowNode
+    handle: str
+    target: FlowNode
+    source_backend_id: str
+    target_backend_id: str
+    uri: str
+    credential: CredentialRef
+    node_logger: NodeLogger
+    ref: ResultRef | None = None
+
+    def cost(self) -> tuple[int, int] | None:
+        """The rows and columns the output holds when core knows them before ``target`` reads it, else ``None``.
+
+        Taken from the reference ``source`` holds on ``source_backend_id`` (default output only), else from an engine
+        core already holds: the last run's while ``source`` has run with its current setup, or a manual input's own
+        frame. Nothing is counted, sampled or collected to price an edge.
+        """
+        if self.handle == DEFAULT_OUTPUT_HANDLE:
+            ref = self.source.held_result(self.source_backend_id)
+            if ref is not None and ref.row_count is not None:
+                return ref.row_count, len(ref.schema)
+        engines = []
+        if self.source.node_stats.has_run_with_current_setup:
+            engines.append(self.source.peek_output_engine(self.handle))
+        if self.handle == DEFAULT_OUTPUT_HANDLE and isinstance(self.source.function, FlowDataEngine):
+            engines.append(self.source.function)
+        for engine in engines:
+            if engine is not None and (rows := engine.known_record_count()) is not None:
+                return rows, len(engine.schema)
+        return None
+
+    def cross(self) -> FlowDataEngine:
+        """The engine ``target`` composes on for this input: the plan of its import on ``target_backend_id``.
+
+        The first call exports the output and imports it. The default output is exported as the reference ``source``
+        holds. Another output (a filter's second side) is submitted on ``source_backend_id`` as a deferred plan under
+        ``<source hash>_<handle>_<target id>``, exported, and released.
+
+        Raises:
+            ValueError: ``source`` holds no result on ``source_backend_id`` for its default output.
+            ComputeError: The export or the import failed.
+        """
+        output = FlowNode._resolve_input_result_for_handle(self.source, self.handle)
+        target = registry.backend(self.target_backend_id)
+        if self.ref is None:
+            exported_rows = self._export(output)
+            row_count = exported_rows if exported_rows is not None else output.known_record_count()
+            self.ref = target.import_uri(self.uri, output.schema, row_count, self.credential)
+            self.node_logger.info(
+                f'Input from node {self.source.node_id} crossed from backend "{self.source_backend_id}" to '
+                f'"{self.target_backend_id}" through {self.uri}'
+            )
+        return FlowDataEngine(target.plan_for(self.ref), schema=output.schema, number_of_records=self.ref.row_count)
+
+    def _export(self, output: FlowDataEngine) -> int | None:
+        """Export ``source``'s output on ``handle`` to ``uri``; the exported reference's row count."""
+        source = registry.backend(self.source_backend_id)
+        if self.handle == DEFAULT_OUTPUT_HANDLE:
+            ref = self.source.results.result_ref
+            if ref is None or ref.backend_id != self.source_backend_id:
+                raise ValueError(
+                    f'Node {self.source.node_id} holds no result on backend "{self.source_backend_id}" for node '
+                    f"{self.target.node_id} to read"
+                )
+            source.export(ref, self.uri, self.credential)
+            return ref.row_count
+        plan, result_id = output.data_frame.lazy(), f"{self.source.hash}_{self.handle}_{self.target.node_id}"
+        ref = source.submit(
+            plan, [], DEFERRED_HINTS, result_id, flow_id=self.node_logger.flow_id, node_id=self.source.node_id
+        ).ref
+        try:
+            source.export(ref, self.uri, self.credential)
+        finally:
+            source.release(ref)
+        return ref.row_count
+
+    def release(self) -> None:
+        """Release the import on ``target_backend_id`` and forget it; nothing when the input never crossed."""
+        ref, self.ref = self.ref, None
+        if ref is not None:
+            registry.backend(self.target_backend_id).release(ref)
+
+
+def _release_boundary_inputs(node: FlowNode, edges: Sequence[BoundaryEdge]) -> None:
+    """Forget ``node``'s boundary inputs and release each import; a failed release is a warning on the node's log."""
+    node._boundary_inputs = {}
+    for edge in edges:
+        try:
+            edge.release()
+        except Exception as e:
+            edge.node_logger.warning(
+                f"Could not release the import of node {edge.source.node_id}'s result: {type(e).__name__}: {e}"
+            )
+
+
+class ExecutionMixin(GraphMixinBase):
+    # The running run's prefix in the exchange store; None between runs.
+    exchange_run: ExchangeRun | None = None
+
+    @property
+    def last_closed_gate_handles(self) -> Mapping[str | int, frozenset[str]]:
+        """Gate id -> the output handles the last ``run_graph`` routed dead (parameter and formula gates)."""
+        return self._last_closed_gate_handles
+
+    @property
+    def execution_context(self) -> ExecutionContext:
+        """Where this flow's runs execute, derived from its current location, mode and parallelism settings.
+
+        Computed on each access, so it always matches ``flow_settings``, however a field was set.
+        """
+        return ExecutionContext.for_flow(self.flow_settings)
+
+    def check_flow_laziness(self) -> tuple[bool, list[str]]:
+        """Check whether the flow supports lazy execution for virtual tables.
+
+        Finds all catalog-writer nodes in the graph and checks whether their
+        upstream dependencies are fully lazy.  Only the nodes that actually
+        feed into a catalog writer matter — unrelated branches (e.g. an
+        Explore Data node on a separate path) are ignored.
+
+        Returns a tuple of (is_optimizable, reasons_if_not).
+        """
+        catalog_writers = [n for n in self.nodes if n.node_type == "catalog_writer"]
+        if not catalog_writers:
+            # No catalog writer → nothing to optimise; treat as non-lazy
+            return False, ["No catalog writer node found in the flow"]
+        all_reasons: list[str] = []
+        for writer in catalog_writers:
+            _, reasons = writer.check_upstream_laziness()
+            all_reasons.extend(reasons)
+        seen: set[str] = set()
+        unique: list[str] = []
+        for r in all_reasons:
+            if r not in seen:
+                seen.add(r)
+                unique.append(r)
+        return len(unique) == 0, unique
+
+    @property
+    def execution_mode(self) -> schemas.ExecutionModeLiteral:
+        """Gets the current execution mode ('Development' or 'Performance')."""
+        return self.flow_settings.execution_mode
+
+    def get_implicit_starter_nodes(self) -> list[FlowNode]:
+        """Finds nodes that can act as starting points but are not explicitly defined as such.
+
+        Some nodes, like the Polars Code node, can function without an input. This
+        method identifies such nodes if they have no incoming connections.
+
+        Returns:
+            A list of `FlowNode` objects that are implicit starting nodes.
+        """
+        starting_node_ids = [node.node_id for node in self._flow_starts]
+        implicit_starting_nodes = []
+        for node in self.nodes:
+            if node.node_template.can_be_start and not node.has_input and node.node_id not in starting_node_ids:
+                implicit_starting_nodes.append(node)
+        return implicit_starting_nodes
+
+    @execution_mode.setter
+    def execution_mode(self, mode: schemas.ExecutionModeLiteral):
+        """Sets the execution mode for the flow.
+
+        Args:
+            mode: The execution mode to set.
+        """
+        self.flow_settings.execution_mode = mode
+
+    @property
+    def execution_location(self) -> schemas.ExecutionLocationsLiteral:
+        """Gets the current execution location."""
+        return self.flow_settings.execution_location
+
+    @execution_location.setter
+    def execution_location(self, execution_location: schemas.ExecutionLocationsLiteral):
+        """Sets the execution location for the flow.
+
+        Args:
+            execution_location: The execution location to set.
+        """
+        if self.flow_settings.execution_location != execution_location:
+            self.reset()
+        self.flow_settings.execution_location = execution_location
+
+    def validate_if_node_can_be_fetched(self, node_id: int) -> None:
+        flow_node = self._node_db.get(node_id)
+        if not flow_node:
+            raise Exception("Node not found found")
+        execution_plan = compute_execution_plan(
+            nodes=self.nodes, flow_starts=self._flow_starts + self.get_implicit_starter_nodes()
+        )
+        if flow_node.node_id in [skip_node.node_id for skip_node in execution_plan.skip_nodes]:
+            raise Exception("Node can not be executed because it does not have it's inputs")
+
+    def create_initial_run_information(self, number_of_nodes: int, run_type: Literal["fetch_one", "full_run"]):
+        return RunInformation(
+            flow_id=self.flow_id,
+            start_time=datetime.datetime.now(),
+            end_time=None,
+            success=None,
+            is_running=True,
+            execution_mode=self.flow_settings.execution_mode,
+            number_of_nodes=number_of_nodes,
+            node_step_result=[],
+            run_type=run_type,
+        )
+
+    def create_empty_run_information(self) -> RunInformation:
+        return RunInformation(
+            flow_id=self.flow_id,
+            start_time=None,
+            end_time=None,
+            success=None,
+            is_running=False,
+            execution_mode=self.flow_settings.execution_mode,
+            number_of_nodes=0,
+            node_step_result=[],
+            run_type="init",
+        )
+
+    def try_claim_run(self, *, kernel_hold: KernelHold | None = None, commit_sources: bool = True) -> bool:
+        """Atomically claim the flow's single-run slot; False when a run is already in flight.
+
+        Waits for an in-flight edit first, so a run never starts on a half-applied mutation
+        (lock order: edit lock, then claim lock). Everything a caller may read off a running flow is
+        set under the same lock, before the claim is visible: the cancel flag is cleared, so a
+        ``cancel`` that lands once ``is_running`` is seen is never wiped by the run's own start, and
+        the run's ``kernel_hold`` and ``commit_sources`` are in place, so a notebook interrupt that
+        sees the run also sees the kernel it holds. The flow's log file is truncated under the same lock,
+        before ``is_running`` is set: a log stream opened on ``is_running`` or on ``run_started`` reads
+        this run's file from its first line, never the previous run's. Truncating after the flag was
+        visible left a window where a stream opened on the stale file and the truncation moved the end of
+        the file below its read offset, so the new run's first lines were skipped.
+        """
+        with self.edit_lock(bounded=False), self._run_claim_lock:
+            if self.flow_settings.is_running:
+                return False
+            self.flow_logger.clear_log_file()
+            self._kernel_hold = kernel_hold
+            self._commit_sources = commit_sources
+            self.flow_settings.is_canceled = False
+            self.flow_settings.is_running = True
+        self._bump_revision("run_started")
+        return True
+
+    def release_run(self) -> None:
+        """Release the single-run slot claimed by try_claim_run (idempotent).
+
+        A flow closed while the run was in flight (``close_flow``) is closed now, so what the run minted is released.
+        """
+        with self._run_claim_lock:
+            was_running = self.flow_settings.is_running
+            close = self._close_when_released
+            self._close_when_released = False
+            self._kernel_hold = None
+            self._commit_sources = True
+            self.flow_settings.is_running = False
+        if was_running:
+            self._bump_revision("run_ended")
+        if close:
+            self.close_flow()
+
+    def trigger_fetch_node(
+        self,
+        node_id: int,
+        *,
+        performance_mode: bool = False,
+        reset_cache: bool = True,
+        claimed: bool = False,
+    ) -> RunInformation | None:
+        """Executes a specific node in the graph by its ID.
+
+        The defaults are the data-preview contract: the node fills its 100-row example grid, stored with an inline
+        sample in a Development flow, sampled from the deferred plan in a Performance one. Callers that only need
+        the query plan (the Explore Data drawer) pass ``performance_mode=True``, which installs no grid and stores
+        nothing, and ``reset_cache=False`` so exploring doesn't evict a useful cache.
+        ``claimed`` says the caller already holds the run slot (``try_claim_run``),
+        as the fetch route does before it answers; the slot is released here either way.
+
+        The node and its inputs are placed as a run's nodes are (``_place_run``), under an ``exchange_run`` of the
+        fetch's own. A refusal runs nothing, each refused node a failed row. A placement that raises fails the node's
+        row and is raised again. Otherwise the node runs on its assigned backend: an input that ran with its current
+        setup on another backend crosses through the exchange store, and one that has not run is composed into the
+        node's plan. The fetch's nodes are the node and its inputs, so its hints count no consumer.
+        """
+        if not claimed and not self.try_claim_run():
+            raise Exception("Flow is already running")
+        exchange_run = self.exchange_run = ExchangeRun(self.flow_id, uuid.uuid4().hex)
+        try:
+            flow_node = self.get_node(node_id)
+            self.latest_run_info = self.create_initial_run_information(1, "fetch_one")
+            node_logger = self.flow_logger.get_node_logger(flow_node.node_id)
+            node_result = NodeResult(
+                node_id=flow_node.node_id,
+                node_name=flow_node.name,
+                description=flow_node.get_node_information().description,
+            )
+            inputs = dict.fromkeys(source for source, _ in flow_node._slot_input_pairs() if source is not None)
+            stage = ExecutionStage(nodes=[*inputs, flow_node])
+            try:
+                placement, edges = self._place_run(ExecutionPlan(skip_nodes=[], stages=[stage]), exchange_run)
+            except Exception as e:
+                node_logger.error(f"Error in node {flow_node.node_id}: {e}")
+                node_result.finish(success=False, error=str(e))
+                node_result.compute_error = type(e).__name__ if isinstance(e, ComputeError) else None
+                self.latest_run_info.node_step_result.append(node_result)
+                raise
+        except BaseException:
+            # The node left between the route's check and this task, or placing it failed: release the slot.
+            self.release_run()
+            self._end_exchange_run(exchange_run)
+            raise
+        try:
+            if placement is not None:
+                self.latest_run_info.boundaries = [
+                    pair for pair in placement.boundaries if pair[1] == flow_node.node_id
+                ]
+                if placement.refusals:
+                    self._record_refusals(placement.refusals)
+                    self.latest_run_info.end_time = datetime.datetime.now()
+                    return self.get_run_info()
+                moved = [fallback for fallback in placement.fallbacks if fallback.node_id == flow_node.node_id]
+                self._record_fallbacks(moved)
+                node_result.backend_id = placement.assignment.get(flow_node.node_id)
+                if moved:
+                    node_result.fallback_from, node_result.fallback_reason = moved[0].backend_id, moved[0].reason
+            logger.info(f"Starting to run: node {flow_node.node_id}, start time: {node_result.start_timestamp}")
+            self.latest_run_info.node_step_result.append(node_result)
+            context = current_context(self)
+            backend_id = None if placement is None else placement.assignment.get(flow_node.node_id)
+            if backend_id is not None and backend_id != context.backend_id:
+                context = replace(context, backend_id=backend_id)
+            unreachable = None if placement is None else placement.unreachable.get(backend_id)
+            edges_into = [
+                edge
+                for edge in edges
+                if edge.target.node_id == flow_node.node_id and edge.source.node_stats.has_run_with_current_setup
+            ]
+            flow_node._boundary_inputs = {(edge.source.node_id, edge.handle): edge for edge in edges_into}
+            try:
+                with use_context(context), node_parameters_resolved(flow_node):
+                    flow_node.execute_node(
+                        # Not one input: a Performance-setting flow keeps a deferred plan yet still samples its grid.
+                        performance_mode=performance_mode or self.flow_settings.execution_mode == "Performance",
+                        node_logger=node_logger,
+                        reset_cache=reset_cache,
+                        unreachable=unreachable,
+                        running=frozenset(node.node_id for node in stage.nodes),
+                        preview=not performance_mode,
+                    )
+            finally:
+                _release_boundary_inputs(flow_node, edges_into)
+            errors = flow_node.results.errors
+            node_result.finish(success=errors is None, error="" if errors is None else str(errors))
+            if errors is not None:
+                node_result.compute_error = _compute_error(flow_node)
+            if self.flow_settings.is_canceled:
+                node_result.success = None
+            if node_result.success:
+                self.latest_run_info.nodes_completed += 1
+            self.latest_run_info.end_time = datetime.datetime.now()
+            return self.get_run_info()
+        except Exception as e:
+            node_logger.error(f"Error in node {flow_node.node_id}: {e}")
+            node_result.finish(success=False, error=str(e))
+        finally:
+            self.release_run()
+            self._end_exchange_run(exchange_run)
+
+    @staticmethod
+    def _resolve_input_names(node: FlowNode | None, table_count: int) -> list[str] | None:
+        """Derive named input keys from connected source nodes.
+
+        Uses the source node's ``node_reference`` when set, otherwise
+        falls back to ``df_{node_id}``.  Returns ``None`` when no node
+        is available, there are no input tables, or the number of
+        connected sources doesn't match ``table_count`` (original
+        unnamed behaviour).
+        """
+        if node is None or table_count == 0:
+            return None
+        input_names: list[str] = []
+        for source_node in node.all_inputs:
+            ref = getattr(source_node.setting_input, "node_reference", None)
+            name = ref if ref else f"df_{source_node.node_id}"
+            input_names.append(name)
+        if len(input_names) != table_count:
+            return None
+        return input_names
+
+    def _get_upstream_node_ids(self, node_id: int) -> list[int]:
+        """Get all upstream node IDs (direct and transitive) for *node_id*.
+
+        Traverses the ``all_inputs`` links recursively and returns a
+        deduplicated list in breadth-first order.
+        """
+        node = self.get_node(node_id)
+        if node is None:
+            return []
+
+        visited: set[int] = set()
+        result: list[int] = []
+        queue = list(node.all_inputs)
+        while queue:
+            current = queue.pop(0)
+            cid = current.node_id
+            if cid in visited:
+                continue
+            visited.add(cid)
+            result.append(cid)
+            queue.extend(current.all_inputs)
+        return result
+
+    def _get_required_kernel_ids(self) -> set[str]:
+        """Return the set of kernel IDs used by ``python_script`` nodes."""
+        kernel_ids: set[str] = set()
+        for node in self.nodes:
+            if node.node_type == "python_script" and node.setting_input is not None:
+                kid = getattr(
+                    getattr(node.setting_input, "python_script_input", None),
+                    "kernel_id",
+                    None,
+                )
+                if kid:
+                    kernel_ids.add(kid)
+        return kernel_ids
+
+    def _compute_rerun_python_script_node_ids(
+        self,
+        plan_skip_ids: set[str | int],
+    ) -> set[int]:
+        """Return node IDs for ``python_script`` nodes that will re-execute.
+
+        A python_script node will re-execute (and thus needs its old
+        artifacts cleared) when:
+
+        * It is NOT in the execution-plan skip set, **and**
+        * Its execution state indicates it has NOT already run with the
+          current setup (i.e. its cache is stale or it never ran).
+        """
+        rerun: set[int] = set()
+        for node in self.nodes:
+            if node.node_type != "python_script":
+                continue
+            if node.node_id in plan_skip_ids:
+                continue
+            if not node._execution_state.has_run_with_current_setup:
+                rerun.add(node.node_id)
+        return rerun
+
+    def _group_rerun_nodes_by_kernel(
+        self,
+        rerun_node_ids: set[int],
+    ) -> dict[str, set[int]]:
+        """Group *rerun_node_ids* by their kernel ID.
+
+        Returns a mapping ``kernel_id → {node_id, …}``.
+        """
+        kernel_nodes: dict[str, set[int]] = {}
+        for node in self.nodes:
+            if node.node_id not in rerun_node_ids:
+                continue
+            if node.node_type == "python_script" and node.setting_input is not None:
+                kid = getattr(
+                    getattr(node.setting_input, "python_script_input", None),
+                    "kernel_id",
+                    None,
+                )
+                if kid:
+                    kernel_nodes.setdefault(kid, set()).add(node.node_id)
+        return kernel_nodes
+
+    def _execute_single_node(
+        self,
+        node: FlowNode,
+        performance_mode: bool,
+        run_info_lock: threading.Lock,
+        backend_id: str | None,
+        edges: Sequence[BoundaryEdge],
+        unreachable: ComputeError | None = None,
+        fallback: Fallback | None = None,
+        running: frozenset[int | str] | None = None,
+    ) -> tuple[NodeResult, FlowNode]:
+        """Executes a single node, records its result, and returns both.
+
+        Thread-safe: uses run_info_lock when mutating shared run information.
+
+        Args:
+            node: The node to execute.
+            performance_mode: Whether to run in performance mode.
+            run_info_lock: Lock protecting shared RunInformation state.
+            backend_id: The backend placement assigned the node; ``None`` when nothing was placed.
+            edges: The run's boundary edges into the node; every import is released once it ran.
+            unreachable: The error the handshake of the node's backend raised; the node fails with it, nothing sent.
+            fallback: Why placement moved the node to the default backend, for its result row.
+            running: The ids of the nodes the run executes, among which the node's hints count its consumers.
+
+        Returns:
+            A (NodeResult, FlowNode) tuple for post-stage failure propagation.
+        """
+        node_logger = self.flow_logger.get_node_logger(node.node_id)
+        node_result = NodeResult(
+            node_id=node.node_id,
+            node_name=node.name,
+            description=node.get_node_information().description,
+            backend_id=backend_id,
+            fallback_from=None if fallback is None else fallback.backend_id,
+            fallback_reason=None if fallback is None else fallback.reason,
+        )
+
+        with run_info_lock:
+            self.latest_run_info.node_step_result.append(node_result)
+
+        with ExitStack() as params_scope:
+            params_scope.callback(ambient_kernel_hold.reset, ambient_kernel_hold.set(self._kernel_hold))
+            run_context = current_context(self)
+            if backend_id is not None and backend_id != run_context.backend_id:
+                params_scope.enter_context(use_context(replace(run_context, backend_id=backend_id)))
+            node._boundary_inputs = {(edge.source.node_id, edge.handle): edge for edge in edges}
+            params_scope.callback(_release_boundary_inputs, node, edges)
+            try:
+                params_scope.enter_context(node_parameters_resolved(node))
+            except ValueError as e:
+                # Never executed this run: a stale class must not describe this failure.
+                node._last_exception_class = None
+                node_logger.error(f"Parameter resolution failed for node {node.node_id}: {e}")
+                node_result.finish(success=False, error=str(e))
+                return node_result, node
+
+            logger.info(f"Starting to run: node {node.node_id}, start time: {node_result.start_timestamp}")
+            node.execute_node(
+                performance_mode=performance_mode, node_logger=node_logger, unreachable=unreachable, running=running
+            )
+        try:
+            errors = node.results.errors
+            if self.flow_settings.is_canceled:
+                node_result.error = "" if errors is None else str(errors)
+                node_result.success = None
+                node_result.is_running = False
+                return node_result, node
+            node_result.finish(success=errors is None, error="" if errors is None else str(errors))
+            if errors is not None:
+                node_result.compute_error = _compute_error(node)
+        except Exception as e:
+            node_logger.error(f"Error in node {node.node_id}: {e}")
+            node_result.finish(success=False, error=str(e))
+
+        node_logger.info(f"Completed node with success: {node_result.success}")
+        if node_result.success:
+            with run_info_lock:
+                self.latest_run_info.nodes_completed += 1
+
+        return node_result, node
+
+    def _prepare_rerun_artifacts(self, plan_skip_ids: set[str | int]) -> None:
+        """Prepare artifact state for nodes that will re-run.
+
+        Computes which python_script nodes need re-execution, expands the set
+        to include producer nodes whose artifacts were deleted, marks them
+        stale, and clears both metadata and kernel-side artifacts.
+        """
+        rerun_node_ids = self._compute_rerun_python_script_node_ids(plan_skip_ids)
+
+        # A re-running node that deleted artifacts needs their producers re-run too.
+        while True:
+            deleted_producers = self.artifact_context.get_producer_nodes_for_deletions(
+                rerun_node_ids,
+            )
+            new_ids = deleted_producers - rerun_node_ids
+            if not new_ids:
+                break
+            rerun_node_ids |= new_ids
+
+        # Mark the added producers stale so they really re-execute.
+        for nid in rerun_node_ids:
+            node = self.get_node(nid)
+            if node is not None and node._execution_state.has_run_with_current_setup:
+                node._execution_state.has_run_with_current_setup = False
+
+        # Purge metadata of nodes no longer in this graph.
+        graph_node_ids = set(self._node_db.keys())
+        stale_node_ids = {nid for nid in self.artifact_context._node_states if nid not in graph_node_ids}
+        nodes_to_clear = rerun_node_ids | stale_node_ids
+        if nodes_to_clear:
+            self.artifact_context.clear_nodes(nodes_to_clear)
+
+        if rerun_node_ids:
+            kernel_node_map = self._group_rerun_nodes_by_kernel(rerun_node_ids)
+            for kid, node_ids_for_kernel in kernel_node_map.items():
+                try:
+                    manager = root().get_kernel_manager()
+                    manager.clear_node_artifacts_sync(
+                        kid, list(node_ids_for_kernel), flow_id=self.flow_id, flow_logger=self.flow_logger
+                    )
+                except Exception:
+                    logger.debug(
+                        "Could not clear node artifacts for kernel '%s', nodes %s",
+                        kid,
+                        sorted(node_ids_for_kernel),
+                    )
+
+    def _execute_stages(
+        self,
+        execution_plan: ExecutionPlan,
+        performance_mode: bool,
+        params: dict[str, ParamValue],
+        skip_node_ids: set[str | int],
+        deliberate_skip_ids: set[str | int] | None = None,
+        closed_gate_handles: dict[str | int, frozenset[str]] | None = None,
+        placement: Placement | None = None,
+        edges: Sequence[BoundaryEdge] = (),
+    ) -> set[str | int]:
+        """Execute all stages in the plan, running independent nodes in parallel.
+
+        Iterates through stages sequentially. Within each stage, up to the run
+        context's ``parallelism`` independent nodes execute at once (one at a
+        time in a local flow). Because stages are topological, each node is decided from its
+        immediate inputs' statuses via the trigger rules (skip_rules) right
+        before its stage runs — a failure skips its dependents stage by stage
+        instead of via a blind transitive closure.
+
+        ``skip_node_ids`` arrives holding the static (misconfiguration) skips
+        and is mutated in place to accumulate every skipped node, preserving
+        the caller's view. ``deliberate_skip_ids`` holds gate-driven skips and
+        is likewise mutated when the rules propagate one.
+        ``closed_gate_handles`` (gate id -> dead output handles) holds
+        parameter-mode routing decided before the run; formula gates join it —
+        mutated in place, same dict the caller created — as they execute and
+        evaluate. ``placement`` (``None`` when nothing was placed) names the
+        backend each node runs on, and each of ``edges`` goes to the node that
+        reads through it. Each node runs with ``running``, the plan's nodes less
+        those skipped so far, so its hints count only the consumers that run; a
+        consumer a formula gate closes later still counts, which only stores a
+        result nothing reads.
+
+        Returns:
+            Set of node IDs that failed during execution.
+        """
+        run_info_lock = threading.Lock()
+        failed_node_ids: set[str | int] = set()
+        if deliberate_skip_ids is None:
+            deliberate_skip_ids = set()
+        if closed_gate_handles is None:
+            closed_gate_handles = {}
+
+        statuses: dict[str | int, NodeRunStatus] = {}
+        for node_id in skip_node_ids:
+            statuses[node_id] = NodeRunStatus.SKIPPED_ERROR
+        for node_id in deliberate_skip_ids:
+            statuses[node_id] = NodeRunStatus.SKIPPED_DELIBERATE
+            skip_node_ids.add(node_id)
+
+        assignment = {} if placement is None else placement.assignment
+        unreachable = {} if placement is None else placement.unreachable
+        moved = {} if placement is None else {fallback.node_id: fallback for fallback in placement.fallbacks}
+        edges_into: dict[str | int, list[BoundaryEdge]] = {}
+        for edge in edges:
+            edges_into.setdefault(edge.target.node_id, []).append(edge)
+
+        planned = {node.node_id for stage in execution_plan.stages for node in stage.nodes}
+        any_rule_nodes_touched: list[FlowNode] = []
+        try:
+            for stage in execution_plan.stages:
+                if self.flow_settings.is_canceled:
+                    self.flow_logger.info("Flow canceled")
+                    break
+
+                nodes_to_run: list[FlowNode] = []
+                for node in stage.nodes:
+                    already_decided = statuses.get(node.node_id)
+                    if already_decided is not None and already_decided != NodeRunStatus.RUN:
+                        skip_node_ids.add(node.node_id)
+                        if already_decided == NodeRunStatus.SKIPPED_DELIBERATE:
+                            self._record_deliberate_skips({node.node_id}, count_toward_total=False)
+                        else:
+                            self.flow_logger.get_node_logger(node.node_id).info(f"Skipping node {node.node_id}")
+                        continue
+                    input_statuses = [
+                        effective_input_status(statuses, input_node.node_id, src_handle, closed_gate_handles)
+                        for input_node, src_handle in node._slot_input_pairs()
+                        if input_node is not None
+                    ]
+                    decision = classify_from_inputs(node, input_statuses)
+                    if decision == NodeRunStatus.RUN:
+                        if uses_any_rule(node):
+                            self._apply_any_input_liveness(node, statuses, closed_gate_handles)
+                            any_rule_nodes_touched.append(node)
+                        nodes_to_run.append(node)
+                        continue
+                    statuses[node.node_id] = decision
+                    skip_node_ids.add(node.node_id)
+                    if decision == NodeRunStatus.SKIPPED_DELIBERATE:
+                        deliberate_skip_ids.add(node.node_id)
+                        self._record_deliberate_skips({node.node_id}, count_toward_total=False)
+                    else:
+                        self.flow_logger.get_node_logger(node.node_id).info(f"Skipping node {node.node_id}")
+
+                if not nodes_to_run:
+                    continue
+
+                running = frozenset(planned - skip_node_ids)
+                max_workers = current_context(self).parallelism
+                if len(nodes_to_run) == 1 or max_workers == 1:
+                    stage_results = [
+                        self._execute_single_node(
+                            node,
+                            performance_mode,
+                            run_info_lock,
+                            assignment.get(node.node_id),
+                            edges_into.get(node.node_id, []),
+                            unreachable.get(assignment.get(node.node_id)),
+                            moved.get(node.node_id),
+                            running,
+                        )
+                        for node in nodes_to_run
+                    ]
+                else:
+                    stage_results: list[tuple[NodeResult, FlowNode]] = []
+                    workers = min(max_workers, len(nodes_to_run))
+                    with ThreadPoolExecutor(max_workers=workers) as executor:
+                        # Each node gets its own copy of this thread's context, so it sees the run's.
+                        futures = {
+                            executor.submit(
+                                contextvars.copy_context().run,
+                                self._execute_single_node,
+                                node,
+                                performance_mode,
+                                run_info_lock,
+                                assignment.get(node.node_id),
+                                edges_into.get(node.node_id, []),
+                                unreachable.get(assignment.get(node.node_id)),
+                                moved.get(node.node_id),
+                                running,
+                            ): node
+                            for node in nodes_to_run
+                        }
+                        for future in as_completed(futures):
+                            stage_results.append(future.result())
+
+                for node_result, node in stage_results:
+                    if node_result.success:
+                        statuses[node.node_id] = NodeRunStatus.RUN
+                        if node.node_type == GATE_NODE_TYPE and self._gate_routes_on_formula(node):
+                            # Route from the actual result, never a stash: cache branches can skip the gate's function.
+                            try:
+                                closed = self._formula_gate_is_closed(node, params or None)
+                            except (Exception, PanicException) as e:
+                                node_result.success = False
+                                node_result.error = f"Gate formula evaluation failed: {e}"
+                                self.latest_run_info.nodes_completed -= 1
+                                # The node itself ran fine; no stale class may describe this failure.
+                                node._last_exception_class = None
+                                statuses[node.node_id] = NodeRunStatus.FAILED
+                                failed_node_ids.add(node.node_id)
+                                skip_node_ids.add(node.node_id)
+                                continue
+                            dead = dead_gate_handles(not closed, gate_has_else_output(node))
+                            if dead:
+                                closed_gate_handles[node.node_id] = dead
+                                side = "then branch" if gate_has_else_output(node) and closed else "downstream"
+                                if closed:
+                                    self.flow_logger.get_node_logger(node.node_id).info(
+                                        f"Gate {node.node_id} closed by its formula; {side} will be skipped"
+                                    )
+                                else:
+                                    self.flow_logger.get_node_logger(node.node_id).info(
+                                        f"Gate {node.node_id} open; its else branch will be skipped"
+                                    )
+                    else:
+                        statuses[node.node_id] = NodeRunStatus.FAILED
+                        failed_node_ids.add(node.node_id)
+                        skip_node_ids.add(node.node_id)
+        finally:
+            # A skipped node has not run: clear its run flags or dev-mode serves last run's frame.
+            for node_id in skip_node_ids - failed_node_ids:
+                node = self.get_node(node_id)
+                if node is None:
+                    continue
+                node.node_stats.has_run_with_current_setup = False
+                node.node_stats.has_completed_last_run = False
+                node._execution_state.has_run_with_current_setup = False
+                node._execution_state.has_completed_last_run = False
+                if statuses.get(node_id) == NodeRunStatus.SKIPPED_ERROR and not node.deferred_until_run:
+                    # Skipped below a failure: drop what it held, so a read reaches the failed input's error.
+                    node.results.resulting_data = None
+                    node._named_outputs = {}
+            for node in any_rule_nodes_touched:
+                node._skipped_input_ids_this_run = frozenset()
+
+        return failed_node_ids
+
+    def _apply_any_input_liveness(
+        self,
+        node: FlowNode,
+        statuses: dict[str | int, NodeRunStatus],
+        closed_gate_handles: dict[str | int, frozenset[str]] | None = None,
+    ) -> None:
+        """Prepare an ANY-rule node (union) to run with a partial input set.
+
+        Stashes which inputs were deliberately skipped this run — keyed by
+        (source id, source handle), so a two-output gate feeding the union is
+        judged per edge — so input assembly can drop them from the concat, and
+        invalidates the node when the surviving-input set differs from the
+        previous run — the node's hash only folds settings and input hashes, so
+        a gate flip would otherwise serve the previous run's partial result from
+        the dev-mode cache (and the worker's cache_results lookup).
+        """
+        input_pairs = [
+            (input_node, src_handle) for input_node, src_handle in node._slot_input_pairs() if input_node is not None
+        ]
+        surviving = frozenset(
+            (input_node.node_id, src_handle)
+            for input_node, src_handle in input_pairs
+            if effective_input_status(statuses, input_node.node_id, src_handle, closed_gate_handles)
+            == NodeRunStatus.RUN
+        )
+        node._skipped_input_ids_this_run = frozenset(
+            (input_node.node_id, src_handle)
+            for input_node, src_handle in input_pairs
+            if (input_node.node_id, src_handle) not in surviving
+        )
+        previous = self._any_input_liveness.get(node.node_id)
+        if previous is not None and previous != surviving:
+            self.flow_logger.info(
+                f"Node {node.node_id}: surviving inputs changed since last run "
+                f"({sorted(map(str, previous))} -> {sorted(map(str, surviving))}); invalidating cached result"
+            )
+            node.invalidate_cache()
+        elif previous is None and node._skipped_input_ids_this_run:
+            # No liveness history but a partial input set: a cached concat may predate this gate topology.
+            node.invalidate_cache()
+        self._any_input_liveness[node.node_id] = surviving
+
+    @staticmethod
+    def _gate_routes_on_formula(node: FlowNode) -> bool:
+        gate_input = getattr(node.setting_input, "gate_input", None)
+        return gate_input is not None and gate_input.condition_source == "formula"
+
+    def _formula_gate_is_closed(self, node: FlowNode, params: dict[str, Any] | None = None) -> bool:
+        """Fresh routing decision for a formula gate, from its source node's result.
+
+        The predicate runs against the control input when one is connected,
+        else against the gate's own data input — resolved through the edge's
+        recorded source handle, like input assembly, so a control wired to a
+        secondary output (e.g. a split filter's fail side) probes that frame,
+        not the source's default output. The memoized result is served when
+        the source ran in an earlier stage; the resolution lazily pulls when
+        the gate's own cache branch short-cut input assembly. ``${param}``
+        refs in the formula render as typed expression literals (strings
+        quoted) like every other expression field — the stage loop sees the
+        restored (unsubstituted) settings. Raises on a missing/unparsable
+        formula — the caller fails the gate visibly. The probe runs on the
+        backend that holds the source's result for its current setup, else on
+        the current context's.
+        """
+        gate_input = node.setting_input.gate_input
+        source_node = node.node_inputs.right_input
+        if source_node is None and node.node_inputs.main_inputs:
+            source_node = node.node_inputs.main_inputs[0]
+        if source_node is None:
+            raise ValueError("gate has no input to evaluate its formula against")
+        handle = node._input_output_handles.get(source_node.node_id, DEFAULT_OUTPUT_HANDLE)
+        source_result = node._resolve_input_result_for_handle(source_node, handle)
+        if source_result is None:
+            raise ValueError("gate input produced no result to evaluate its formula against")
+        formula = resolve_expression_parameters(gate_input.formula, params or {})
+        context = current_context(self)
+        ref = source_node.results.result_ref
+        held = source_node.held_result(ref.backend_id) if ref is not None else None
+        if held is not None and held.backend_id != context.backend_id:
+            context = replace(context, backend_id=held.backend_id)
+        with use_context(context):
+            return not _gate_formula_matches(source_result, formula, self)
+
+    def _evaluate_gate_conditions(self, nodes: list[FlowNode] | None = None) -> dict[str | int, frozenset[str]]:
+        """Evaluate parameter-mode gates (of ``nodes``, default all) before the run; returns per-gate dead handles.
+
+        Formula gates are decided when they execute (stage loop). A gate with
+        an else output always routes exactly one handle dead on a successful
+        evaluation. A gate whose condition cannot be evaluated (unknown
+        parameter, un-coercible value) gets no entry — fully open — so it
+        fails visibly at execution and its downstream (both sides) error-skips
+        — fail-closed either way, but with the error on the canvas instead of
+        a silently-picked branch.
+        """
+        closed: dict[str | int, frozenset[str]] = {}
+        for node in self.nodes if nodes is None else nodes:
+            if node.node_type != "gate" or not node.is_correct:
+                continue
+            gate_input = getattr(node.setting_input, "gate_input", None)
+            if gate_input is None or gate_input.condition_source != "parameter":
+                continue
+            try:
+                is_open = parameter_gate_is_open(gate_input, self.flow_settings.parameters)
+                dead = dead_gate_handles(is_open, gate_has_else_output(node))
+                if dead:
+                    closed[node.node_id] = dead
+            except ValueError:
+                # The gate's hash ignores flow parameters; invalidate so a broken condition re-raises, not caches.
+                node.invalidate_cache()
+                continue
+        return closed
+
+    def _place_run(
+        self, execution_plan: ExecutionPlan, exchange_run: ExchangeRun, *, log: bool = True
+    ) -> tuple[Placement | None, list[BoundaryEdge]]:
+        """Place the nodes ``execution_plan`` runs and resolve its crossings; ``(None, [])`` with the protocol flag off.
+
+        With an exchange store (``FLOWFILE_EXCHANGE_URI``) the policy is ``MixedPlacementPolicy``, falling back to
+        ``registry.fallback_backend_id``; without one it is ``SingleBackendPolicy`` on the run's backend. Each backend
+        named is read through its handshake verdict (``handshake.verdict_for``), except ``local`` in a process that
+        serves, which runs no node and is never asked. A backend refused whole, a ``VersionMismatch`` or an id the
+        registry does not know refuses every node assigned to it. Any other ``ComputeError`` keeps the backend's nodes
+        on it unchecked, and each fails with that error when it runs (``Placement.unreachable``).
+
+        Each boundary becomes one ``BoundaryEdge`` per output the importing node reads, written to
+        ``<prefix><from>-<handle>-<to>.parquet`` under the run's exchange prefix. The importing node is refused, once,
+        when the store cannot be used, when the limit is not a whole number, or when core knows the output holds more
+        rows than ``FLOWFILE_EXCHANGE_MAX_ROWS`` (``BoundaryEdge.cost``). An edge of unknown size crosses. Every refusal
+        carries its ``remedy_for``. ``log`` false (the placement preview) writes no warnings to core's log.
+        """
+        if not settings.FLOWFILE_COMPUTE_PROTOCOL:
+            return None, []
+        nodes = execution_plan.all_nodes
+        run_backend_id = current_context(self).backend_id
+        fallback_id = registry.fallback_backend_id()
+        if settings.get_exchange_uri():
+            policy = MixedPlacementPolicy(run_backend_id, fallback_id=fallback_id)
+        else:
+            policy = SingleBackendPolicy(run_backend_id)
+        declared: dict[str, Capabilities] = {}
+        absent: dict[str, dict[str, str]] = {}
+        refused: dict[str, str] = {}
+        unreachable: dict[str, ComputeError] = {}
+        named = dict.fromkeys(policy.backend_for(node) for node in nodes)
+        if isinstance(policy, MixedPlacementPolicy) and nodes:
+            named.setdefault(fallback_id)
+        for backend_id in named:
+            if backend_id == registry.LOCAL_BACKEND_ID and registry.serving():
+                continue
+            try:
+                verdict = handshake.verdict_for(registry.backend(backend_id))
+            except VersionMismatch as e:
+                refused[backend_id] = str(e)
+                continue
+            except ComputeError as e:
+                unreachable[backend_id] = e
+                continue
+            except LookupError as e:
+                refused[backend_id] = str(e)
+                continue
+            if verdict.ok:
+                declared[backend_id] = verdict.offered
+                absent[backend_id] = verdict.absent
+            else:
+                refused[backend_id] = verdict.error
+        placement = place(self, declared, policy, nodes=nodes, absent=absent, unreachable=unreachable, log=log)
+        if refused:
+            refusals = [
+                Refusal(node.node_id, policy.backend_for(node), refused[policy.backend_for(node)])
+                for node in nodes
+                if policy.backend_for(node) in refused
+            ]
+            placement = replace(
+                placement,
+                assignment={**placement.assignment, **{refusal.node_id: refusal.backend_id for refusal in refusals}},
+                refusals=[*refusals, *placement.refusals],
+            )
+        edges: list[BoundaryEdge] = []
+        crossing_refusals: dict[int, Refusal] = {}
+        for source_id, target_id in placement.boundaries:
+            source, target = self.get_node(source_id), self.get_node(target_id)
+            try:
+                crossing = exchange_run.prefix()
+                max_rows = settings.get_exchange_max_rows() if crossing is not None else None
+            except ValueError as e:
+                crossing_refusals.setdefault(target_id, Refusal(target_id, placement.assignment[target_id], str(e)))
+                continue
+            if crossing is None:
+                continue
+            prefix, credential = crossing
+            handles = dict.fromkeys(handle for node, handle in target._slot_input_pairs() if node is source)
+            for handle in handles:
+                edge = BoundaryEdge(
+                    source=source,
+                    handle=handle,
+                    target=target,
+                    source_backend_id=placement.assignment[source_id],
+                    target_backend_id=placement.assignment[target_id],
+                    uri=f"{prefix}{source_id}-{handle}-{target_id}.parquet",
+                    credential=credential,
+                    node_logger=self.flow_logger.get_node_logger(target_id),
+                )
+                cost = edge.cost() if max_rows is not None else None
+                if cost is not None and cost[0] > max_rows:
+                    rows, columns = cost
+                    reason = (
+                        f'the input from node {source_id} would cross from backend "{edge.source_backend_id}" with '
+                        f"{rows} rows of {columns} columns, above FLOWFILE_EXCHANGE_MAX_ROWS={max_rows}"
+                    )
+                    crossing_refusals.setdefault(target_id, Refusal(target_id, edge.target_backend_id, reason))
+                else:
+                    edges.append(edge)
+        if crossing_refusals:
+            placement = replace(placement, refusals=[*placement.refusals, *crossing_refusals.values()])
+        if placement.refusals:
+            store_moves_to = None if isinstance(policy, MixedPlacementPolicy) else fallback_id
+            placement = replace(
+                placement,
+                refusals=[
+                    replace(
+                        refusal,
+                        remedy=remedy_for(
+                            self.get_node(refusal.node_id),
+                            policy,
+                            fallback_id=None
+                            if refusal.backend_id in refused or refusal.backend_id == store_moves_to
+                            else store_moves_to,
+                        ),
+                    )
+                    for refusal in placement.refusals
+                ],
+            )
+        return placement, edges
+
+    def preview_placement(self) -> Placement | None:
+        """Where a run would place each of the flow's nodes now, without running, logging or changing anything.
+
+        ``None`` with the protocol flag off. Every node is placed as if every gate were open, under an exchange run that
+        is never collected, and the boundary edges are dropped. Placement reads a resolved copy of each node's settings,
+        so a preview beside an edit or a run leaves both as they are.
+        """
+        stage = ExecutionStage(nodes=list(self.nodes))
+        placement, _ = self._place_run(
+            ExecutionPlan(skip_nodes=[], stages=[stage]), ExchangeRun(self.flow_id, "preview"), log=False
+        )
+        return placement
+
+    def _record_fallbacks(self, fallbacks: list[Fallback]) -> None:
+        """Log each node placement moved to the default backend on its node's log, and how many on the flow's.
+
+        A node whose own Compute backend names the backend is told so, since its setting is not what runs it.
+        """
+        if not fallbacks:
+            return
+        for fallback in fallbacks:
+            node = self.get_node(fallback.node_id)
+            own_backend = getattr(node.setting_input, "execution_location", "auto") != "auto"
+            subject = f'{"its Compute backend" if own_backend else "backend"} "{fallback.backend_id}"'
+            self.flow_logger.get_node_logger(fallback.node_id).warning(
+                f'{subject} cannot run it: {fallback.reason}; it runs on the default backend "{fallback.fallback_id}" '
+                "instead"
+            )
+        targets = ", ".join(sorted({fallback.fallback_id for fallback in fallbacks}))
+        node_ids = ", ".join(str(fallback.node_id) for fallback in fallbacks)
+        self.flow_logger.warning(
+            f"{len(fallbacks)} node(s) run on the default backend {targets} instead of the backend their settings "
+            f"name: {node_ids}"
+        )
+
+    def _record_refusals(self, refusals: list[Refusal]) -> None:
+        """Record each refused node as a failed result of the run, which starts no node; called single-threaded.
+
+        The node's error is ``cannot run on backend "<id>": <reason>``, then its remedy as a sentence when it has one.
+        """
+        for refusal in refusals:
+            node = self.get_node(refusal.node_id)
+            error = f'cannot run on backend "{refusal.backend_id}": {refusal.reason}'
+            if refusal.remedy:
+                error += f"{'' if error.endswith('.') else '.'} {refusal.remedy}"
+            self.flow_logger.get_node_logger(node.node_id).error(error)
+            node_result = NodeResult(
+                node_id=node.node_id,
+                node_name=node.name,
+                description=node.get_node_information().description,
+                compute_error="Refusal",
+            )
+            node_result.finish(success=False, error=error)
+            self.latest_run_info.node_step_result.append(node_result)
+        backend_ids = ", ".join(sorted({refusal.backend_id for refusal in refusals}))
+        self.flow_logger.error(f"{len(refusals)} node(s) cannot run on backend {backend_ids}; no node was started")
+
+    def _run_post_execution_callbacks(
+        self,
+        failed_node_ids: set[str | int],
+        skip_node_ids: set[str | int],
+        deliberate_skip_ids: set[str | int] | None = None,
+        run_node_ids: set[str | int] | None = None,
+    ) -> None:
+        """Invoke _on_flow_complete callbacks registered by source nodes.
+
+        Each callback receives ``success=True`` when the node and all its
+        downstream dependents completed without failure or error-driven skip.
+        Used e.g. by Kafka sources to commit offsets only on full success.
+
+        A *deliberate* skip (a branch gated off by design) counts as complete:
+        a Kafka source upstream of a closed gate must still commit its offsets,
+        otherwise it would re-read the same messages on every run. Skips caused
+        by a failure or misconfiguration keep blocking the callback.
+
+        ``run_node_ids`` (a run restricted to those nodes) calls back only a node whose whole
+        downstream is among them; any other keeps its callback for a run that reaches it all.
+
+        Note: the caller must guard against cancellation — this method is
+        only invoked when ``is_canceled`` is False.
+        """
+        deliberate_skip_ids = deliberate_skip_ids or set()
+        incomplete_node_ids = (failed_node_ids | skip_node_ids) - deliberate_skip_ids
+
+        for n in self.nodes:
+            callback = n._on_flow_complete
+            if callback is None:
+                continue
+            downstream = list(n.get_all_dependent_nodes())
+            if run_node_ids is not None and any(
+                node_id not in run_node_ids for node_id in [n.node_id, *(dep.node_id for dep in downstream)]
+            ):
+                continue
+            downstream_incomplete = n.node_id in incomplete_node_ids or any(
+                dep.node_id in incomplete_node_ids for dep in downstream
+            )
+            success = not downstream_incomplete
+            if success and deliberate_skip_ids:
+                gated_outputs = [
+                    dep.node_id
+                    for dep in downstream
+                    if dep.node_id in deliberate_skip_ids and dep.node_template.node_group == "output"
+                ]
+                if gated_outputs:
+                    self.flow_logger.warning(
+                        f"Node {n.node_id}: committing source progress while output node(s) "
+                        f"{gated_outputs} were deliberately skipped by a gate"
+                    )
+            try:
+                callback(success)
+            except Exception as e:
+                self.flow_logger.error(f"Post-execution callback failed for node {n.node_id}: {e}")
+            n._on_flow_complete = None
+
+    def _record_deliberate_skips(self, deliberate_skip_ids: set[str | int], count_toward_total: bool = True) -> None:
+        """Record deliberately-skipped nodes as green, zero-work results.
+
+        Deliberate skips (closed-gate branches) are part of a successful run:
+        each gets a ``NodeResult(skipped=True, success=True)`` row so the run
+        report and canvas can show the state, and counts as completed so
+        progress reaches the denominator. Their run flags are cleared so the
+        next run re-executes them if the gate opens — a node that did not
+        execute this run has not run.
+
+        ``count_toward_total`` is True for plan-level skips (excluded from
+        ``ExecutionPlan.node_count``, so the denominator must grow) and False
+        for skips decided mid-run on nodes the plan already counted. Only ever
+        called single-threaded — before the stages start or between stage
+        executions — so the bare ``node_step_result.append`` is safe.
+        """
+        if not deliberate_skip_ids or self.latest_run_info is None:
+            return
+        already_recorded = {nr.node_id for nr in self.latest_run_info.node_step_result if nr.skipped}
+        for node_id in sorted(deliberate_skip_ids, key=str):
+            node = self.get_node(node_id)
+            if node is None or node.node_id in already_recorded:
+                continue
+            now = time()
+            self.latest_run_info.node_step_result.append(
+                NodeResult(
+                    node_id=node.node_id,
+                    node_name=node.name,
+                    success=True,
+                    skipped=True,
+                    start_timestamp=now,
+                    end_timestamp=now,
+                    run_time_ms=0,
+                    is_running=False,
+                )
+            )
+            self.latest_run_info.nodes_completed += 1
+            if count_toward_total:
+                self.latest_run_info.number_of_nodes += 1
+            node.node_stats.has_run_with_current_setup = False
+            node.node_stats.has_completed_last_run = False
+            node._execution_state.has_run_with_current_setup = False
+            node._execution_state.has_completed_last_run = False
+            self.flow_logger.get_node_logger(node.node_id).info(
+                f"Node {node.node_id} deliberately skipped (gated off); marked as skipped, not failed"
+            )
+
+    def _refresh_catalog_reader_freshness(self, nodes: list[FlowNode] | None = None) -> None:
+        """Invalidate catalog_reader nodes (of ``nodes``, default all) whose Delta sources changed since their last run.
+
+        The node hash is source-blind (settings + upstream hashes only), so in
+        Development mode an unchanged-settings reader is skipped and downstream
+        keeps reading a frozen worker snapshot. This probes the live Delta
+        versions once per run and bumps the node's cache epoch on drift — which
+        rotates the hash, defeats the dev-mode skip AND the explicit
+        cache_results worker lookup, and cascades resets downstream.
+
+        Pinned ``delta_version`` readers are deliberate time travel and are
+        never probed. Probe failures fail open (invalidate) so the real error
+        surfaces on the canvas instead of a silently-served stale snapshot.
+        Cloud readers get the same pass only when they read a Delta change feed.
+        """
+        version_cache: dict[str, int] = {}
+        opts_by_namespace: dict[int | None, dict | None] = {}
+        for node in self.nodes if nodes is None else nodes:
+            settings = node.setting_input
+            cloud_change_read = (
+                node.node_type == "cloud_storage_reader"
+                and isinstance(settings, input_schema.NodeCloudStorageReader)
+                and _is_cloud_change_read(settings.cloud_storage_settings)
+            )
+            if not cloud_change_read:
+                if node.node_type != "catalog_reader" or not isinstance(settings, input_schema.NodeCatalogReader):
+                    continue
+                if not settings.sql_query and settings.delta_version is not None:
+                    continue
+            try:
+                if cloud_change_read:
+                    fingerprint, force = self._cloud_change_read_fingerprint(node, version_cache), False
+                else:
+                    fingerprint, force = _catalog_reader_source_fingerprint(
+                        settings, version_cache, opts_by_namespace, cdc_state=self._cdc_fingerprint_state(node)
+                    )
+            except Exception:
+                self.flow_logger.warning(
+                    f"Node {node.node_id}: could not probe source freshness; re-running to be safe"
+                )
+                fingerprint, force = None, True
+            recorded = node._execution_state.source_version_info
+            if force or (recorded is not None and fingerprint != recorded):
+                node.invalidate_cache()
+                self.flow_logger.info(f"Node {node.node_id}: source changed; invalidating cached result")
+            node._execution_state.source_version_info = fingerprint
+
+    def _cdc_fingerprint_state(self, node: FlowNode) -> int | str | None:
+        """The run state a change reader's output depends on, for its freshness fingerprint.
+
+        ``since_last_run`` folds in the stored cursor; the version and timestamp modes fold in the
+        resolved ``since`` value when it comes from a flow parameter (a literal is already part of
+        the settings hash). Unresolvable (no registration, no table id, no cursor yet, unknown
+        parameter) means "nothing to fold in" — the head probe alone then decides freshness.
+        """
+        settings = node.setting_input
+        if settings.cdc_mode in ("since_version", "since_timestamp"):
+            return _cdc_since_param_state(settings, node)
+        if settings.cdc_mode != "since_last_run" or not settings.catalog_table_id:
+            return None
+        try:
+            consumer_key, _ = resolve_consumer_key(self, settings)
+            with get_db_context() as db:
+                cursor = read_cursor(db, settings.catalog_table_id, consumer_key)
+        except Exception:
+            return None
+        return cursor.last_version if cursor is not None else None
+
+    def _cloud_change_read_fingerprint(self, node: FlowNode, version_cache: dict[str, int]) -> str:
+        """Freshness fingerprint of a cloud Delta change reader: live head plus a ``${param}`` ``since`` value.
+
+        Path and connection ``${param}`` refs are resolved for the probe. Raises on probe failures (an
+        undefined parameter included), which the caller treats as a fail-open re-run.
+        """
+        read_settings = node.setting_input.cloud_storage_settings
+        cdc_state = _cdc_since_param_state(read_settings, node)
+        with node_parameters_resolved(node):
+            path, storage_options = _cloud_change_read_target(read_settings, node.setting_input.user_id)
+            head = _probe_version_entry(path, storage_options, version_cache)
+        return _delta_reader_fingerprint(path, head, cdc_state)
+
+    def _refresh_read_source_freshness(self, nodes: list[FlowNode] | None = None) -> None:
+        """Invalidate read nodes (of ``nodes``, default all) whose source files changed since their last run.
+
+        Same rationale as the catalog pass above: the node hash is source-blind, so a changed
+        or added file would let Development mode and cache_results serve stale results — and
+        because downstream hashes fold in this node's, the whole chain would skip. The epoch
+        bump must happen here, before the stages run: a rotation done inside the executor is
+        reverted by _execute_single_node's hash save/restore. The stale worker entry is purged
+        first, while the hash it was stored under is still current, and reset() must follow
+        invalidate_cache() immediately — any hash access in between re-memoizes the hash and
+        the downstream reset cascade never fires.
+        """
+        for node in self.nodes if nodes is None else nodes:
+            if node.node_type != "read":
+                continue
+            info = node._execution_state.source_file_info
+            if info is None or not info.has_changed():
+                continue
+            try:
+                node.remove_cache()
+            except Exception:
+                self.flow_logger.warning(f"Node {node.node_id}: could not purge the stale worker cache entry")
+            node.invalidate_cache()
+            node.reset()
+            self.flow_logger.info(f"Node {node.node_id}: source files changed; invalidating cached result")
+
+    def run_graph(
+        self,
+        *,
+        node_ids: Collection[int | str] | None = None,
+        kernel_hold: KernelHold | None = None,
+        commit_sources: bool = True,
+        claimed: bool = False,
+    ) -> RunInformation | None:
+        """Executes the entire data flow graph from start to finish.
+
+        Independent nodes within the same execution stage are run in parallel
+        using threads. Stages are processed sequentially so that all dependencies
+        are satisfied before a stage begins.
+
+        The run and every node it executes see ``current_context(self)``, so a subflow keeps the context of the run
+        around it.
+
+        With ``FLOWFILE_COMPUTE_PROTOCOL`` on, the nodes are placed first (``_place_run``). Any refusal ends the run
+        before a node starts, each refused node a failed result. Otherwise each node runs on its assigned backend, an
+        input from another backend crossing through the exchange store. ``RunInformation.boundaries`` lists those
+        edges, a refused run's included.
+
+        The run holds ``exchange_run`` from before ``flow_run_started`` is published. However the run ends, its prefix
+        is removed and ``exchange_run`` is ``None`` again (``_end_exchange_run``).
+
+        Args:
+            node_ids: Restrict the run to these nodes; pass a closed set (each node together with
+                every node it reads from), since a node whose input lies outside it is unreachable.
+                Only they are probed, routed, planned, executed and reported, and a source's
+                post-execution callback fires only when its whole downstream is among them.
+                ``None`` runs the whole graph.
+            kernel_hold: Kernels whose execution lock the caller holds while it waits on this run; a kernel
+                node on one fails at once (``KernelBusyError``) instead of waiting, here and in subflows.
+                ``None`` keeps the hold of a run this one runs inside (``ambient_kernel_hold``), such as a
+                subflow of a virtual table's producer.
+            commit_sources: ``False`` for a run that only looks at rows (a notebook's lineage run that holds no
+                output node): no source's post-execution callback fires, so no change-feed cursor or Kafka
+                offset moves. The callbacks stay set and fire in the next run that commits. A subflow this
+                run runs inherits it (``_commit_sources``), so its sources commit only when this run does.
+            claimed: The caller already holds the run slot (``try_claim_run``), as the run routes do
+                before they answer, so a client sees ``is_running`` once its request returns. The slot
+                is released here either way.
+
+        Returns:
+            A RunInformation object summarizing the execution results.
+
+        Raises:
+            Exception: If the flow is already running.
+        """
+        if kernel_hold is None:
+            kernel_hold = ambient_kernel_hold.get()
+        if claimed:
+            # The route claimed with no hold (a route runs outside any kernel session): set the run's own.
+            self._kernel_hold = kernel_hold
+            self._commit_sources = commit_sources
+        elif not self.try_claim_run(kernel_hold=kernel_hold, commit_sources=commit_sources):
+            raise Exception("Flow is already running")
+        ambient = ambient_kernel_hold.set(kernel_hold)
+        released = False
+        exchange_run = self.exchange_run = ExchangeRun(self.flow_id, uuid.uuid4().hex)
+        try:
+            with use_context(current_context(self)):
+                self.flow_logger.info("Starting to run flowfile flow...")
+
+                publish("flow_run_started", graph=self)
+
+                selected = None if node_ids is None else set(node_ids)
+                run_nodes = self.nodes if selected is None else [n for n in self.nodes if n.node_id in selected]
+                self._refresh_catalog_reader_freshness(run_nodes)
+                self._refresh_read_source_freshness(run_nodes)
+
+                params: dict[str, ParamValue] = typed_parameter_values(self.flow_settings.parameters)
+                # Parameter gates route before the run (dead sides deliberately skipped); formula gates at execution.
+                closed_gate_handles = self._evaluate_gate_conditions(run_nodes)
+                # Same dict the stage loop folds formula-gate decisions into, so it ends as the run's final routing.
+                self._last_closed_gate_handles = closed_gate_handles
+
+                flow_starts = self._flow_starts + self.get_implicit_starter_nodes()
+                execution_plan = compute_execution_plan(
+                    nodes=run_nodes,
+                    flow_starts=flow_starts if selected is None else [n for n in flow_starts if n.node_id in selected],
+                    closed_gate_handles=closed_gate_handles,
+                )
+
+                placement, edges = self._place_run(execution_plan, exchange_run)
+                if placement is not None and placement.refusals:
+                    # Refused before any node starts: nothing is prepared, executed, skipped or committed.
+                    self.latest_run_info = self.create_initial_run_information(execution_plan.node_count, "full_run")
+                    self.latest_run_info.boundaries = list(placement.boundaries)
+                    self._record_refusals(placement.refusals)
+                else:
+                    plan_skip_ids: set[str | int] = {n.node_id for n in execution_plan.skip_nodes}
+                    deliberate_skip_ids: set[str | int] = {n.node_id for n in execution_plan.deliberate_skip_nodes}
+                    not_selected_ids = set() if selected is None else {n.node_id for n in self.nodes} - selected
+                    self._prepare_rerun_artifacts(plan_skip_ids | deliberate_skip_ids | not_selected_ids)
+
+                    self.latest_run_info = self.create_initial_run_information(execution_plan.node_count, "full_run")
+                    if placement is not None:
+                        self.latest_run_info.boundaries = list(placement.boundaries)
+                        self._record_fallbacks(placement.fallbacks)
+                    skip_node_message(self.flow_logger, execution_plan.skip_nodes)
+                    execution_order_message(self.flow_logger, execution_plan.stages)
+
+                    performance_mode = self.flow_settings.execution_mode == "Performance"
+                    self._record_deliberate_skips(deliberate_skip_ids)
+
+                    failed_node_ids = self._execute_stages(
+                        execution_plan,
+                        performance_mode,
+                        params,
+                        plan_skip_ids,
+                        deliberate_skip_ids,
+                        closed_gate_handles,
+                        placement=placement,
+                        edges=edges,
+                    )
+                    if commit_sources and not self.flow_settings.is_canceled:
+                        self._run_post_execution_callbacks(
+                            failed_node_ids, plan_skip_ids, deliberate_skip_ids, selected
+                        )
+                    self.flow_logger.info("Flow completed!")
+
+                self.latest_run_info.end_time = datetime.datetime.now()
+                self.end_datetime = datetime.datetime.now()
+                self.release_run()
+                released = True
+                if self.flow_settings.is_canceled:
+                    self.flow_logger.info("Flow canceled")
+                run_info = self.get_run_info()
+                publish("flow_run_finished", graph=self, run_info=run_info)
+                return run_info
+        except BaseException as e:
+            # A pyo3 panic is BaseException-only; `except Exception` would miss it.
+            publish("flow_run_crashed", graph=self, error=e)
+            raise
+        finally:
+            ambient_kernel_hold.reset(ambient)
+            # Released once: a second release would end a run another caller claimed meanwhile.
+            if not released:
+                self.release_run()
+            self._end_exchange_run(exchange_run)
+
+    def _end_exchange_run(self, exchange_run: ExchangeRun) -> None:
+        """Remove what the run wrote to the exchange store; a failure is a warning on the flow log, never the run's.
+
+        ``exchange_run`` is reset only while it is still this run's: a run claimed once this one released its slot
+        holds its own.
+        """
+        if self.exchange_run is exchange_run:
+            self.exchange_run = None
+        try:
+            exchange_run.collect()
+        except Exception as e:
+            self.flow_logger.warning(f"Could not remove the run's exchange-store prefix: {type(e).__name__}: {e}")
+
+    def get_run_info(self) -> RunInformation:
+        """Gets a summary of the most recent graph execution.
+
+        Returns:
+            A RunInformation object with details about the last run.
+        """
+        is_running = self.flow_settings.is_running
+        if self.latest_run_info is None:
+            return self.create_empty_run_information()
+
+        run_info = self.latest_run_info
+        run_info.is_running = is_running
+        run_info.execution_mode = self.flow_settings.execution_mode
+        if not is_running and run_info.success is None:
+            run_info.success = all(nr.success for nr in run_info.node_step_result)
+        return run_info
+
+    def cancel(self):
+        """Cancels an ongoing graph execution."""
+
+        if not self.flow_settings.is_running:
+            return
+        self.flow_settings.is_canceled = True
+        for node in self.nodes:
+            node.cancel()
+
+    def close_flow(self):
+        """Releases every result the flow's nodes hold; never raises.
+
+        A flow with a run in flight is closed when the run releases its slot (``release_run``), so nothing is released
+        under a node still reading it and nothing the run mints is left held.
+        """
+        with self._run_claim_lock:
+            running = self.flow_settings.is_running
+            self._close_when_released = running
+        if running:
+            return
+        for node in self.nodes:
+            try:
+                node.remove_cache()
+            except Exception as e:
+                logger.warning(f"Flow {self.flow_id}: node {node.node_id}'s results were not released: {e}")
+
+    def reset(self):
+        """Forces a deep reset on all nodes in the graph."""
+
+        for node in self.nodes:
+            node.reset(True)

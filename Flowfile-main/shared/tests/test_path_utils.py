@@ -1,0 +1,347 @@
+import glob
+import os
+from pathlib import Path, PurePosixPath, PureWindowsPath
+
+import pytest
+
+from shared.path_utils import (
+    file_name,
+    DIRECTORY_SCAN_FILE_TYPES,
+    CloudPathNotSupportedError,
+    DirectoryScanUnsupportedError,
+    NoFilesMatchedError,
+    assert_directory_scan_supported,
+    contained_path,
+    default_scan_extension,
+    ensure_glob_pattern,
+    expand_glob_pattern,
+    is_cloud_path,
+    is_glob_pattern,
+    is_url,
+    is_utf8_encoding,
+    refuse_cloud_path,
+)
+
+
+def test_is_url_detects_http_and_https():
+    assert is_url("http://example.com/data.csv")
+    assert is_url("https://raw.githubusercontent.com/org/repo/main/data.csv")
+
+
+def test_is_url_rejects_local_paths():
+    assert not is_url("/app/data/regions.csv")
+    assert not is_url("data/regions.csv")
+    assert not is_url("~/Downloads/regions.csv")
+    assert not is_url("C:\\Users\\me\\regions.csv")
+
+
+def test_is_url_handles_non_string():
+    assert not is_url(None)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "s3://bucket/sales.parquet",
+        "S3://bucket/sales.parquet",
+        "gs://bucket/x.csv",
+        "az://container/x.csv",
+        "abfss://c@acct/x.csv",
+        "file:///tmp/x.csv",
+        "hf://datasets/org/x.parquet",
+        Path("s3://bucket/sales.parquet"),
+        PureWindowsPath("s3://bucket/sales.parquet"),
+        PurePosixPath("s3://bucket/sales.parquet"),
+    ],
+)
+def test_is_cloud_path_detects_non_http_uris(path):
+    assert is_cloud_path(path)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/data/s3/x.csv",
+        "s3/x.csv",
+        "https://example.com/x.csv",
+        "HTTPS://example.com/x.csv",
+        "C://data/x.csv",
+        PureWindowsPath("C:/data/x.csv"),
+        PureWindowsPath("data/s3/x.csv"),
+        None,
+    ],
+)
+def test_is_cloud_path_rejects_local_paths_and_urls(path):
+    assert not is_cloud_path(path)
+
+
+@pytest.mark.parametrize(
+    "file_type, reader",
+    [
+        ("parquet", "ff.scan_parquet_from_cloud_storage"),
+        ("csv", "ff.scan_csv_from_cloud_storage"),
+        ("ndjson", "ff.scan_json_from_cloud_storage"),
+    ],
+)
+def test_refuse_cloud_path_names_the_matching_cloud_reader(file_type, reader):
+    with pytest.raises(CloudPathNotSupportedError, match=reader) as exc:
+        refuse_cloud_path("s3://bucket/sales.data", file_type)
+    assert "s3://bucket/sales.data" in str(exc.value)
+
+
+@pytest.mark.parametrize("file_type", ["excel", "avro", "ipc", "ipc_stream"])
+def test_refuse_cloud_path_offers_no_cloud_reader_for_unsupported_formats(file_type):
+    with pytest.raises(CloudPathNotSupportedError, match="No cloud storage reader supports") as exc:
+        refuse_cloud_path("s3://bucket/data.file", file_type)
+    assert "from_cloud_storage" not in str(exc.value)
+
+
+def test_refuse_cloud_path_passes_local_paths_and_urls():
+    refuse_cloud_path("/data/sales.parquet", "parquet")
+    refuse_cloud_path("https://example.com/sales.csv", "csv")
+
+
+def test_is_cloud_path_does_not_import_cloud_storage():
+    """path_utils stays dependency-free: the check is a regex, not the cloud_storage package."""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys; from shared.path_utils import is_cloud_path; is_cloud_path('s3://b/k'); "
+        "print('shared.cloud_storage' in sys.modules)"
+    )
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    assert out.stdout.strip() == "False"
+
+
+def test_is_glob_pattern_detects_metacharacters():
+    """Only *, ? and [ make a path a pattern; a plain path must stay a plain path."""
+    assert not is_glob_pattern("/data/sales/january.csv")
+    assert is_glob_pattern("/data/sales/*.csv")
+    assert is_glob_pattern("/data/sales/part_?.csv")
+    assert is_glob_pattern("/data/sales/[ab].csv")
+
+
+def test_is_glob_pattern_ignores_parameter_references():
+    """${param} carries braces but no glob meaning — the substituted value decides globness."""
+    assert not is_glob_pattern("${data_dir}")
+    assert not is_glob_pattern("/data/${env}/sales")
+    assert is_glob_pattern("${data_dir}/*.csv")
+
+
+def test_default_scan_extension_maps_ipc_to_arrow():
+    """The synthesised glob must use the on-disk extension, which differs from the file type for ipc."""
+    assert default_scan_extension("ipc") == "arrow"
+    assert default_scan_extension("csv") == "csv"
+    assert default_scan_extension("parquet") == "parquet"
+
+
+def test_ensure_glob_pattern_synthesises_recursive_glob_for_a_directory(tmp_path):
+    """A bare directory becomes a recursive, case-insensitive glob so nested files are read too."""
+    assert ensure_glob_pattern(str(tmp_path), "csv") == os.path.join(str(tmp_path), "**", "*.[cC][sS][vV]")
+
+
+def test_ensure_glob_pattern_leaves_an_explicit_pattern_alone(tmp_path):
+    """A user-written pattern is authoritative — never wrapped in another /**/*.ext."""
+    pattern = os.path.join(str(tmp_path), "part_*.csv")
+    assert ensure_glob_pattern(pattern, "csv") == pattern
+
+
+def test_ensure_glob_pattern_treats_a_real_bracketed_directory_as_a_directory(tmp_path):
+    """What is on disk wins over a metacharacter sniff: a directory literally named ``[ab]`` is a
+    directory, and its escaped pattern must not match the sibling file the character class would."""
+    directory = tmp_path / "[ab]"
+    directory.mkdir()
+    (directory / "one.csv").write_text("a\n1\n")
+    (directory / "two.csv").write_text("a\n2\n")
+    (tmp_path / "a").write_text("decoy matched only if [ab] is read as a character class\n")
+
+    pattern = ensure_glob_pattern(str(directory), "csv")
+
+    assert pattern == os.path.join(glob.escape(str(directory)), "**", "*.[cC][sS][vV]")
+    assert expand_glob_pattern(pattern) == [str(directory / "one.csv"), str(directory / "two.csv")]
+
+
+def test_ensure_glob_pattern_synthesises_for_a_directory_that_does_not_exist_yet(tmp_path):
+    """Nothing on disk and no metacharacters still means 'a directory' — it may appear before the run.
+
+    An absent path cannot be escaped meaningfully, and matches nothing either way.
+    """
+    missing = tmp_path / "landing"
+
+    assert ensure_glob_pattern(str(missing), "csv") == os.path.join(str(missing), "**", "*.[cC][sS][vV]")
+
+
+def test_ensure_glob_pattern_passes_an_existing_file_through(tmp_path):
+    """A directory-mode node pointed at one concrete file still reads that file."""
+    file_path = tmp_path / "sales.csv"
+    file_path.write_text("a\n1\n")
+    assert ensure_glob_pattern(str(file_path), "csv") == str(file_path)
+
+
+def test_expand_glob_pattern_is_sorted_and_files_only(tmp_path):
+    """The expansion is the single source of truth for scan, fingerprint and probe, so it must be
+    deterministic (sorted) and never hand a directory to polars."""
+    (tmp_path / "b.csv").write_text("a\n1\n")
+    (tmp_path / "a.csv").write_text("a\n2\n")
+    (tmp_path / "looks_like_a_file.csv").mkdir()
+
+    assert expand_glob_pattern(str(tmp_path / "*.csv")) == [str(tmp_path / "a.csv"), str(tmp_path / "b.csv")]
+
+
+def test_expand_glob_pattern_excludes_dotfiles(tmp_path):
+    """Python's glob skips dotfiles by design, which keeps macOS AppleDouble junk out of the scan."""
+    (tmp_path / "data.csv").write_text("a\n1\n")
+    (tmp_path / ".hidden.csv").write_text("a\n2\n")
+
+    assert expand_glob_pattern(str(tmp_path / "*.csv")) == [str(tmp_path / "data.csv")]
+
+
+@pytest.mark.parametrize("file_type", ["csv", "parquet", "ipc"])
+def test_assert_directory_scan_supported_accepts_natively_scannable_types(file_type):
+    """Only formats polars can scan from a file list may be read as a directory."""
+    assert file_type in DIRECTORY_SCAN_FILE_TYPES
+    assert_directory_scan_supported(file_type)
+
+
+@pytest.mark.parametrize("file_type", ["excel", "avro", "json", "ndjson"])
+def test_assert_directory_scan_supported_refuses_other_types(file_type):
+    """Refusal happens up front so the user sees a clear error instead of a partial read."""
+    assert file_type not in DIRECTORY_SCAN_FILE_TYPES
+    with pytest.raises(DirectoryScanUnsupportedError):
+        assert_directory_scan_supported(file_type)
+
+
+def test_assert_directory_scan_supported_refuses_non_utf8_csv():
+    """Non-UTF-8 csv routes to the worker's separate reader, which directory mode must never reach."""
+    with pytest.raises(DirectoryScanUnsupportedError):
+        assert_directory_scan_supported("csv", encoding="ISO-8859-1")
+
+
+@pytest.mark.parametrize("encoding", ["utf-8", "utf8-lossy"])
+def test_assert_directory_scan_supported_accepts_utf8_csv(encoding):
+    """Both UTF-8 spellings the csv reader uses stay on the native scan path."""
+    assert_directory_scan_supported("csv", encoding=encoding)
+
+
+def test_assert_directory_scan_supported_refuses_urls():
+    """There is no filesystem to expand a glob over, so directory mode over a URL is refused up front."""
+    with pytest.raises(DirectoryScanUnsupportedError):
+        assert_directory_scan_supported("csv", None, "https://example.com/data")
+    with pytest.raises(DirectoryScanUnsupportedError):
+        assert_directory_scan_supported("parquet", None, "http://example.com/data")
+
+
+def test_assert_directory_scan_supported_accepts_a_local_path():
+    """The path argument is optional and only ever refuses URLs — local paths stay on the happy path."""
+    assert_directory_scan_supported("csv", "utf-8", "/data/sales")
+    assert_directory_scan_supported("parquet", None, "/data/sales")
+
+
+def test_no_files_matched_error_is_a_file_not_found_error():
+    """Callers that already handle a missing file keep working when a pattern matches nothing."""
+    assert issubclass(NoFilesMatchedError, FileNotFoundError)
+
+
+# Review fixes: metacharacter escaping, case-insensitive extensions, encoding helper
+
+
+def test_ensure_glob_pattern_escapes_an_existing_bracketed_file(tmp_path):
+    """A concrete file whose name contains metacharacters must expand to itself, not to the
+    character-class interpretation (which matches nothing)."""
+    target = tmp_path / "report[1].csv"
+    target.write_text("a\n1\n")
+
+    pattern = ensure_glob_pattern(str(target), "csv")
+
+    assert pattern == glob.escape(str(target))
+    assert expand_glob_pattern(pattern) == [str(target)]
+
+
+def test_ensure_glob_pattern_is_idempotent(tmp_path):
+    """Every returned pattern must survive a second pass unchanged — set_absolute_filepath is
+    called from several places on the same value."""
+    directory_pattern = ensure_glob_pattern(str(tmp_path), "csv")
+    assert ensure_glob_pattern(directory_pattern, "csv") == directory_pattern
+
+    bracketed = tmp_path / "report[1].csv"
+    bracketed.write_text("a\n1\n")
+    file_pattern = ensure_glob_pattern(str(bracketed), "csv")
+    assert ensure_glob_pattern(file_pattern, "csv") == file_pattern
+
+
+def test_synthesised_extension_matches_any_casing(tmp_path):
+    """A.CSV and b.csv are the same data drop; fnmatch only folds case on Windows, so the
+    synthesised pattern carries character classes to behave the same on every platform."""
+    (tmp_path / "A.CSV").write_text("a\n1\n")
+    (tmp_path / "b.csv").write_text("a\n2\n")
+
+    matches = expand_glob_pattern(ensure_glob_pattern(str(tmp_path), "csv"))
+
+    assert matches == [str(tmp_path / "A.CSV"), str(tmp_path / "b.csv")]
+
+
+def test_is_utf8_encoding():
+    for encoding in ("utf-8", "UTF-8", "utf8", "UTF8-LOSSY", "utf-8-lossy"):
+        assert is_utf8_encoding(encoding)
+    for encoding in (None, "", "latin-1", "UTF-16", "ascii"):
+        assert not is_utf8_encoding(encoding)
+
+
+def test_assert_directory_scan_supported_refuses_an_empty_csv_encoding():
+    """An empty string is not UTF-8; only a true None (non-csv callers) skips the check."""
+    with pytest.raises(DirectoryScanUnsupportedError):
+        assert_directory_scan_supported("csv", "")
+    assert_directory_scan_supported("csv", None)
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        (r"titanic\train.csv", "train.csv"),
+        ("titanic/sub\\train.csv", "train.csv"),
+        ("/data/titanic/train.csv", "train.csv"),
+        (r"C:\data\train.csv", "train.csv"),
+        ("s3://bucket/dir/train.csv", "train.csv"),
+        ("train.csv", "train.csv"),
+    ],
+)
+def test_file_name_takes_the_last_component_under_either_separator(path, expected):
+    assert file_name(path) == expected
+
+
+def test_contained_path_accepts_the_base_and_paths_under_it(tmp_path):
+    base = tmp_path / "base"
+    (base / "child").mkdir(parents=True)
+    assert contained_path(base, base) == os.path.realpath(base)
+    assert contained_path(base, base / "child" / "new.csv") == os.path.realpath(base / "child" / "new.csv")
+
+
+def test_contained_path_refuses_a_sibling_sharing_the_name_prefix(tmp_path):
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data2").mkdir()
+    assert contained_path(tmp_path / "data", tmp_path / "data2" / "x") is None
+
+
+def test_contained_path_refuses_a_traversal_out_of_the_base(tmp_path):
+    base = tmp_path / "base"
+    base.mkdir()
+    assert contained_path(base, os.path.join(base, "..", "outside")) is None
+
+
+def test_contained_path_refuses_a_symlink_whose_target_escapes(tmp_path):
+    base = tmp_path / "base"
+    base.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = base / "link"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+    assert contained_path(base, link / "secret.txt") is None
+
+
+def test_contained_path_under_the_filesystem_root(tmp_path):
+    root = tmp_path.anchor
+    assert contained_path(root, tmp_path / "x") == os.path.realpath(tmp_path / "x")

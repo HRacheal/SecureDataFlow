@@ -1,0 +1,586 @@
+"""Tests for the bounded worker WebSocket receive (wedged-worker hardening).
+
+Core's ``_receive_raw_result`` must never wait on a silent worker forever:
+each poll tick checks cancellation (``should_abort``) and total silence
+against ``_WS_INACTIVITY_TIMEOUT`` (env ``FLOWFILE_WORKER_WS_TIMEOUT``).
+A stall raises ``WorkerStreamStalled`` — and, critically, mid-receive
+failures must NOT trigger the fetchers' REST fallback (which would
+re-submit the task to a worker that is presumed wedged).
+"""
+
+import threading
+import time
+
+import polars as pl
+import pytest
+from websockets.exceptions import ConnectionClosedOK
+from websockets.frames import Close
+
+from flowfile_core.configs.settings import WORKER_URL
+from flowfile_core.flowfile.flow_data_engine.subprocess_operations import (
+    streaming as stream_mod,
+)
+from flowfile_core.flowfile.flow_data_engine.subprocess_operations import (
+    subprocess_operations as subprocess_ops,
+)
+from flowfile_core.flowfile.flow_data_engine.subprocess_operations.streaming import (
+    WorkerStreamInterrupted,
+    WorkerStreamStalled,
+    WorkerTaskError,
+    _receive_raw_result,
+)
+from flowfile_core.flowfile.flow_node.models import RemoteExecutionError
+
+
+def _closed_ok() -> ConnectionClosedOK:
+    return ConnectionClosedOK(Close(1000, ""), Close(1000, ""), True)
+
+
+class _FakeClock:
+    """Deterministic stand-in for ``streaming.monotonic``.
+
+    Real sleeps made the silence-threshold tests timing-dependent: a single 50ms
+    sleep overshooting under full-suite load was enough to trip a stall the test
+    was asserting *against*. Here time only moves when the fake socket says so,
+    so the margins are exact rather than hopeful.
+    """
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class _FakeWs:
+    """Duck-typed stand-in for a websockets.sync client connection.
+
+    The script is a list of items played back by ``recv``:
+    - ``"timeout"``: let ``gap`` seconds elapse, then raise ``TimeoutError``
+      (simulating a quiet poll tick);
+    - an Exception instance: raised as-is;
+    - anything else: returned as the received message (no time passes — a
+      message that has arrived is already here).
+    An exhausted script keeps raising ``TimeoutError`` (permanent silence).
+
+    With a ``clock``, "elapsed" means advancing that clock; without one it is a
+    real sleep. Prefer the clock for anything asserting on a threshold.
+    """
+
+    def __init__(self, script=(), gap: float = 0.0, clock: "_FakeClock | None" = None):
+        self._script = list(script)
+        self._gap = gap
+        self._clock = clock
+        self.closed = False
+
+    def _elapse(self):
+        if self._clock is not None:
+            self._clock.advance(self._gap)
+        else:
+            time.sleep(self._gap)
+
+    def recv(self, timeout=None):
+        if not self._script:
+            self._elapse()
+            raise TimeoutError
+        item = self._script.pop(0)
+        if item == "timeout":
+            self._elapse()
+            raise TimeoutError
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    def close(self):
+        self.closed = True
+
+
+def test_silent_worker_raises_stalled(monkeypatch):
+    """A worker that never sends anything must surface as a stall, promptly."""
+    clock = _FakeClock()
+    monkeypatch.setattr(stream_mod, "monotonic", clock)
+    monkeypatch.setattr(stream_mod, "_WS_INACTIVITY_TIMEOUT", 0.05)
+    ws = _FakeWs(gap=0.01, clock=clock)
+
+    start = time.monotonic()
+    with pytest.raises(WorkerStreamStalled, match="FLOWFILE_WORKER_WS_TIMEOUT"):
+        _receive_raw_result(ws, "task-silent")
+    assert time.monotonic() - start < 5, "stall detection must be bounded"
+
+
+def test_heartbeats_keep_stream_alive(monkeypatch):
+    """Progress heartbeats (even with an unchanged value) reset the silence clock.
+
+    The gaps are deliberately tuned so this fails if the reset is removed:
+    each individual silence (0.1) stays under the 0.25 threshold, but the three
+    of them *accumulate* to 0.3 and would trip it. An earlier version used
+    0.05 gaps against a 0.2 threshold — cumulative 0.15, under the threshold
+    either way — so it passed even with the reset deleted.
+    """
+    clock = _FakeClock()
+    monkeypatch.setattr(stream_mod, "monotonic", clock)
+    monkeypatch.setattr(stream_mod, "_WS_INACTIVITY_TIMEOUT", 0.25)
+    ws = _FakeWs(
+        script=[
+            "timeout",
+            '{"type": "progress", "progress": 50}',
+            "timeout",
+            '{"type": "progress", "progress": 50}',
+            "timeout",
+            '{"type": "complete", "has_result": false, "file_ref": "x"}',
+        ],
+        gap=0.1,
+        clock=clock,
+    )
+
+    raw_result, status = _receive_raw_result(ws, "task-heartbeat")
+    assert raw_result is None
+    assert status is not None and status.progress == 100
+
+
+def test_should_abort_interrupts_receive():
+    """Cancellation must break the wait on the next poll tick."""
+    ws = _FakeWs(gap=0.0)
+
+    with pytest.raises(WorkerStreamInterrupted, match="Canceled"):
+        _receive_raw_result(ws, "task-abort", should_abort=lambda: True)
+
+
+def test_stalled_receive_does_not_fall_back_to_rest(monkeypatch):
+    """A stall after a successful submit must not re-submit the task via REST."""
+    monkeypatch.setattr(subprocess_ops, "streaming_start", lambda **kwargs: _FakeWs())
+
+    def _stalled_receive(ws, task_id, should_abort=None):
+        raise WorkerStreamStalled("worker presumed unresponsive")
+
+    monkeypatch.setattr(subprocess_ops, "streaming_receive", _stalled_receive)
+    monkeypatch.setattr(
+        subprocess_ops,
+        "trigger_df_operation",
+        lambda **kwargs: pytest.fail("REST fallback must not run after a successful WS submit"),
+    )
+
+    with pytest.raises(WorkerStreamStalled):
+        subprocess_ops.ExternalDfFetcher(
+            flow_id=1,
+            node_id=1,
+            lf=pl.LazyFrame({"a": [1]}),
+            file_ref="t-stall",
+            wait_on_completion=True,
+            worker_url=WORKER_URL,
+        )
+
+
+def test_stalled_sampler_does_not_fall_back_to_rest(monkeypatch):
+    monkeypatch.setattr(subprocess_ops, "streaming_start", lambda **kwargs: _FakeWs())
+
+    def _stalled_receive(ws, task_id, should_abort=None):
+        raise WorkerStreamStalled("worker presumed unresponsive")
+
+    monkeypatch.setattr(subprocess_ops, "streaming_receive", _stalled_receive)
+    monkeypatch.setattr(
+        subprocess_ops,
+        "trigger_sample_operation",
+        lambda **kwargs: pytest.fail("REST fallback must not run after a successful WS submit"),
+    )
+
+    with pytest.raises(WorkerStreamStalled):
+        subprocess_ops.ExternalSampler(
+            lf=pl.LazyFrame({"a": [1]}),
+            node_id=1,
+            flow_id=1,
+            file_ref="t-sample-stall",
+            wait_on_completion=True,
+            worker_url=WORKER_URL,
+        )
+
+
+def test_generic_stream_error_still_falls_back_to_rest(monkeypatch):
+    """Connection-phase failures keep the original REST fallback behavior."""
+
+    def _no_ws(**kwargs):
+        raise ConnectionRefusedError("worker has no WS endpoint")
+
+    monkeypatch.setattr(subprocess_ops, "streaming_start", _no_ws)
+
+    def _rest_called(**kwargs):
+        raise RuntimeError("REST_CALLED")
+
+    monkeypatch.setattr(subprocess_ops, "trigger_df_operation", _rest_called)
+
+    with pytest.raises(RuntimeError, match="REST_CALLED"):
+        subprocess_ops.ExternalDfFetcher(
+            flow_id=1,
+            node_id=1,
+            lf=pl.LazyFrame({"a": [1]}),
+            file_ref="t-fallback",
+            wait_on_completion=True,
+            worker_url=WORKER_URL,
+        )
+
+
+def test_sampler_rest_fallback_without_file_ref_polls_its_own_task(monkeypatch):
+    """With no file_ref, the REST submit must carry the id the poll thread uses (real worker)."""
+
+    def _no_ws(**kwargs):
+        raise ConnectionRefusedError("worker has no WS endpoint")
+
+    monkeypatch.setattr(subprocess_ops, "streaming_start", _no_ws)
+
+    sampler = subprocess_ops.ExternalSampler(
+        lf=pl.LazyFrame({"a": list(range(10))}),
+        node_id=1,
+        flow_id=1,
+        file_ref=None,
+        sample_size=3,
+        worker_url=WORKER_URL,
+    )
+
+    assert not sampler.has_error, sampler.error_description
+    assert sampler.status.background_task_id == sampler.file_ref
+    assert pl.read_ipc(sampler.status.file_ref)["a"].to_list() == [0, 1, 2]
+
+
+def test_receive_thread_marks_stall_as_worker_unresponsive(monkeypatch):
+    """Non-blocking mode: a stall surfaces via get_result() with error_code -2.
+
+    -1 is reserved for "worker child died" (nodes degrade gracefully and
+    continue); -2 makes the node fail fast because the worker itself is gone.
+    """
+    monkeypatch.setattr(subprocess_ops, "streaming_start", lambda **kwargs: _FakeWs())
+
+    def _stalled_receive(ws, task_id, should_abort=None):
+        raise WorkerStreamStalled("worker presumed unresponsive")
+
+    monkeypatch.setattr(subprocess_ops, "streaming_receive", _stalled_receive)
+
+    fetcher = subprocess_ops.ExternalDfFetcher(
+        flow_id=1,
+        node_id=1,
+        lf=pl.LazyFrame({"a": [1]}),
+        file_ref="t-async-stall",
+        wait_on_completion=False,
+        worker_url=WORKER_URL,
+    )
+    with pytest.raises(Exception, match="unresponsive"):
+        fetcher.get_result()
+    assert fetcher.error_code == -2
+
+
+def test_connection_closed_during_cancel_raises_interrupted():
+    """cancel() closes the ws; with cancel intent flagged the resulting
+    ConnectionClosed must classify as an interrupt, not a worker death."""
+    ws = _FakeWs(script=[_closed_ok()])
+
+    with pytest.raises(WorkerStreamInterrupted, match="Canceled"):
+        _receive_raw_result(ws, "task-cancel-close", should_abort=lambda: True)
+
+
+def test_connection_closed_without_cancel_propagates():
+    """A worker-initiated close with no cancel in flight must keep its raw
+    exception so callers preserve the -1 degrade-gracefully semantics."""
+    with pytest.raises(ConnectionClosedOK):
+        _receive_raw_result(_FakeWs(script=[_closed_ok()]), "task-worker-close")
+
+    with pytest.raises(ConnectionClosedOK):
+        _receive_raw_result(_FakeWs(script=[_closed_ok()]), "task-worker-close-2", should_abort=lambda: False)
+
+
+class _CancellableFakeWs:
+    """Blocks in quiet poll ticks until close() flips it to ConnectionClosed —
+    mimics a real socket being closed by cancel() from another thread."""
+
+    def __init__(self):
+        self.closed = threading.Event()
+
+    def recv(self, timeout=None):
+        if self.closed.is_set():
+            raise _closed_ok()
+        time.sleep(0.01)
+        raise TimeoutError
+
+    def close(self):
+        self.closed.set()
+
+
+def test_cancel_mid_stream_classified_as_interrupted_not_worker_death(monkeypatch):
+    """Fetcher-level race through the REAL receive chain: cancel() must yield
+    error_code -2 (interrupted) rather than -1 (worker child died), which
+    downstream would mislabel as a memory kill and degrade gracefully."""
+    fake_ws = _CancellableFakeWs()
+    monkeypatch.setattr(subprocess_ops, "streaming_start", lambda **kwargs: fake_ws)
+    monkeypatch.setattr(subprocess_ops, "cancel_task", lambda *a, **k: None)
+
+    fetcher = subprocess_ops.ExternalDfFetcher(
+        flow_id=1,
+        node_id=1,
+        lf=pl.LazyFrame({"a": [1]}),
+        file_ref="t-cancel-race",
+        wait_on_completion=False,
+        worker_url=WORKER_URL,
+    )
+    time.sleep(0.05)
+    fetcher.cancel()
+
+    assert fetcher.error_code == -2, "user cancel must classify as interrupted (-2), not worker death (-1)"
+    with pytest.raises(Exception, match="Canceled"):
+        fetcher.get_result()
+
+
+def test_task_error_frame_raises_worker_task_error():
+    """An error frame marked status "Error" is the task's own failure, not a dead child."""
+    frame = '{"type": "error", "error_message": "ComputeError: cycle a -> b -> a", "status": "Error"}'
+    with pytest.raises(WorkerTaskError, match="a -> b -> a"):
+        _receive_raw_result(_FakeWs(script=[frame]), "task-failed")
+
+
+def test_unmarked_error_frame_keeps_degrade_semantics():
+    """Frames without the status (child died, older worker) must not become task errors."""
+    frame = '{"type": "error", "error_message": "Process ended unexpectedly"}'
+    with pytest.raises(Exception, match="Process ended unexpectedly") as exc_info:
+        _receive_raw_result(_FakeWs(script=[frame]), "task-died")
+    assert not isinstance(exc_info.value, WorkerTaskError)
+
+
+def test_receive_thread_marks_task_error_as_a_real_failure(monkeypatch):
+    """Non-blocking mode: a task error is error_code 1 like the REST path, never -1 (degrade)."""
+    monkeypatch.setattr(subprocess_ops, "streaming_start", lambda **kwargs: _FakeWs())
+
+    def _failed_receive(ws, task_id, should_abort=None):
+        raise WorkerTaskError("ComputeError: cycle a -> b -> a")
+
+    monkeypatch.setattr(subprocess_ops, "streaming_receive", _failed_receive)
+
+    fetcher = subprocess_ops.ExternalDfFetcher(
+        flow_id=1,
+        node_id=1,
+        lf=pl.LazyFrame({"a": [1]}),
+        file_ref="t-async-task-error",
+        wait_on_completion=False,
+        worker_url=WORKER_URL,
+    )
+    with pytest.raises(Exception, match="a -> b -> a"):
+        fetcher.get_result()
+    assert fetcher.error_code == 1
+
+
+def test_blocking_task_error_is_recorded_without_rest_resubmit(monkeypatch):
+    """Blocking mode: a task that ran and failed must not be re-submitted over REST."""
+    monkeypatch.setattr(subprocess_ops, "streaming_start", lambda **kwargs: _FakeWs())
+
+    def _failed_receive(ws, task_id, should_abort=None):
+        raise WorkerTaskError("ComputeError: cycle a -> b -> a")
+
+    monkeypatch.setattr(subprocess_ops, "streaming_receive", _failed_receive)
+    monkeypatch.setattr(
+        subprocess_ops,
+        "trigger_df_operation",
+        lambda **kwargs: pytest.fail("REST fallback must not run after the worker reported a task error"),
+    )
+
+    with pytest.raises(RemoteExecutionError, match="a -> b -> a"):
+        subprocess_ops.ExternalDfFetcher(
+            flow_id=1,
+            node_id=1,
+            lf=pl.LazyFrame({"a": [1]}),
+            file_ref="t-block-task-error",
+            wait_on_completion=True,
+            worker_url=WORKER_URL,
+        )
+
+
+def test_blocking_sampler_task_error_raises_without_rest_resubmit(monkeypatch):
+    """The sampler behind narrow nodes must raise too, or the node is marked successful."""
+    monkeypatch.setattr(subprocess_ops, "streaming_start", lambda **kwargs: _FakeWs())
+
+    def _failed_receive(ws, task_id, should_abort=None):
+        raise WorkerTaskError("InvalidOperationError: conversion from `str` to `i64` failed")
+
+    monkeypatch.setattr(subprocess_ops, "streaming_receive", _failed_receive)
+    monkeypatch.setattr(
+        subprocess_ops,
+        "trigger_sample_operation",
+        lambda **kwargs: pytest.fail("REST fallback must not run after the worker reported a task error"),
+    )
+
+    with pytest.raises(RemoteExecutionError, match="conversion from") as exc_info:
+        subprocess_ops.ExternalSampler(
+            lf=pl.LazyFrame({"a": [1]}),
+            node_id=1,
+            flow_id=1,
+            file_ref="t-sample-task-error",
+            wait_on_completion=True,
+            worker_url=WORKER_URL,
+        )
+    assert exc_info.value.original_class == "InvalidOperationError"
+
+
+def test_environment_error_frame_degrades_like_a_dead_child():
+    """error_kind "environment" (plan unloadable, result write failed, time limit) keeps code -1."""
+    frame = (
+        '{"type": "error", "error_message": "ModuleNotFoundError: No module named \'udfs\'",'
+        ' "status": "Error", "error_kind": "environment"}'
+    )
+    with pytest.raises(WorkerTaskError, match="udfs") as exc_info:
+        _receive_raw_result(_FakeWs(script=[frame]), "task-env")
+    assert exc_info.value.error_code == -1
+
+
+@pytest.mark.parametrize("kind", ["task", None])
+def test_task_or_unkinded_error_frame_fails_the_node(kind):
+    """A data failure, or an "Error" from a worker that sends no kind, keeps code 1."""
+    kind_field = f', "error_kind": "{kind}"' if kind else ""
+    frame = f'{{"type": "error", "error_message": "ComputeError: cycle", "status": "Error"{kind_field}}}'
+    with pytest.raises(WorkerTaskError) as exc_info:
+        _receive_raw_result(_FakeWs(script=[frame]), "task-data")
+    assert exc_info.value.error_code == 1
+
+
+def test_receive_thread_degrades_on_an_environment_failure(monkeypatch):
+    monkeypatch.setattr(subprocess_ops, "streaming_start", lambda **kwargs: _FakeWs())
+
+    def _failed_receive(ws, task_id, should_abort=None):
+        raise WorkerTaskError("ModuleNotFoundError: No module named 'udfs'", "environment")
+
+    monkeypatch.setattr(subprocess_ops, "streaming_receive", _failed_receive)
+
+    fetcher = subprocess_ops.ExternalDfFetcher(
+        flow_id=1,
+        node_id=1,
+        lf=pl.LazyFrame({"a": [1]}),
+        file_ref="t-async-env-error",
+        wait_on_completion=False,
+        worker_url=WORKER_URL,
+    )
+    with pytest.raises(Exception, match="udfs"):
+        fetcher.get_result()
+    assert fetcher.error_code == -1
+
+
+def test_blocking_environment_failure_raises_without_rest_resubmit(monkeypatch):
+    monkeypatch.setattr(subprocess_ops, "streaming_start", lambda **kwargs: _FakeWs())
+
+    def _failed_receive(ws, task_id, should_abort=None):
+        raise WorkerTaskError("Task exceeded the 3600s time limit and was terminated", "environment")
+
+    monkeypatch.setattr(subprocess_ops, "streaming_receive", _failed_receive)
+    monkeypatch.setattr(
+        subprocess_ops,
+        "trigger_df_operation",
+        lambda **kwargs: pytest.fail("a task the worker already ran must not be re-submitted over REST"),
+    )
+
+    with pytest.raises(RemoteExecutionError, match="time limit"):
+        subprocess_ops.ExternalDfFetcher(
+            flow_id=1,
+            node_id=1,
+            lf=pl.LazyFrame({"a": [1]}),
+            file_ref="t-block-env-error",
+            wait_on_completion=True,
+            worker_url=WORKER_URL,
+        )
+
+
+def _run_receive_thread_failing_with(monkeypatch, caplog, error: Exception, file_ref: str):
+    """Fail the non-blocking receive thread with *error* and return the records it logged."""
+    import logging
+
+    monkeypatch.setattr(subprocess_ops, "streaming_start", lambda **kwargs: _FakeWs())
+
+    def _failed_receive(ws, task_id, should_abort=None):
+        raise error
+
+    monkeypatch.setattr(subprocess_ops, "streaming_receive", _failed_receive)
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger=subprocess_ops.logger.name):
+        fetcher = subprocess_ops.ExternalDfFetcher(
+            flow_id=1,
+            node_id=1,
+            lf=pl.LazyFrame({"a": [1]}),
+            file_ref=file_ref,
+            wait_on_completion=False,
+            worker_url=WORKER_URL,
+        )
+        with pytest.raises(RemoteExecutionError):
+            fetcher.get_result()
+    return [r for r in caplog.records if r.name == subprocess_ops.logger.name]
+
+
+@pytest.mark.parametrize("kind", ["task", "environment", None])
+def test_receive_thread_logs_worker_task_failure_as_warning_without_traceback(monkeypatch, caplog, kind):
+    """A failure the worker classified is expected (a data cycle, a bad cast): no ERROR, no stack trace."""
+    import logging
+
+    records = _run_receive_thread_failing_with(
+        monkeypatch, caplog, WorkerTaskError("ComputeError: cycle a -> b -> a", kind), f"t-log-task-{kind}"
+    )
+    assert records, "the task failure should still be logged"
+    assert all(r.levelno < logging.ERROR for r in records)
+    assert all(r.exc_info is None for r in records)
+    assert any(r.levelno == logging.WARNING and "a -> b -> a" in r.getMessage() for r in records)
+
+
+def test_receive_thread_logs_unexpected_error_with_traceback(monkeypatch, caplog):
+    """Transport, protocol or core bugs are not task failures and keep the full exception log."""
+    import logging
+
+    records = _run_receive_thread_failing_with(
+        monkeypatch, caplog, RuntimeError("unexpected frame"), "t-log-unexpected"
+    )
+    assert any(r.levelno == logging.ERROR and r.exc_info is not None for r in records)
+
+
+@pytest.fixture
+def core_only_udf_plan(tmp_path, monkeypatch) -> pl.LazyFrame:
+    """A plan whose UDF lives in a module only this (core) process can import, as with separate images."""
+    module_name = f"core_only_udf_{tmp_path.name.replace('-', '_')}"
+    (tmp_path / f"{module_name}.py").write_text("def plus_one(s):\n    return s + 1\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    module = __import__(module_name)
+    return pl.LazyFrame({"a": [1, 2]}).select(pl.col("a").map_batches(module.plus_one, return_dtype=pl.Int64))
+
+
+def _force_rest(monkeypatch):
+    def _no_websocket(**kwargs):
+        raise ConnectionRefusedError("websocket disabled for this test")
+
+    monkeypatch.setattr(subprocess_ops, "streaming_start", _no_websocket)
+
+
+@pytest.mark.parametrize("transport", ["websocket", "rest"])
+def test_real_worker_that_cannot_load_the_plan_degrades(running_worker, core_only_udf_plan, transport, monkeypatch):
+    """The worker can't import the plan's UDF: error code -1, so the node continues in core."""
+    if transport == "rest":
+        _force_rest(monkeypatch)
+    fetcher = subprocess_ops.ExternalDfFetcher(
+        flow_id=1,
+        node_id=1,
+        lf=core_only_udf_plan,
+        file_ref=f"t-real-env-{transport}-{time.monotonic_ns()}",
+        wait_on_completion=False,
+        worker_url=WORKER_URL,
+    )
+    with pytest.raises(RemoteExecutionError, match="core_only_udf"):
+        fetcher.get_result()
+    assert fetcher.error_code == -1
+
+
+@pytest.mark.parametrize("transport", ["websocket", "rest"])
+def test_real_worker_data_failure_fails_the_node(running_worker, transport, monkeypatch):
+    """The plan loads but fails on its data: error code 1, a real node error."""
+    if transport == "rest":
+        _force_rest(monkeypatch)
+    fetcher = subprocess_ops.ExternalDfFetcher(
+        flow_id=1,
+        node_id=1,
+        lf=pl.LazyFrame({"a": ["abc"]}).with_columns(pl.col("a").cast(pl.Int64)),
+        file_ref=f"t-real-data-{transport}-{time.monotonic_ns()}",
+        wait_on_completion=False,
+        worker_url=WORKER_URL,
+    )
+    with pytest.raises(RemoteExecutionError, match="InvalidOperationError"):
+        fetcher.get_result()
+    assert fetcher.error_code == 1

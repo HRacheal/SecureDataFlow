@@ -1,0 +1,93 @@
+<template>
+  <div class="compute-view">
+    <SettingsTabBar
+      v-if="visibleTabs.length > 1"
+      :tabs="visibleTabs"
+      :active-tab="activeTab"
+      @select="handleTabClick($event as ComputeTabKey)"
+    />
+
+    <div class="compute-content">
+      <KernelManagerView v-if="activeTab === 'kernels'" />
+      <ComputeBackendsPanel v-else-if="activeTab === 'backends'" />
+      <PrivacyPanel v-else-if="activeTab === 'privacy'" />
+      <BackupsPanel v-else-if="activeTab === 'backups'" />
+    </div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { computed, onMounted, ref, watch } from "vue";
+import { useRoute, useRouter } from "vue-router";
+import SettingsTabBar from "../../components/settings/SettingsTabBar.vue";
+import KernelManagerView from "../KernelManagerView/KernelManagerView.vue";
+import ComputeBackendsPanel from "./ComputeBackendsPanel.vue";
+import PrivacyPanel from "./PrivacyPanel.vue";
+import BackupsPanel from "./BackupsPanel.vue";
+import { computeTabs, COMPUTE_TAB_GROUP_LABELS, resolveComputeTab } from "./computeTabs";
+import type { ComputeTabKey } from "./computeTabs";
+import { useAuthStore } from "../../stores/auth-store";
+
+const route = useRoute();
+const router = useRouter();
+const authStore = useAuthStore();
+
+// Captions derive from the visible list: hiding an admin tab must not strand one.
+const visibleTabs = computed(() => {
+  const shown = computeTabs.filter((t) => !t.requiresAdmin || authStore.isAdmin);
+  return shown.map((tab, i) => ({
+    key: tab.key,
+    label: tab.label,
+    icon: tab.icon,
+    groupStart: i > 0 && tab.group !== shown[i - 1].group,
+    groupLabel:
+      i === 0 || tab.group !== shown[i - 1].group ? COMPUTE_TAB_GROUP_LABELS[tab.group] : null,
+  }));
+});
+
+function getInitialTab(): ComputeTabKey {
+  // No localStorage stickiness: kernels is the right default every time, and
+  // Backends is a rarely-visited admin setting.
+  return resolveComputeTab(route.query.tab) ?? "kernels";
+}
+
+const activeTab = ref<ComputeTabKey>(getInitialTab());
+
+onMounted(() => {
+  router.replace({ query: { ...route.query, tab: activeTab.value } });
+});
+
+function handleTabClick(tab: ComputeTabKey) {
+  activeTab.value = tab;
+  router.replace({ query: { ...route.query, tab } });
+}
+
+// React to external navigation that changes ?tab= (the sidebar sub-menu), so the
+// active tab follows the URL even when the view is already mounted. Validated
+// against ALL tab keys, not visibleTabs: a non-admin deep link to
+// ?tab=backends renders the panel's locked explainer instead of silently
+// bouncing. A retired alias is rewritten to the tab it names.
+watch(
+  () => route.query.tab,
+  (tab) => {
+    const resolved = resolveComputeTab(tab);
+    if (resolved === null) return;
+    if (resolved !== activeTab.value) activeTab.value = resolved;
+    if (resolved !== tab) router.replace({ query: { ...route.query, tab: resolved } });
+  },
+);
+</script>
+
+<style scoped>
+.compute-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+/* No padding here: both panels bring their own centered max-width container. */
+.compute-content {
+  flex: 1;
+  overflow: auto;
+}
+</style>

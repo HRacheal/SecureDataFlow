@@ -1,0 +1,402 @@
+# jwt.py
+
+import logging
+import os
+import secrets
+import threading
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import jwt
+from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from jwt import PyJWTError as JWTError
+from sqlalchemy.orm import Session
+
+from flowfile_core.auth.models import TokenData, User
+from flowfile_core.auth.secrets import get_password, set_password
+from flowfile_core.configs.settings import ACCESS_TOKEN_EXPIRE_MINUTES
+from flowfile_core.database import models as db_models
+from flowfile_core.database.connection import get_db
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+# Constants for JWT
+ALGORITHM = "HS256"
+REFRESH_TOKEN_EXPIRE_DAYS = 7
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/token", auto_error=False)
+
+# Internal service authentication
+# This token is shared between Core and Kernel for service-to-service auth
+_internal_token: str | None = None
+
+
+_LOCK_STALE_SECONDS = 5.0
+_LOCK_WAIT_SECONDS = 6.0
+_LOCK_POLL_SECONDS = 0.05
+
+
+def _token_lock_path() -> Path:
+    from flowfile_core.auth import secrets as secrets_module
+
+    return Path(secrets_module._storage.storage_path) / ".internal_token.lock"
+
+
+def _read_or_mint_token() -> str:
+    """The critical section: adopt a persisted token, else mint and persist one."""
+    token = get_password("flowfile", "internal_token")
+    if token:
+        return token
+    token = secrets.token_hex(32)
+    set_password("flowfile", "internal_token", token)
+    return get_password("flowfile", "internal_token") or token
+
+
+def _break_stale_token_lock(lock_path: Path) -> None:
+    """Drop a lock whose holder died mid-mint."""
+    try:
+        if time.time() - os.path.getmtime(lock_path) > _LOCK_STALE_SECONDS:
+            os.unlink(lock_path)
+    except OSError:
+        pass
+
+
+def _load_or_create_persisted_token() -> str:
+    """Read the persisted internal token, minting and storing one if absent.
+
+    Serialised across processes by an O_CREAT|O_EXCL lock file beside the store,
+    so two processes that both start with an empty store cannot each mint: the
+    loser waits for the winner's write and adopts it. A re-read alone does not
+    converge — the loser can write after the winner has already re-read, leaving
+    the winner on a token the store no longer holds for the rest of its uptime.
+
+    Never raises: any failure in the lock machinery falls back to the unguarded
+    read-mint-persist, which is last-writer-wins but still yields a usable token.
+    """
+    token = get_password("flowfile", "internal_token")
+    if token:
+        return token
+
+    try:
+        lock_path = _token_lock_path()
+        deadline = time.monotonic() + _LOCK_WAIT_SECONDS
+        while True:
+            try:
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            except FileExistsError:
+                pass
+            else:
+                os.close(fd)
+                try:
+                    return _read_or_mint_token()
+                finally:
+                    try:
+                        os.unlink(lock_path)
+                    except OSError:
+                        pass
+
+            token = get_password("flowfile", "internal_token")
+            if token:
+                return token
+            _break_stale_token_lock(lock_path)
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(_LOCK_POLL_SECONDS)
+    except Exception as exc:
+        logger.debug(f"Internal-token lock unavailable, falling back to unguarded mint: {exc}")
+
+    return _read_or_mint_token()
+
+
+def get_internal_token() -> str:
+    """Get the internal service token used for kernel → Core auth.
+
+    In Docker mode the token MUST be set via the
+    ``FLOWFILE_INTERNAL_TOKEN`` environment variable (configured in
+    docker-compose.yml, same pattern as ``JWT_SECRET_KEY``).
+
+    In Electron mode it is generated once and persisted through SecureStorage
+    (same pattern as ``get_jwt_secret``) so that CLI subprocesses spawned for
+    manual and scheduled runs agree with the long-lived server instead of each
+    minting a private token. There is no rotation path: delete the
+    ``internal_token`` entry from the store and restart to mint a new one.
+    """
+    global _internal_token
+    if _internal_token is None:
+        _internal_token = os.environ.get("FLOWFILE_INTERNAL_TOKEN")
+        if not _internal_token:
+            if os.environ.get("FLOWFILE_MODE") == "electron":
+                _internal_token = _load_or_create_persisted_token()
+                os.environ["FLOWFILE_INTERNAL_TOKEN"] = _internal_token
+            else:
+                raise ValueError(
+                    "FLOWFILE_INTERNAL_TOKEN environment variable must be set in Docker mode. "
+                    "Add it to docker-compose.yml alongside JWT_SECRET_KEY."
+                )
+    return _internal_token
+
+
+def verify_internal_token(token: str) -> bool:
+    """Verify an internal service token."""
+    return secrets.compare_digest(token, get_internal_token())
+
+
+def internal_token_valid(token: str | None) -> bool:
+    """True only when ``token`` is present and matches; False when core has no token configured."""
+    try:
+        return bool(token) and verify_internal_token(token)
+    except ValueError:
+        return False
+
+
+def require_internal_token(x_internal_token: str | None = Header(None, alias="X-Internal-Token")) -> None:
+    """Admit only the worker and kernels, which sign their core callbacks with the internal token.
+
+    Fails closed (401) when the header is missing or wrong, and when core has no token configured.
+    """
+    if not internal_token_valid(x_internal_token):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing internal token")
+
+
+def get_jwt_secret():
+    if os.environ.get("FLOWFILE_MODE") == "electron":
+        key = get_password("flowfile", "jwt_secret")
+        if not key:
+            key = secrets.token_hex(32)
+            set_password("flowfile", "jwt_secret", key)
+        return key
+    else:
+        key = os.environ.get("JWT_SECRET_KEY")
+        if not key:
+            raise Exception("JWT_SECRET_KEY environment variable must be set in Docker mode")
+        return key
+
+
+def get_current_user_sync(token: str, db: Session):
+    """Synchronous version of get_current_user for non-FastAPI contexts"""
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+    if not token:
+        raise credentials_exception
+
+    try:
+        payload = jwt.decode(token, get_jwt_secret(), algorithms=[ALGORITHM])
+        # Reject refresh tokens used as access tokens
+        if payload.get("type") == "refresh":
+            raise credentials_exception
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+        token_data = TokenData(username=username)
+    except JWTError:
+        raise credentials_exception from None
+
+    return _resolve_token_user(db, token_data.username, credentials_exception)
+
+
+USER_CACHE_TTL_SECONDS = 60
+
+_user_cache: dict[str, tuple[float, User]] = {}
+_user_cache_lock = threading.Lock()
+
+
+def invalidate_user_cache(username: str | None = None) -> None:
+    """Drop cached lookups for *username* (all when ``None``).
+
+    Call after any user-row mutation. Keyed by username, so a rename must pass the old name.
+    """
+    with _user_cache_lock:
+        if username is None:
+            _user_cache.clear()
+        else:
+            _user_cache.pop(username, None)
+
+
+def _resolve_token_user(db: Session, username: str, credentials_exception: HTTPException) -> User:
+    """Token subject → ``User``.
+
+    Cached per process for ``USER_CACHE_TTL_SECONDS`` so a page-load fan-out needs no DB
+    connections for auth; misses are not cached.
+    """
+    if os.environ.get("FLOWFILE_MODE") == "electron":
+        if username == "local_user":
+            return User(username="local_user", id=1, disabled=False, is_admin=True, must_change_password=False)
+        raise credentials_exception
+
+    now = time.monotonic()
+    with _user_cache_lock:
+        cached = _user_cache.get(username)
+    if cached is not None and cached[0] > now:
+        user = cached[1]
+    else:
+        row = db.query(db_models.User).filter(db_models.User.username == username).first()
+        if row is None:
+            raise credentials_exception
+        user = User(
+            username=row.username,
+            id=row.id,
+            email=row.email,
+            full_name=row.full_name,
+            disabled=row.disabled,
+            is_admin=row.is_admin,
+            must_change_password=row.must_change_password,
+        )
+        with _user_cache_lock:
+            _user_cache[username] = (now + USER_CACHE_TTL_SECONDS, user)
+    if user.disabled:
+        raise HTTPException(status_code=400, detail="Inactive user")
+    return user.model_copy()
+
+
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    """Sync on purpose: a pool wait must land on the threadpool, not the event loop."""
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+    if not token:
+        raise credentials_exception
+
+    try:
+        payload = jwt.decode(token, get_jwt_secret(), algorithms=[ALGORITHM])
+        # Reject refresh tokens used as access tokens
+        if payload.get("type") == "refresh":
+            raise credentials_exception
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+        token_data = TokenData(username=username)
+    except JWTError:
+        raise credentials_exception from None
+
+    return _resolve_token_user(db, token_data.username, credentials_exception)
+
+
+def get_current_active_user(current_user=Depends(get_current_user)):
+    if hasattr(current_user, "disabled") and current_user.disabled:
+        raise HTTPException(status_code=400, detail="Inactive user")
+    return current_user
+
+
+def create_access_token(data: dict, expires_delta: timedelta | None = None):
+    to_encode = data.copy()
+
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+
+    to_encode.update({"exp": expire, "type": "access"})
+    encoded_jwt = jwt.encode(to_encode, get_jwt_secret(), algorithm=ALGORITHM)
+    return encoded_jwt
+
+
+def create_refresh_token(data: dict) -> str:
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    to_encode.update({"exp": expire, "type": "refresh"})
+    return jwt.encode(to_encode, get_jwt_secret(), algorithm=ALGORITHM)
+
+
+def decode_refresh_token(token: str) -> str:
+    """Decode a refresh token and return the username.
+
+    Raises HTTPException(401) if the token is invalid, expired, or not a refresh token.
+    """
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid refresh token",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, get_jwt_secret(), algorithms=[ALGORITHM])
+        if payload.get("type") != "refresh":
+            raise credentials_exception
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+        return username
+    except JWTError:
+        raise credentials_exception from None
+
+
+async def get_current_admin_user(current_user: User = Depends(get_current_user)):
+    """Dependency that requires the current user to be an admin"""
+    if not current_user.is_admin:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin privileges required")
+    return current_user
+
+
+def get_user_or_internal_service(
+    token: str = Depends(oauth2_scheme),
+    x_internal_token: str | None = Header(None, alias="X-Internal-Token"),
+    x_kernel_id: str | None = Header(None, alias="X-Kernel-Id"),
+    db: Session = Depends(get_db),
+) -> User:
+    """Auth dependency that accepts either JWT or internal service token.
+
+    Used for endpoints that need to be accessible from both:
+    - External clients (using JWT authentication)
+    - Internal services like kernel (using X-Internal-Token + X-Kernel-Id)
+
+    When the internal token authenticates and X-Kernel-Id is provided, returns
+    the kernel's actual owner so artifact / catalog ownership lands on the
+    right user in multi-user deployments. Falls back to a synthetic
+    ``_internal_service`` user when no kernel id is supplied (legacy callers).
+    """
+    if x_internal_token:
+        try:
+            if verify_internal_token(x_internal_token):
+                # When the kernel identifies itself, route ownership to the
+                # kernel's actual owner. The X-Kernel-Id header is not a secret:
+                # the internal token gates access, and the kernel container is
+                # started by Core with this id baked in as an env var.
+                if x_kernel_id:
+                    kernel_row = (
+                        db.query(db_models.Kernel)
+                        .filter(db_models.Kernel.id == x_kernel_id)
+                        .first()
+                    )
+                    if kernel_row is not None:
+                        owner = (
+                            db.query(db_models.User)
+                            .filter(db_models.User.id == kernel_row.user_id)
+                            .first()
+                        )
+                        if owner is not None and not owner.disabled:
+                            return User(
+                                username=owner.username,
+                                id=owner.id,
+                                email=owner.email,
+                                full_name=owner.full_name,
+                                disabled=owner.disabled,
+                                is_admin=owner.is_admin,
+                                must_change_password=owner.must_change_password,
+                            )
+
+                # Fall through to synthetic service user. ID is configurable
+                # via FLOWFILE_INTERNAL_SERVICE_USER_ID; default 1 (typically
+                # the first/admin user).
+                service_user_id = int(os.environ.get("FLOWFILE_INTERNAL_SERVICE_USER_ID", "1"))
+                return User(
+                    username="_internal_service",
+                    id=service_user_id,
+                    disabled=False,
+                    is_admin=False,
+                    must_change_password=False,
+                )
+        except ValueError:
+            # Token not configured or invalid user ID - fall through to JWT auth
+            pass
+
+    return get_current_user(token=token, db=db)

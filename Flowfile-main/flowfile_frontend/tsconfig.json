@@ -1,0 +1,41 @@
+{
+  "compilerOptions": {
+    "noEmit": true,
+    "target": "esnext",
+    "useDefineForClassFields": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "jsx": "preserve",
+    "sourceMap": true,
+    "resolveJsonModule": true,
+    "esModuleInterop": true,
+    "lib": ["esnext", "dom"],
+    "skipLibCheck": true,
+    "types": ["vite/client", "node"],
+    "allowJs": true,
+    "paths": {
+      "@/*": ["./src/renderer/app/*"],
+      "@/api": ["./src/renderer/app/api"],
+      "@/api/*": ["./src/renderer/app/api/*"],
+      "@/types": ["./src/renderer/app/types"],
+      "@/types/*": ["./src/renderer/app/types/*"],
+      "@/stores": ["./src/renderer/app/stores"],
+      "@/stores/*": ["./src/renderer/app/stores/*"],
+      "@/composables": ["./src/renderer/app/composables"],
+      "@/composables/*": ["./src/renderer/app/composables/*"]
+    },
+    "typeRoots": ["./node_modules/@types", "./types"]
+  },
+  "include": [
+    "src/**/*.ts",
+    "src/**/*.d.ts",
+    "src/**/*.vue",
+    "vite.config.ts",
+    "src/router/index.ts",
+    "types/**/*.d.ts",
+    "electron.d.ts"
+  ],
+
+  "exclude": ["node_modules/**/*", "**/*.tsx", "**/*.jsx", "dist-electron/**/*"]
+}

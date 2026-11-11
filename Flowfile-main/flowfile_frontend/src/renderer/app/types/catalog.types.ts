@@ -1,0 +1,750 @@
+// Catalog TypeScript interfaces
+// Maps to backend schemas in catalog_schema.py
+import type { AccessInfo } from "./sharing.types";
+import type { NotebookSummary } from "../api/notebook.api";
+import type { FlowParameter } from "./flow.types";
+
+// Namespace (Unity Catalog-style hierarchy)
+
+export interface CatalogNamespace {
+  id: number;
+  name: string;
+  parent_id: number | null;
+  level: number; // 0=catalog, 1=schema
+  description: string | null;
+  owner_id: number;
+  created_at: string;
+  updated_at: string;
+  // Per-catalog object storage (level 0 only; schemas inherit). null ⇒ local filesystem.
+  storage_uri?: string | null;
+  storage_connection_name?: string | null;
+  access?: AccessInfo | null;
+}
+
+export interface NamespaceTree extends CatalogNamespace {
+  children: NamespaceTree[];
+  flows: FlowRegistration[];
+  artifacts: GlobalArtifact[];
+  tables: CatalogTable[];
+  visualizations: CatalogVisualization[];
+  notebooks: NotebookSummary[];
+}
+
+// System-managed schemas under "General" that users never pick as a store target.
+export const SYSTEM_NAMESPACE_NAMES = new Set([
+  "Unnamed Flows",
+  "Local Flows",
+  "Python Editor",
+  "sync",
+]);
+
+// The subset whose rows accrete automatically (quick-create / FlowFrame API) and
+// get a bulk "clean up" action; the cleanup route enforces the same set server-side.
+export const SCRATCH_NAMESPACE_NAMES = new Set(["Unnamed Flows", "Python Editor"]);
+
+// Shallow copy of the tree with system schemas removed from the "General" root.
+// Scoped to "General" so a user-created schema sharing a name elsewhere is kept.
+export function filterSelectableNamespaces(tree: NamespaceTree[]): NamespaceTree[] {
+  return tree.map((node) =>
+    node.name === "General" && node.parent_id === null
+      ? { ...node, children: node.children.filter((c) => !SYSTEM_NAMESPACE_NAMES.has(c.name)) }
+      : node,
+  );
+}
+
+// Ancestry names from root to the namespace with the given id (e.g.
+// ["General", "default"]), or [] when the id isn't in the tree.
+export function findNamespacePath(nodes: NamespaceTree[], id: number): string[] {
+  for (const node of nodes) {
+    if (node.id === id) return [node.name];
+    const childPath = findNamespacePath(node.children, id);
+    if (childPath.length) return [node.name, ...childPath];
+  }
+  return [];
+}
+
+/**
+ * Default save-target namespace for catalog registration pickers: prefer
+ * ``General > Local Flows`` (the home for disk-backed flows), falling back to
+ * ``General > default``. Note that trees passed through
+ * ``filterSelectableNamespaces`` no longer contain "Local Flows", so those
+ * callers land on "default". ``isSelectable`` lets save-target pickers skip
+ * read-only namespaces.
+ */
+export function findDefaultSaveNamespace(
+  nodes: NamespaceTree[],
+  isSelectable: (node: NamespaceTree) => boolean = () => true,
+): NamespaceTree | null {
+  for (const node of nodes) {
+    if (node.name === "General" && node.parent_id === null) {
+      const local = node.children.find((c) => c.name === "Local Flows");
+      if (local && isSelectable(local)) return local;
+      const fallback = node.children.find((c) => c.name === "default");
+      if (fallback && isSelectable(fallback)) return fallback;
+    }
+  }
+  return null;
+}
+
+export interface NamespaceCreate {
+  name: string;
+  parent_id?: number | null;
+  description?: string | null;
+  // Object storage for a new catalog (level 0 only); set both together or neither.
+  storage_uri?: string | null;
+  storage_connection_name?: string | null;
+}
+
+export interface NamespaceUpdate {
+  name?: string;
+  description?: string;
+  // Catalog-level only; sent only to change them, and core refuses once a table is stored
+  storage_uri?: string | null;
+  storage_connection_name?: string | null;
+}
+
+// Flow Registration
+
+export interface FlowRegistration {
+  id: number;
+  name: string;
+  description: string | null;
+  flow_path: string;
+  namespace_id: number | null;
+  owner_id: number;
+  created_at: string;
+  updated_at: string;
+  is_favorite: boolean;
+  is_following: boolean;
+  run_count: number;
+  last_run_at: string | null;
+  last_run_success: boolean | null;
+  file_exists: boolean;
+  is_api_compatible: boolean;
+  artifact_count: number;
+  tables_produced: CatalogTableSummary[];
+  tables_read: CatalogTableSummary[];
+  access?: AccessInfo | null;
+}
+
+export type FlowCodeFormat = "yaml" | "notebook" | "flowframe" | "polars";
+
+/** A registered flow as text; `content` is null when the file is gone or `error` says why. */
+export interface FlowCode {
+  registration_id: number;
+  format: FlowCodeFormat;
+  content: string | null;
+  file_exists: boolean;
+  error: string | null;
+}
+
+export interface FlowRegistrationCreate {
+  name: string;
+  description?: string | null;
+  flow_path: string;
+  namespace_id?: number | null;
+}
+
+export interface FlowRegistrationUpdate {
+  name?: string;
+  description?: string;
+  namespace_id?: number | null;
+}
+
+// Subflow Interface (flows-in-flows)
+
+export interface SubflowIOPort {
+  name: string;
+  node_id: number;
+}
+
+export type SubflowParameterSpec = FlowParameter;
+
+export interface SubflowInterface {
+  registration_id: number;
+  inputs: SubflowIOPort[];
+  outputs: SubflowIOPort[];
+  parameters: SubflowParameterSpec[];
+  file_exists: boolean;
+}
+
+// Flow Run
+
+export interface FlowRun {
+  id: number;
+  registration_id: number | null;
+  flow_name: string;
+  flow_path: string | null;
+  user_id: number;
+  started_at: string;
+  ended_at: string | null;
+  success: boolean | null;
+  nodes_completed: number;
+  number_of_nodes: number;
+  duration_seconds: number | null;
+  run_type: "in_designer_run" | "scheduled" | "manual" | "on_demand";
+  schedule_id: number | null;
+  has_snapshot: boolean;
+  has_log: boolean;
+}
+
+export interface PaginatedFlowRuns {
+  items: FlowRun[];
+  total: number;
+  total_success: number;
+  total_failed: number;
+  total_running: number;
+}
+
+export interface FlowRunDetail extends FlowRun {
+  flow_snapshot: string | null;
+  node_results_json: string | null;
+}
+
+// Global Artifact
+
+/** A global artifact stored in the catalog. */
+export interface GlobalArtifact {
+  id: number;
+  name: string;
+  version: number;
+  status: string; // "active" | "deleted"
+  description: string | null;
+  python_type: string | null;
+  python_module: string | null;
+  serialization_format: string | null; // "pickle" | "joblib" | "parquet"
+  size_bytes: number | null;
+  sha256: string | null;
+  tags: string[];
+  namespace_id: number | null;
+  source_registration_id: number | null;
+  source_flow_id: number | null;
+  source_node_id: number | null;
+  owner_id: number | null;
+  created_at: string | null;
+  updated_at: string | null;
+  blob_exists: boolean;
+  // Number of versions in this artifact's family. The tree returns one row per
+  // (name, namespace) so the row count can no longer stand in for it.
+  version_count?: number | null;
+  access?: AccessInfo | null;
+}
+
+/** One row of an artifact's version history (GET /artifacts/by-name/{ref}/versions). */
+export interface ArtifactVersionInfo {
+  id: number;
+  version: number;
+  created_at: string;
+  size_bytes: number | null;
+  sha256: string | null;
+  python_type: string | null;
+  blob_exists: boolean;
+}
+
+/** Paginated version history: `all_versions` is one page, `total_versions` the count. */
+export interface ArtifactWithVersions {
+  id: number;
+  name: string;
+  namespace_id: number | null;
+  version: number;
+  status: string;
+  all_versions: ArtifactVersionInfo[];
+  total_versions: number;
+}
+
+/** Row minted by POST /artifacts/{id}/promote (backend ArtifactOut). */
+export interface PromotedArtifactVersion {
+  id: number;
+  name: string;
+  namespace_id: number | null;
+  version: number;
+  status: string;
+}
+
+export interface ArtifactPruneCandidate {
+  id: number;
+  version: number;
+  size_bytes: number | null;
+}
+
+export interface ArtifactPruneResult {
+  would_delete: ArtifactPruneCandidate[];
+  freed_bytes: number;
+  deleted: number;
+}
+
+// Catalog Table
+
+export interface ColumnSchema {
+  name: string;
+  dtype: string;
+}
+
+export interface CatalogTableSummary {
+  id: number;
+  name: string;
+  namespace_id: number | null;
+}
+
+export interface FlowSummary {
+  id: number;
+  name: string;
+}
+
+export interface Scd2TableConfig {
+  business_keys: string[];
+  surrogate_key_column: string;
+  valid_from_column: string;
+  valid_to_column: string;
+  is_current_column: string;
+  compare_columns: string[];
+  full_snapshot: boolean;
+}
+
+export interface CatalogTable {
+  id: number;
+  name: string;
+  namespace_id: number | null;
+  namespace_name: string | null;
+  full_table_name: string | null;
+  // Fully-qualified catalog.schema.table (full_table_name is only 2-part schema.table).
+  qualified_name: string | null;
+  description: string | null;
+  owner_id: number;
+  file_exists: boolean;
+  // True when the table's data lives in object storage; preview/history load on demand.
+  is_remote_storage: boolean;
+  is_favorite: boolean;
+  schema_columns: ColumnSchema[];
+  row_count: number | null;
+  column_count: number | null;
+  size_bytes: number | null;
+  source_registration_id: number | null;
+  source_registration_name: string | null;
+  source_run_id: number | null;
+  // Points at a sibling catalog table holding model predictions for this table.
+  prediction_table_id: number | null;
+  prediction_table_name: string | null;
+  read_by_flows: FlowSummary[];
+  table_type: "physical" | "virtual";
+  producer_registration_id: number | null;
+  producer_registration_name: string | null;
+  is_optimized: boolean | null;
+  laziness_blockers: string[] | null;
+  sql_query: string | null;
+  polars_plan: string | null;
+  source_table_versions: string | null;
+  partition_columns: string[] | null;
+  // Set only for tables maintained by an SCD2 write; null for every other table.
+  scd2: Scd2TableConfig | null;
+  cdc_enabled: boolean;
+  // Delta commit version at which change tracking was enabled — the cursor floor.
+  cdc_enabled_version: number | null;
+  created_at: string;
+  updated_at: string;
+  access?: AccessInfo | null;
+}
+
+export interface OptimizeTableRequest {
+  z_order_columns?: string[] | null;
+}
+
+export interface OptimizeTableResponse {
+  metrics: Record<string, unknown>;
+  size_bytes: number | null;
+}
+
+export interface VacuumTableRequest {
+  retention_hours: number;
+  dry_run: boolean;
+  // Overrides the CDC_CURSORS_AT_RISK refusal.
+  force?: boolean;
+}
+
+// Change tracking (Delta change data feed)
+
+export interface CdcCursor {
+  consumer_key: string;
+  consumer_label: string | null;
+  owner_id: number | null;
+  last_version: number;
+  last_commit_timestamp: string | null;
+  table_path?: string | null;
+  // current_version - last_version; null when the live head could not be read.
+  pending_commits: number | null;
+  updated_at: string;
+}
+
+export interface TableCdcStatus {
+  cdc_enabled: boolean;
+  cdc_enabled_version: number | null;
+  current_version: number | null;
+  cursors: CdcCursor[];
+}
+
+export type CdcCursorResetTarget = "now" | "beginning" | number;
+
+export interface CdcCursorResetRequest {
+  consumer_key: string;
+  to: CdcCursorResetTarget;
+}
+
+/** Body of the 409 a vacuum returns when it would strand change-feed cursors. */
+export interface CdcCursorsAtRiskDetail {
+  error_code: "CDC_CURSORS_AT_RISK";
+  message?: string | null;
+  cursors?: CdcCursor[];
+}
+
+export interface VacuumTableResponse {
+  dry_run: boolean;
+  files_removed: string[];
+  file_count: number;
+  size_bytes: number | null;
+}
+
+// Table Edits (catalog edit surface)
+
+export type NewColumnDtype = "String" | "Int64" | "Float64" | "Boolean" | "Date" | "Datetime";
+
+export interface NewColumnSpec {
+  name: string;
+  dtype: NewColumnDtype;
+}
+
+export interface CatalogTableEditsRequest {
+  key_columns: string[];
+  expected_version?: number | null;
+  upsert_columns?: string[] | null;
+  upsert_rows?: unknown[][] | null;
+  new_columns?: NewColumnSpec[];
+  delete_keys?: unknown[][] | null;
+}
+
+export interface CatalogTableEditsResponse {
+  table: CatalogTable;
+  rows_upserted: number;
+  rows_deleted: number;
+  new_version: number | null;
+}
+
+export interface CatalogTableKeyColumnRequest {
+  column_name?: string;
+  expected_version?: number | null;
+}
+
+export interface CatalogTableKeyColumnResponse {
+  table: CatalogTable;
+  column_name: string;
+  new_version: number | null;
+}
+
+/** Structured detail of the 409 the edits endpoint returns when the table moved. */
+export interface StaleWriteDetail {
+  error: "stale_write";
+  resource_type: string;
+  resource_id: number;
+  expected: number | null;
+  current: number | null;
+  message: string;
+}
+
+export interface CatalogTableCreate {
+  name: string;
+  file_path: string;
+  namespace_id?: number | null;
+  description?: string | null;
+}
+
+export interface CatalogTableUpdate {
+  name?: string;
+  description?: string;
+  namespace_id?: number | null;
+  // An explicit null clears the prediction-table association.
+  prediction_table_id?: number | null;
+}
+
+export interface VirtualFlowTableCreate {
+  name: string;
+  namespace_id?: number | null;
+  description?: string | null;
+  producer_registration_id: number;
+}
+
+export interface VirtualFlowTableUpdate {
+  name?: string;
+  description?: string;
+  namespace_id?: number | null;
+  producer_registration_id?: number | null;
+}
+
+export interface QueryVirtualTableCreate {
+  name: string;
+  namespace_id?: number | null;
+  description?: string | null;
+  sql_query: string;
+}
+
+export interface QueryVirtualTableUpdate {
+  name?: string;
+  namespace_id?: number | null;
+  description?: string;
+  sql_query?: string;
+}
+
+export interface CatalogTablePreview {
+  columns: string[];
+  dtypes: string[];
+  rows: any[][];
+  total_rows: number;
+}
+
+// Delta Version History
+
+export interface DeltaVersionCommit {
+  version: number;
+  timestamp: string | null;
+  operation: string | null;
+  parameters: Record<string, any> | null;
+}
+
+export interface DeltaTableHistory {
+  current_version: number;
+  history: DeltaVersionCommit[];
+}
+
+// Schedule
+
+export interface FlowSchedule {
+  id: number;
+  registration_id: number;
+  owner_id: number;
+  enabled: boolean;
+  name: string | null;
+  description: string | null;
+  schedule_type: "interval" | "cron" | "table_trigger" | "table_set_trigger";
+  interval_seconds: number | null;
+  cron_expression: string | null;
+  cron_timezone: string | null;
+  trigger_table_id: number | null;
+  trigger_table_name: string | null;
+  trigger_namespace_id: number | null;
+  trigger_namespace_name: string | null;
+  trigger_full_table_name: string | null;
+  trigger_table_ids: number[];
+  trigger_table_names: string[];
+  trigger_full_table_names: string[];
+  last_triggered_at: string | null;
+  last_trigger_table_updated_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FlowScheduleCreate {
+  registration_id: number;
+  schedule_type: "interval" | "cron" | "table_trigger" | "table_set_trigger";
+  interval_seconds?: number | null;
+  cron_expression?: string | null;
+  cron_timezone?: string | null;
+  trigger_table_id?: number | null;
+  trigger_table_ids?: number[] | null;
+  enabled?: boolean;
+  name?: string | null;
+  description?: string | null;
+}
+
+export interface FlowScheduleUpdate {
+  enabled?: boolean;
+  interval_seconds?: number | null;
+  cron_expression?: string | null;
+  cron_timezone?: string | null;
+  name?: string | null;
+  description?: string | null;
+}
+
+export interface CronValidationRequest {
+  cron_expression?: string | null;
+  cron_timezone?: string | null;
+}
+
+export interface CronValidationResult {
+  valid: boolean;
+  error: string | null;
+}
+
+// Active Flow Run
+
+export interface ActiveFlowRun {
+  id: number;
+  registration_id: number | null;
+  schedule_id: number | null;
+  flow_name: string;
+  flow_path: string | null;
+  user_id: number;
+  started_at: string;
+  nodes_completed: number;
+  number_of_nodes: number;
+  run_type: "in_designer_run" | "scheduled" | "manual" | "on_demand";
+}
+
+// Catalog Stats
+
+export interface CatalogStats {
+  total_namespaces: number;
+  total_flows: number;
+  total_runs: number;
+  total_favorites: number;
+  total_table_favorites: number;
+  total_artifacts: number;
+  total_tables: number;
+  total_virtual_tables: number;
+  total_schedules: number;
+  recent_runs: FlowRun[];
+  favorite_flows: FlowRegistration[];
+  favorite_tables: CatalogTable[];
+  active_runs: ActiveFlowRun[];
+}
+
+// Scheduler Status
+
+export interface SchedulerStatus {
+  active: boolean;
+  holder_id?: string;
+  started_at?: string;
+  heartbeat_at?: string;
+  is_embedded?: boolean;
+}
+
+// Catalog Overview (everything the catalog screen loads on mount, one round-trip)
+
+export interface CatalogOverview {
+  stats: CatalogStats;
+  tree: NamespaceTree[];
+  flows: FlowRegistration[];
+  tables: CatalogTable[];
+  favorites: FlowRegistration[];
+  schedules: FlowSchedule[];
+  active_runs: ActiveFlowRun[];
+  runs: PaginatedFlowRuns;
+  scheduler: SchedulerStatus;
+  default_namespace_id: number | null;
+}
+
+// View state helpers
+
+export type CatalogTab =
+  | "catalog"
+  | "favorites"
+  | "following"
+  | "runs"
+  | "schedules"
+  | "alerts"
+  | "sql"
+  | "notebook"
+  | "visuals"
+  | "apis"
+  | "customNodes";
+
+// SQL Query types
+
+export interface SqlQueryResult {
+  columns: string[];
+  dtypes: string[];
+  rows: any[][];
+  total_rows: number;
+  truncated: boolean;
+  execution_time_ms: number;
+  used_tables: string[];
+  error: string | null;
+}
+
+// Visualizations
+
+export type VizSourceKind = "table" | "sql";
+
+export interface CatalogVisualization {
+  id: number;
+  name: string;
+  description: string | null;
+  chart_type: string | null;
+  /** GraphicWalker IChart[] — one entry per chart tab. */
+  spec: Record<string, any>[];
+  spec_gw_version: string | null;
+  source_type: VizSourceKind;
+  catalog_table_id: number | null;
+  sql_query: string | null;
+  namespace_id: number | null;
+  /** Base64 PNG data URL captured on save by GraphicWalker's exportChart. */
+  thumbnail_data_url: string | null;
+  created_by: number | null;
+  created_at: string;
+  updated_at: string;
+  /** Parent table info (resolved server-side) so the viewer can render
+   * "namespace.tablename" without a second API call. */
+  table_name?: string | null;
+  table_namespace_name?: string | null;
+  table_full_name?: string | null;
+  table_type?: string | null;
+  namespace_name?: string | null;
+  access?: AccessInfo | null;
+}
+
+export interface VisualizationCreatePayload {
+  name: string;
+  description?: string | null;
+  chart_type?: string | null;
+  spec: Record<string, any>[];
+  spec_gw_version?: string | null;
+  source_type: VizSourceKind;
+  catalog_table_id?: number | null;
+  sql_query?: string | null;
+  namespace_id?: number | null;
+  thumbnail_data_url?: string | null;
+}
+
+export interface VisualizationUpdatePayload {
+  name?: string;
+  description?: string | null;
+  chart_type?: string | null;
+  spec?: Record<string, any>[];
+  spec_gw_version?: string | null;
+  namespace_id?: number | null;
+  sql_query?: string | null;
+  catalog_table_id?: number | null;
+  thumbnail_data_url?: string | null;
+  /** CAS guard: echo of the server's updated_at; mismatch -> 409 stale_write. */
+  expected_updated_at?: string;
+}
+
+/** Source descriptor sent to the ad-hoc compute and fields endpoints. */
+export interface VizSourceDescriptor {
+  source_type: VizSourceKind;
+  table_id?: number | null;
+  sql_query?: string | null;
+}
+
+export interface VisualizationComputeResponse {
+  rows: Record<string, any>[];
+  total_rows: number;
+  truncated: boolean;
+  elapsed_ms: number;
+  cache_hit: boolean;
+  error: string | null;
+}
+
+export interface VisualizationFieldsResponse {
+  fields: Record<string, any>[];
+  cache_hit: boolean;
+  error: string | null;
+}
+
+export interface ColumnStatsResponse {
+  dtype: string;
+  values: unknown[];
+  truncated: boolean;
+  distinct_count: number | null;
+  min: unknown | null;
+  max: unknown | null;
+  cache_hit: boolean;
+  error: string | null;
+}

@@ -1,0 +1,266 @@
+"""Polars-code node export: runtime-parity return detection and a token-level ``pl`` -> ``ff`` rename."""
+
+import builtins
+from datetime import date, datetime, time
+from decimal import Decimal
+from zoneinfo import ZoneInfo
+
+import polars as pl
+import pytest
+from polars.testing import assert_frame_equal
+
+from flowfile_core.flowfile.code_generator.code_generator import (
+    _polars_code_function_body,
+    _polars_code_to_flowframe,
+    _sandbox_imports,
+    export_flow_to_flowframe,
+    export_flow_to_polars,
+)
+from flowfile_core.flowfile.flow_data_engine.polars_code_parser import PolarsCodeParser
+from flowfile_core.flowfile.flow_graph import FlowGraph, add_connection
+from flowfile_core.schemas import input_schema, transform_schema
+from tests.flowfile.test_project_exporter import create_basic_flow
+from test_utils.exec_script import run_exported
+
+_EXPORTS = [
+    pytest.param(export_flow_to_polars, id="polars"),
+    pytest.param(export_flow_to_flowframe, id="flowframe"),
+]
+
+
+pytestmark = pytest.mark.usefixtures("keep_single_file_env")
+
+
+_run_export = run_exported
+
+
+def _polars_code_flow(polars_code: str) -> FlowGraph:
+    flow = create_basic_flow(name="polars_code_export")
+    flow.add_manual_input(
+        input_schema.NodeManualInput(
+            flow_id=1,
+            node_id=1,
+            raw_data_format=input_schema.RawData(
+                columns=[input_schema.MinimalFieldInfo(name="a", data_type="Integer")], data=[[1, 2, 3]]
+            ),
+        )
+    )
+    flow.add_polars_code(
+        input_schema.NodePolarsCode(
+            flow_id=1,
+            node_id=2,
+            depending_on_ids=[1],
+            polars_code_input=transform_schema.PolarsCodeInput(polars_code=polars_code),
+        )
+    )
+    add_connection(flow, input_schema.NodeConnection.create_from_simple_input(1, 2))
+    return flow
+
+
+def _concat_sources():
+    import flowfile_frame as ff
+
+    left = ff.from_dict({"a": [1, 2], "b": ["x", "y"]})
+    right = ff.from_dict({"a": [3, 4], "b": ["z", "w"]})
+    return ff, left, right
+
+
+@pytest.mark.parametrize("export", _EXPORTS)
+@pytest.mark.parametrize(
+    "build, how",
+    [
+        pytest.param(lambda ff, a, b: ff.concat([a, b]), "vertical", id="module_concat_default"),
+        pytest.param(lambda ff, a, b: a.concat(b, how="vertical"), "vertical", id="method_vertical"),
+        pytest.param(lambda ff, a, b: a.concat(b, how="diagonal"), "diagonal", id="method_diagonal"),
+    ],
+)
+def test_flowframe_concat_exports_run(export, build, how):
+    ff, left, right = _concat_sources()
+    combined = build(ff, left, right)
+
+    result = _run_export(export(combined.flow_graph))
+
+    expected = pl.concat([left.collect(), right.collect()], how=how)
+    assert_frame_equal(result, expected, check_row_order=False)
+
+
+@pytest.mark.parametrize("export", _EXPORTS)
+def test_pl_text_inside_strings_and_names_survives_flowframe_rename(export):
+    code = 'df_pl = input_df\noutput_df = df_pl.with_columns(pl.lit("pl.col").alias("note"))  # pl.lit stays'
+    result = _run_export(export(_polars_code_flow(code)))
+
+    assert result["note"].to_list() == ["pl.col"] * 3
+
+
+@pytest.mark.parametrize("export", _EXPORTS)
+def test_indented_body_with_explicit_return_exports(export):
+    code = (
+        "        output_df = input_df.with_columns(\n"
+        "            (pl.col('a') * 2).alias('doubled'),\n"
+        "        )\n"
+        "\n"
+        "        return output_df\n"
+    )
+    result = _run_export(export(_polars_code_flow(code)))
+
+    assert result["doubled"].to_list() == [2, 4, 6]
+
+
+@pytest.mark.parametrize("export", _EXPORTS)
+@pytest.mark.parametrize(
+    "code",
+    [
+        pytest.param(
+            "# Double it.\ndef doubled(rows: pl.LazyFrame) -> pl.LazyFrame:\n\n"
+            "    return rows.with_columns((pl.col('a') * 2).alias('doubled'))",
+            id="annotated",
+        ),
+        pytest.param(
+            "def doubled(rows: ff.FlowFrame):\n    def twice(c):\n        return c * 2\n"
+            "    return rows.with_columns(twice(pl.col('a')).alias('doubled'))",
+            id="flowframe_hint_and_nested_helper",
+        ),
+    ],
+)
+def test_function_form_exports_as_written_and_runs(export, code):
+    flow = _polars_code_flow(code)
+    exported = export(flow)
+
+    assert code.split("\n", 1)[1] in exported.replace("\n    ", "\n")
+    assert "_polars_code_2" not in exported
+    assert _run_export(exported)["doubled"].to_list() == [2, 4, 6]
+    flow.run_graph()
+    assert flow.get_node(2).get_resulting_data().data_frame.collect()["doubled"].to_list() == [2, 4, 6]
+
+
+@pytest.mark.parametrize("export", _EXPORTS)
+@pytest.mark.parametrize(
+    "code",
+    [
+        pytest.param("def kept(rows: LazyFrame) -> LazyFrame:\n    return rows", id="signature"),
+        pytest.param("def kept(rows):\n    def same(c: Expr) -> Expr:\n        return c\n    return rows", id="nested_def"),
+    ],
+)
+def test_annotations_without_an_import_put_the_future_import_first(export, code):
+    exported = export(_polars_code_flow(code))
+
+    assert exported.startswith("from __future__ import annotations\n")
+    assert len(_run_export(exported)) == 3
+
+
+def test_snippet_renders_its_inputs_as_lazyframes_in_the_flowframe_export():
+    exported = export_flow_to_flowframe(_polars_code_flow("input_df.head(1)"))
+
+    assert "def _polars_code_2(input_df: pl.LazyFrame):" in exported
+    assert "import polars as pl" in exported
+    assert len(_run_export(exported)) == 1
+
+
+@pytest.mark.parametrize(
+    "code, expected",
+    [
+        ("input_df", ([], "input_df")),
+        ("output_df = input_df", (["output_df = input_df"], "output_df")),
+        ("output_df = input_df\nreturn output_df", (["output_df = input_df", "return output_df"], None)),
+        ("# keep\ninput_df.head(1)", (["# keep"], "input_df.head(1)")),
+        (
+            "out = input_df.head(\n    1,\n    parallel=True\n)",
+            (["out = input_df.head(", "    1,", "    parallel=True", ")"], "out"),
+        ),
+        ("output_df = x\nresult = output_df.head()", (["output_df = x", "result = output_df.head()"], "output_df")),
+        ("output_df = (", (["output_df = ("], "output_df")),
+    ],
+    ids=[
+        "expression", "assign", "explicit_return", "leading_comment", "multi_line_call", "output_df_wins", "unparsable",
+    ],
+)
+def test_polars_code_function_body(code, expected):
+    assert _polars_code_function_body(code) == expected
+
+
+@pytest.mark.parametrize(
+    "code, expected",
+    [
+        ("pl.col('a')", "ff.col('a')"),
+        ('pl.lit("pl.col")', 'ff.lit("pl.col")'),
+        ("df_pl.select(x.pl.y)", "df_pl.select(x.pl.y)"),
+        ("x: pl.LazyFrame = pl.DataFrame({})", "x: ff.FlowFrame = ff.FlowFrame({})"),
+        ("frame.LazyFrame", "frame.LazyFrame"),
+        ("a = 1  # pl.col", "a = 1  # pl.col"),
+    ],
+    ids=["module_ref", "string_literal", "other_names", "frame_classes", "unrelated_attr", "comment"],
+)
+def test_polars_code_to_flowframe(code, expected):
+    assert _polars_code_to_flowframe(code) == expected
+
+
+def test_every_sandbox_name_gets_an_import_binding_the_same_object():
+    import types
+
+    for name, value in PolarsCodeParser().safe_globals.items():
+        if name in {"__builtins__", "pl"} or hasattr(builtins, name):
+            continue
+        (statement,) = _sandbox_imports(f"x = {name}")
+        namespace: dict = {}
+        exec(statement, namespace)
+        imported = namespace[name]
+        if isinstance(value, types.SimpleNamespace):
+            # The sandbox exposes a narrow namespace; the import binds the real module it was built from.
+            for member, member_value in vars(value).items():
+                assert getattr(imported, member) is member_value, f"{name}.{member}"
+        else:
+            assert imported is value, name
+
+
+@pytest.mark.parametrize("export", _EXPORTS)
+@pytest.mark.parametrize(
+    "code",
+    [
+        "input_df.with_columns(col('a').cast(Int64).alias('b'))",
+        "input_df.with_columns(lit(base64.b64encode(b'x').decode()).alias('b'))",
+        "input_df.with_columns(pl.Expr.deserialize(BytesIO(b'{\"Column\":\"a\"}'), format='json').alias('b'))",
+        "input_df.select(cs.numeric())",
+        "input_df.with_columns(lit(datetime.date(2024, 1, 2)).alias('b'))",
+    ],
+    ids=["col_dtype", "base64", "bytesio", "selectors", "datetime"],
+)
+def test_names_the_sandbox_provides_export_and_run(export, code):
+    flow = _polars_code_flow(code)
+    flow.run_graph()
+    expected = flow.get_node(2).get_resulting_data().data_frame.collect()
+    assert_frame_equal(_run_export(export(flow)), expected)
+
+
+@pytest.mark.parametrize("export", _EXPORTS)
+def test_decimal_rows_and_a_decimal_cast_export_together(export):
+    """``from decimal import Decimal`` beside ``from polars import Decimal`` made the rows ``pl.Decimal('1.50')``."""
+    import flowfile_frame as ff
+
+    rows = ff.from_dict({"m": [Decimal("1.50"), Decimal("2.25")], "x": [1, 2]})
+    out = rows.polars_code("input_df.with_columns(col('x').cast(Decimal(10, 2)).alias('y'))")
+    assert_frame_equal(_run_export(export(out.flow_graph)), out.collect())
+
+
+@pytest.mark.parametrize("export", _EXPORTS)
+def test_flow_input_sample_rows_export_as_code_that_runs(export):
+    import flowfile_frame as ff
+
+    sample = {"d": [date(2024, 1, 1), None], "f": [float("nan"), 1.5], "m": [Decimal("1.50"), None]}
+    frame = ff.FlowInput("orders", sample=sample, flow_graph=ff.create_flow_graph())
+    assert_frame_equal(_run_export(export(frame.flow_graph)), frame.collect())
+
+
+@pytest.mark.parametrize("export", _EXPORTS)
+def test_manual_input_rows_export_as_code_that_runs(export):
+    import flowfile_frame as ff
+
+    rows = ff.from_dict(
+        {
+            "f": [1.5, float("nan"), float("inf"), float("-inf")],
+            "d": [date(2024, 1, 1), None, date(2024, 2, 29), date(1999, 12, 31)],
+            "t": [datetime(2024, 1, 1, tzinfo=ZoneInfo("Europe/Amsterdam"))] * 4,
+            "c": [time(1, 2), None, time(23, 59), time(0, 0)],
+            "m": [Decimal("1.50"), None, Decimal("2.25"), Decimal("0.10")],
+        }
+    )
+    assert_frame_equal(_run_export(export(rows.flow_graph)), rows.collect())

@@ -1,0 +1,196 @@
+// Flow Store - Manages flow ID and flow-level state
+import { defineStore } from "pinia";
+import type { VueFlowStore } from "@vue-flow/core";
+import type { HistoryState, FlowArtifactData, NodeArtifactSummary } from "../types";
+import type { FlowParameter } from "../types/flow.types";
+import { FlowApi } from "../api/flow.api";
+import { useEditorStore } from "./editor-store";
+import { useResultsStore } from "./results-store";
+
+export const FLOW_ID_STORAGE_KEY = "last_flow_id";
+
+let placementTimer: ReturnType<typeof setTimeout> | null = null;
+
+// Default history state
+const defaultHistoryState: HistoryState = {
+  flow_id: null,
+  can_undo: false,
+  can_redo: false,
+  undo_description: null,
+  redo_description: null,
+  undo_count: 0,
+  redo_count: 0,
+};
+
+const defaultArtifactData: FlowArtifactData = {
+  nodes: {},
+  edges: [],
+};
+
+export const useFlowStore = defineStore("flow", {
+  state: () => {
+    const savedFlowId = sessionStorage.getItem(FLOW_ID_STORAGE_KEY);
+    const initialFlowId = savedFlowId ? parseInt(savedFlowId) : -1;
+
+    return {
+      flowId: initialFlowId as number,
+      vueFlowInstance: null as any | VueFlowStore,
+      // History state for undo/redo
+      historyState: { ...defaultHistoryState } as HistoryState,
+      // Artifact visualization data
+      artifactData: { ...defaultArtifactData } as FlowArtifactData,
+      // Flow-level parameters (${name} refs). Populated by the header when it
+      // loads/saves flow settings; read by the formula/filter editor for
+      // highlighting, autocomplete and hover.
+      parameters: [] as FlowParameter[],
+      // Monotonic counter bumped by `requestReload()`. Components rendering
+      // the canvas (e.g. `Canvas.vue`'s `loadFlow`) watch this and re-fetch
+      // the graph on bump. Used when the backend mutates the flow without
+      // going through the in-canvas mutation paths — for instance when
+      // `useAiDiffStore.accept()` applies a server-staged diff.
+      // `graphVersion` is a different signal: it bumps on EVERY mutation
+      // (incl. canvas-local ones) and drives dirty-state UI; watching it
+      // for re-fetch would loop. `pendingReloadCounter` is "external
+      // mutation happened; please re-fetch" only.
+      pendingReloadCounter: 0,
+      // — Monotonic counter bumped by `requestLayoutReset()`.
+      // `Canvas.vue` watches this and runs the same routine the
+      // "Reset layout graph" button triggers (applyStandardLayout +
+      // viewport reset + fitView). Used by the post-agent_live
+      // layout-reorganize prompt so the banner's [Reorganize] button
+      // can call into the canvas without prop-drilling.
+      pendingLayoutResetCounter: 0,
+      // A run started or ended elsewhere; HeaderButtons re-reads the run state on it.
+      pendingRunStateCounter: 0,
+    };
+  },
+
+  getters: {
+    currentFlowId: (state) => state.flowId,
+    canUndo: (state) => state.historyState.can_undo,
+    canRedo: (state) => state.historyState.can_redo,
+    undoDescription: (state) => state.historyState.undo_description,
+    redoDescription: (state) => state.historyState.redo_description,
+  },
+
+  actions: {
+    setFlowId(flowId: number) {
+      if (this.flowId === flowId) return;
+      this.flowId = flowId;
+      try {
+        sessionStorage.setItem(FLOW_ID_STORAGE_KEY, flowId.toString());
+      } catch (error) {
+        console.warn("Failed to store flow ID in session storage:", error);
+      }
+      this.historyState = { ...defaultHistoryState };
+      this.artifactData = { ...defaultArtifactData };
+      this.parameters = [];
+    },
+
+    setParameters(parameters: FlowParameter[]) {
+      this.parameters = parameters ?? [];
+    },
+
+    // Fallback loader for when the editor opens before the header has fetched
+    // flow settings. Pinned to a flowId so a late response for a stale flow is
+    // dropped.
+    async loadParameters(flowId?: number) {
+      const targetId = flowId ?? this.flowId;
+      if (targetId < 0) return;
+      const settings = await FlowApi.getFlowSettings(targetId);
+      if (this.flowId !== targetId) return;
+      this.parameters = settings?.parameters ?? [];
+    },
+
+    setVueFlowInstance(vueFlowInstance: VueFlowStore) {
+      this.vueFlowInstance = vueFlowInstance;
+    },
+
+    getVueFlowInstance() {
+      return this.vueFlowInstance;
+    },
+
+    // Fed by the axios mutation channel and loadFlow; a late state for another flow is dropped.
+    updateHistoryState(historyState: HistoryState) {
+      if (historyState.flow_id != null && historyState.flow_id !== this.flowId) return;
+      this.historyState = historyState;
+      useEditorStore().bumpGraphVersion();
+    },
+
+    // Artifact actions. Caller may pass an explicit flowId to pin the request
+    // to a specific flow — useful from loadFlow where the active flowId can
+    // change mid-fetch. The result is dropped if the store has moved on.
+    async fetchArtifacts(flowId?: number) {
+      const targetId = flowId ?? this.flowId;
+      if (targetId < 0) return;
+      try {
+        const data = await FlowApi.getArtifacts(targetId);
+        if (this.flowId !== targetId) return;
+        this.artifactData = data;
+      } catch {
+        // Artifacts are optional; don't break the UI
+        if (this.flowId === targetId) this.artifactData = { ...defaultArtifactData };
+      }
+    },
+
+    getNodeArtifactSummary(nodeId: number): NodeArtifactSummary | null {
+      return this.artifactData.nodes[String(nodeId)] ?? null;
+    },
+
+    // Backend settings validation (missing-column warnings). Same staleness
+    // handling as fetchArtifacts; advisory, so failures never break the UI.
+    async fetchSettingsValidation(flowId?: number) {
+      const targetId = flowId ?? this.flowId;
+      if (targetId < 0) return;
+      try {
+        const data = await FlowApi.getSettingsValidation(targetId);
+        if (this.flowId !== targetId) return;
+        useResultsStore().applySettingsValidation(targetId, data);
+      } catch {
+        // Validation is advisory; don't break the UI
+      }
+    },
+
+    // Placement is advisory and every edit asks for it, so the request waits for edits to settle.
+    fetchPlacement(flowId?: number) {
+      const targetId = flowId ?? this.flowId;
+      if (targetId < 0) return;
+      if (placementTimer) clearTimeout(placementTimer);
+      placementTimer = setTimeout(async () => {
+        placementTimer = null;
+        try {
+          const data = await FlowApi.getPlacement(targetId);
+          if (this.flowId !== targetId) return;
+          useResultsStore().applyPlacement(targetId, data);
+        } catch {
+          // A failed preview keeps the last one shown
+        }
+      }, 400);
+    },
+
+    // Signal "the backend mutated the flow; please re-fetch and re-render".
+    // Canvas.vue watches `pendingReloadCounter` and calls its local
+    // `loadFlow()` on bump. Safe to call multiple times — the watcher's
+    // debouncing (via `loadToken`) cancels stale runs.
+    requestReload() {
+      this.pendingReloadCounter += 1;
+    },
+
+    // — Signal "please re-run the standard auto-layout".
+    // Canvas.vue watches `pendingLayoutResetCounter` and runs the same
+    // routine the "Reset layout graph" button triggers
+    // (`handleResetLayoutGraph`: applyStandardLayout + viewport reset
+    // + fitView). Used by the post-agent_live layout-reorganize banner
+    // so the [Reorganize] button can call into the canvas without
+    // prop-drilling. Safe to call multiple times.
+    requestLayoutReset() {
+      this.pendingLayoutResetCounter += 1;
+    },
+
+    // Signal "the flow's run state changed elsewhere; re-read it". Same
+    // counter pattern as `requestReload`.
+    requestRunStateRefresh() {
+      this.pendingRunStateCounter += 1;
+    },
+  },
+});

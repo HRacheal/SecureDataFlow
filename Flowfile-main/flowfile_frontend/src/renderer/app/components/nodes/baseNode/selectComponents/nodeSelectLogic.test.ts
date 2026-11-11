@@ -1,0 +1,214 @@
+import { describe, it, expect } from "vitest";
+import {
+  applySelectPositions,
+  createNodeSelect,
+  createSelectInput,
+  restoreBlankName,
+  restoreSourceType,
+  sourceSemanticTypesFromSchema,
+  sourceTypesFromSchema,
+} from "./nodeSelectLogic";
+import type { FileColumn, SelectInput } from "../../../../types/node.types";
+
+const column = (name: string, data_type: string): FileColumn => ({ name, data_type }) as FileColumn;
+
+const input = (old_name: string, data_type: string, position: number): SelectInput => {
+  const selectInput = createSelectInput(old_name, data_type, position, position);
+  return selectInput;
+};
+
+describe("applySelectPositions", () => {
+  it("orders by position and re-stamps position as the array index", () => {
+    const inputs = [input("c", "String", 2), input("a", "String", 0), input("b", "String", 1)];
+
+    const result = applySelectPositions(inputs, [
+      column("a", "String"),
+      column("b", "String"),
+      column("c", "String"),
+    ]);
+
+    expect(result.map((i) => i.old_name)).toEqual(["a", "b", "c"]);
+    expect(result.map((i) => i.position)).toEqual([0, 1, 2]);
+  });
+
+  it("keeps original_position 0 for the first upstream column after a reorder", () => {
+    // Regression: `original_index || index` treated a legitimate 0 as falsy and
+    // fell back to the loop index, so moving column "a" to the bottom of the list
+    // rewrote its original_position from 0 to 2.
+    const inputs = [input("b", "String", 0), input("c", "String", 1), input("a", "String", 2)];
+
+    applySelectPositions(inputs, [
+      column("a", "String"),
+      column("b", "String"),
+      column("c", "String"),
+    ]);
+
+    const movedColumn = inputs.find((i) => i.old_name === "a");
+    expect(movedColumn?.original_position).toBe(0);
+    expect(movedColumn?.position).toBe(2);
+  });
+
+  it("compares data types against the schema entry matching by name, not by loop index", () => {
+    // Regression: the lookup used the loop index, so after a reorder every row was
+    // compared against whichever column happened to sit at the same position.
+    const inputs = [input("b", "Int64", 0), input("a", "String", 1)];
+
+    applySelectPositions(inputs, [column("a", "String"), column("b", "Int64")]);
+
+    expect(inputs.map((i) => [i.old_name, i.data_type_change])).toEqual([
+      ["b", false],
+      ["a", false],
+    ]);
+  });
+
+  it("flags a genuine data type change on both flags", () => {
+    const inputs = [input("a", "String", 0)];
+    inputs[0].data_type = "Int64";
+
+    applySelectPositions(inputs, [column("a", "String")]);
+
+    expect(inputs[0].data_type_change).toBe(true);
+    expect(inputs[0].is_altered).toBe(true);
+  });
+
+  it("treats a rename as altered but not as a data type change", () => {
+    // Matches the backend contract: is_altered covers renames too, while
+    // data_type_change is what drives the cast and the changed-cell marker.
+    const inputs = [input("a", "String", 0)];
+    inputs[0].new_name = "renamed";
+
+    applySelectPositions(inputs, [column("a", "String")]);
+
+    expect(inputs[0].data_type_change).toBe(false);
+    expect(inputs[0].is_altered).toBe(true);
+  });
+
+  it("still reindexes position for columns missing from the upstream schema", () => {
+    const inputs = [input("gone", "String", 0), input("a", "String", 1)];
+
+    applySelectPositions(inputs, [column("a", "String")]);
+
+    expect(inputs.map((i) => i.position)).toEqual([0, 1]);
+    // The vanished column keeps whatever original_position it was loaded with.
+    expect(inputs[0].original_position).toBe(0);
+  });
+
+  it("reindexes position when there is no upstream schema at all", () => {
+    const inputs = [input("b", "String", 5), input("a", "String", 1)];
+
+    applySelectPositions(inputs, undefined);
+
+    expect(inputs.map((i) => [i.old_name, i.position])).toEqual([
+      ["a", 0],
+      ["b", 1],
+    ]);
+  });
+
+  it("preserves object identity so the in-place position write reaches the parent", () => {
+    const first = input("b", "String", 1);
+    const second = input("a", "String", 0);
+    const inputs = [first, second];
+
+    const result = applySelectPositions(inputs, [column("a", "String"), column("b", "String")]);
+
+    expect(result).toBe(inputs);
+    expect(result[0]).toBe(second);
+    expect(result[1]).toBe(first);
+  });
+});
+
+describe("sourceTypesFromSchema", () => {
+  it("maps upstream column names to their data types", () => {
+    expect(sourceTypesFromSchema([column("a", "Int64"), column("b", "String")])).toEqual({
+      a: "Int64",
+      b: "String",
+    });
+  });
+
+  it("is empty when the upstream schema is unknown", () => {
+    expect(sourceTypesFromSchema(undefined)).toEqual({});
+  });
+});
+
+describe("sourceSemanticTypesFromSchema", () => {
+  it("keeps only the columns core marked, keyed by upstream name", () => {
+    const schema = [
+      { ...column("g", "Extension('geoarrow.wkb', Binary, '{}')"), semantic_type: "geometry" },
+      { ...column("s", "String"), semantic_type: null },
+      column("n", "Int64"),
+    ] as FileColumn[];
+    expect(sourceSemanticTypesFromSchema(schema)).toEqual({ g: "geometry" });
+    expect(sourceSemanticTypesFromSchema(undefined)).toEqual({});
+  });
+});
+
+describe("restoreSourceType", () => {
+  it("puts the source type back and clears the type-change flags in place", () => {
+    const selectInput = input("a", "String", 0);
+    selectInput.data_type_change = true;
+    selectInput.is_altered = true;
+
+    const result = restoreSourceType(selectInput, "Int64");
+
+    expect(result).toBe(selectInput);
+    expect(selectInput.data_type).toBe("Int64");
+    expect(selectInput.data_type_change).toBe(false);
+    expect(selectInput.is_altered).toBe(false);
+  });
+
+  it("keeps is_altered when the column is also renamed", () => {
+    const selectInput = input("a", "String", 0);
+    selectInput.new_name = "renamed";
+    selectInput.data_type_change = true;
+    selectInput.is_altered = true;
+
+    restoreSourceType(selectInput, "Int64");
+
+    expect(selectInput.data_type_change).toBe(false);
+    expect(selectInput.is_altered).toBe(true);
+  });
+});
+
+describe("restoreBlankName", () => {
+  it("puts the original name back when the box was cleared", () => {
+    const selectInput = input("a", "String", 0);
+    selectInput.new_name = "";
+    expect(restoreBlankName(selectInput).new_name).toBe("a");
+  });
+
+  it("treats a whitespace-only name as cleared", () => {
+    const selectInput = input("a", "String", 0);
+    selectInput.new_name = "   ";
+    expect(restoreBlankName(selectInput).new_name).toBe("a");
+  });
+
+  it("leaves a real name alone", () => {
+    const selectInput = input("a", "String", 0);
+    selectInput.new_name = "Value (EUR)";
+    expect(restoreBlankName(selectInput).new_name).toBe("Value (EUR)");
+  });
+});
+
+describe("applySelectPositions with a cleared rename box", () => {
+  it("saves the original name, not '' and not an altered flag", () => {
+    const cleared = input("a", "String", 0);
+    cleared.new_name = "";
+    const [result] = applySelectPositions([cleared], [column("a", "String")]);
+    expect(result.new_name).toBe("a");
+    expect(result.is_altered).toBe(false);
+  });
+});
+
+describe("createNodeSelect", () => {
+  it("starts with keep_missing on, as core's default, and no columns listed", () => {
+    const node = createNodeSelect(3, 7).value;
+
+    expect(node.keep_missing).toBe(true);
+    expect(node.select_input).toEqual([]);
+    expect([node.flow_id, node.node_id]).toEqual([3, 7]);
+  });
+
+  it("takes keep_missing when it is given", () => {
+    expect(createNodeSelect(1, 2, 0, 0, false, false).value.keep_missing).toBe(false);
+  });
+});

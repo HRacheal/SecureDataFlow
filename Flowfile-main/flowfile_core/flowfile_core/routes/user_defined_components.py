@@ -1,0 +1,607 @@
+import ast
+import hashlib
+import re
+from pathlib import Path
+from typing import Any, Literal
+
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+
+from flowfile_core import flow_file_handler
+from flowfile_core.auth.jwt import get_current_active_user
+from flowfile_core.configs import logger
+from flowfile_core.configs.node_store import CUSTOM_NODE_STORE
+from flowfile_core.flowfile.community_nodes.receipts import community_icon_override
+from flowfile_core.flowfile.execution.errors import ComputeError, ComputeUnavailable
+from flowfile_core.flowfile.node_designer.codegen import CodegenError, generate_source
+from flowfile_core.flowfile.node_designer.parsing import extract_manifest, parse_source
+from flowfile_core.flowfile.node_designer.state import DesignerState, ParseResult
+from flowfile_core.flowfile.user_defined.dry_run import DryRunRequest, DryRunResponse, run_dry_run
+from flowfile_core.flowfile.user_defined.registry import (
+    KernelRequiredError,
+    LoadedNode,
+    compute_node_key,
+    registry,
+)
+from flowfile_core.routes.custom_node_mounts import require_admin
+from flowfile_core.routes.routes import (
+    edit_flow,
+    get_flow_or_404,
+    keep_server_owned_layout,
+    require_settings_unchanged,
+    settings_fingerprint_of,
+)
+from flowfile_core.schemas import input_schema
+from flowfile_core.schemas.history_schema import HistoryActionType, OperationResponse
+from flowfile_core.schemas.schemas import NODE_TYPE_TO_SETTINGS_CLASS
+from flowfile_core.utils.utils import camel_case_to_snake_case
+from shared import storage
+
+router = APIRouter()
+
+
+class CustomNodeInfo(BaseModel):
+    """Info about a custom node file."""
+
+    file_name: str
+    node_name: str = ""
+    node_category: str = ""
+    title: str = ""
+    intro: str = ""
+    author: str = ""
+    version: str = ""
+    tags: list[str] = []
+    node_icon: str = "user-defined-icon.png"
+    node_key: str = ""
+    environment: Literal["local", "kernel"] = "local"
+    dependencies: list[str] = []
+    source_hash: str = ""
+    error: str | None = None
+
+
+class SaveCustomNodeRequest(BaseModel):
+    """Request model for saving a custom node.
+
+    ``mode`` defaults to ``"code"`` so the legacy ``{file_name, code}`` body keeps
+    working. In designer mode the source is regenerated from ``designer_state``.
+    """
+
+    file_name: str
+    mode: Literal["designer", "code"] = "code"
+    designer_state: DesignerState | None = None
+    code: str | None = None
+    expected_hash: str | None = None
+
+
+class PreviewCustomNodeRequest(BaseModel):
+    """Generate canonical source from a DesignerState without writing anything."""
+
+    designer_state: DesignerState
+
+
+def _safe_file_name(file_name: str) -> str:
+    if not file_name.endswith(".py"):
+        file_name += ".py"
+    safe_name = re.sub(r"[^a-zA-Z0-9_]", "_", file_name[:-3]) + ".py"
+    if not safe_name or safe_name == ".py":
+        raise HTTPException(status_code=400, detail="Invalid file name")
+    return safe_name
+
+
+def _parse_result_for_file(path: Path, content: str) -> ParseResult:
+    try:
+        return parse_source(content, file_name=path.name)
+    except Exception as e:  # parser is defensive, but never fail the route on it
+        logger.warning("Failed to parse designer state for %s: %s", path.name, e)
+        return ParseResult(mode="code_only", designer_state=None, issues=[])
+
+
+def _extract_node_info_from_file(file_path: Path) -> CustomNodeInfo:
+    """Best-effort exec-free metadata for a broken node file, mirroring the healthy-path shape."""
+    info = CustomNodeInfo(file_name=file_path.name)
+    try:
+        content = file_path.read_text(encoding="utf-8")
+    except OSError as e:
+        logger.warning(f"Failed to read node info from {file_path}: {e}")
+        return info
+
+    manifest = extract_manifest(content)
+    if manifest.node_name:
+        info.node_name = manifest.node_name
+    info.node_category = manifest.node_category
+    info.title = manifest.title
+    info.intro = manifest.intro
+    info.author = manifest.author
+    info.version = manifest.version
+    info.tags = list(manifest.tags)
+    info.node_icon = manifest.node_icon
+    info.environment = manifest.environment.kind
+    info.dependencies = list(manifest.environment.dependencies)
+    return info
+
+
+def _node_info_from_entry(entry: LoadedNode) -> CustomNodeInfo:
+    manifest = entry.manifest
+    if manifest is None:
+        # AST-broken file: best-effort metadata so the browser still names it.
+        info = _extract_node_info_from_file(entry.file_path)
+        info.node_key = entry.node_key
+        info.source_hash = entry.source_hash
+        info.error = entry.load_error
+        return info
+    # Installed community icons live namespaced on disk while node_icon keeps the original name.
+    icon_override = community_icon_override(Path(entry.file_name).stem)
+    return CustomNodeInfo(
+        file_name=entry.file_name,
+        node_name=manifest.node_name or "",
+        node_category=manifest.node_category,
+        title=manifest.title,
+        intro=manifest.intro,
+        author=manifest.author,
+        version=manifest.version,
+        tags=list(manifest.tags),
+        node_icon=icon_override or manifest.node_icon,
+        node_key=entry.node_key,
+        environment=manifest.environment.kind,
+        dependencies=list(manifest.environment.dependencies),
+        source_hash=entry.source_hash,
+        error=entry.load_error,
+    )
+
+
+@router.get("/custom-node-schema", summary="Get the UI schema for a custom node instance")
+def get_simple_custom_object(flow_id: int, node_id: int, current_user=Depends(get_current_active_user)):
+    """Return the frontend schema (with current values) for a user-defined node in a flow."""
+    flow = get_flow_or_404(flow_id, current_user)
+    try:
+        node = flow_file_handler.get_node(flow_id=flow.flow_id, node_id=node_id)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    user_defined_node = CUSTOM_NODE_STORE.get(node.node_type)
+
+    if not user_defined_node:
+        entry = registry.get(node.node_type)
+        if entry is not None and entry.load_error:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": entry.load_error, "node_item": node.node_type},
+            )
+        raise HTTPException(
+            status_code=404,
+            detail={"error": f"Node type '{node.node_type}' not found", "node_item": node.node_type},
+        )
+
+    instance = user_defined_node()
+    drift: dict[str, list[str]] | None = None
+    if node.is_setup:
+        stored_settings = node.setting_input.settings
+        if instance.settings_schema is not None and stored_settings:
+            report = instance.settings_schema.populate_values_report(stored_settings)
+            if report.has_drift:
+                drift = {
+                    "unknown_sections": report.unknown_sections,
+                    "unknown_components": report.unknown_components,
+                }
+    schema = instance.get_frontend_schema()
+    schema["drift"] = drift
+    return schema
+
+
+@router.post("/update_user_defined_node", tags=["transform"], response_model=OperationResponse)
+def update_user_defined_node(
+    input_data: dict[str, Any], node_type: str, current_user=Depends(get_current_active_user)
+) -> OperationResponse:
+    input_data["user_id"] = current_user.id
+    expected_fingerprint = input_data.pop("expected_settings_fingerprint", None)
+    node_type = camel_case_to_snake_case(node_type)
+    flow_id = int(input_data.get("flow_id"))
+    logger.info(f'Updating the data for flow: {flow_id}, node {input_data["node_id"]}')
+    flow = get_flow_or_404(flow_id, current_user)
+    user_defined_model = CUSTOM_NODE_STORE.get(node_type)
+    if not user_defined_model:
+        entry = registry.get(node_type)
+        if entry is not None and entry.load_error:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": entry.load_error, "node_item": node_type},
+            )
+        raise HTTPException(status_code=404, detail=f"Node type '{node_type}' not found")
+    user_defined_node_settings = input_schema.UserDefinedNode.model_validate(input_data)
+    initialized_model = user_defined_model.from_settings(user_defined_node_settings.settings)
+
+    node_id = user_defined_node_settings.node_id
+    with edit_flow(flow, f"Update {node_type} settings", HistoryActionType.UPDATE_SETTINGS, node_id=node_id) as txn:
+        require_settings_unchanged(flow, node_id, expected_fingerprint)
+        keep_server_owned_layout(flow, user_defined_node_settings)
+        try:
+            flow.add_user_defined_node(
+                custom_node=initialized_model, user_defined_node_settings=user_defined_node_settings
+            )
+        except KernelRequiredError as e:
+            raise HTTPException(
+                status_code=422,
+                detail={"error_code": "KERNEL_REQUIRED", "node_type": e.node_type, "message": str(e)},
+            ) from e
+    return OperationResponse(
+        success=True, history=txn.history, settings_fingerprint=settings_fingerprint_of(flow, node_id)
+    )
+
+
+def _render_save_source(request: SaveCustomNodeRequest) -> str:
+    """Resolve the source to write. Designer mode regenerates it canonically and
+    asserts the codegen round-trip invariant (a violation is a codegen bug → 500)."""
+    if request.mode == "designer":
+        if request.designer_state is None:
+            raise HTTPException(status_code=400, detail="designer_state is required when mode='designer'")
+        try:
+            source = generate_source(request.designer_state)
+        except CodegenError as e:
+            raise HTTPException(status_code=422, detail=f"Cannot generate node source: {e}") from e
+        try:
+            ast.parse(source)
+        except SyntaxError as e:  # generated code must always parse
+            logger.error("Codegen produced invalid Python (line %s): %s", e.lineno, e.msg)
+            raise HTTPException(status_code=500, detail="Generated node source is not valid Python") from e
+        round_trip = parse_source(source)
+        if round_trip.mode != "designer":
+            codes = [issue.code for issue in round_trip.issues]
+            logger.error("Codegen round-trip invariant broken: generated source parsed as code_only %s", codes)
+            raise HTTPException(status_code=500, detail="Generated node source is not designer-editable (codegen bug)")
+        return source
+
+    if request.code is None:
+        raise HTTPException(status_code=400, detail="code is required when mode='code'")
+    try:
+        ast.parse(request.code)
+    except SyntaxError as e:
+        raise HTTPException(status_code=400, detail=f"Python syntax error at line {e.lineno}: {e.msg}") from e
+    return request.code
+
+
+def _reject_builtin_key_collision(source: str) -> None:
+    """Refuse a new save whose node key collides with a built-in node type.
+
+    Built-in types own the same keys in the type->schema mapping; a custom node
+    sharing one breaks flow deserialization. Only new saves/renames are guarded
+    here — existing colliding installs still load (parse-time resolution handles
+    them). Exec-free: the name comes from the AST manifest.
+    """
+    node_name = extract_manifest(source).node_name
+    if not node_name:
+        return
+    node_key = compute_node_key(node_name)
+    if node_key in NODE_TYPE_TO_SETTINGS_CLASS:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error_code": "BUILTIN_NODE_KEY_COLLISION",
+                "error": (
+                    f"'{node_name}' resolves to node key '{node_key}', which is a built-in "
+                    "Flowfile node type. Rename the node so its key doesn't collide."
+                ),
+                "node_key": node_key,
+            },
+        )
+
+
+@router.post("/save-custom-node", summary="Save a custom node definition")
+def save_custom_node(request: SaveCustomNodeRequest, current_user=Depends(require_admin)):
+    """Write a custom node .py file and hot-register it (AST-only — no exec at save).
+
+    Admin-only: the file is install-wide and its module execs in core once placed.
+
+    Designer mode regenerates canonical source from the DesignerState; code mode
+    writes the supplied source verbatim. A file that saves but fails AST validation
+    is still a success — ``load_error`` carries the broken state. Import-time
+    failures surface at first placement or via the Test tab (worker dry-run). When
+    ``expected_hash`` is set and no longer matches the on-disk file, responds 409.
+    """
+    safe_name = _safe_file_name(request.file_name)
+    source = _render_save_source(request)
+    _reject_builtin_key_collision(source)
+
+    nodes_dir = storage.user_defined_nodes_directory
+    file_path = nodes_dir / safe_name
+
+    if request.expected_hash is not None and file_path.exists():
+        current_hash = hashlib.sha256(file_path.read_bytes()).hexdigest()
+        if current_hash != request.expected_hash:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "The node file changed on disk since it was opened.",
+                    "current_hash": current_hash,
+                },
+            )
+
+    try:
+        file_path.write_text(source, encoding="utf-8", newline="\n")
+        logger.info("Saved custom node to %s", file_path)
+    except Exception as e:
+        logger.error("Failed to save custom node: %s", e)
+        raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}") from e
+
+    entry = registry.load_file(file_path)
+    written = file_path.read_bytes()
+
+    return {
+        "success": True,
+        "file_name": safe_name,
+        "message": f"Node saved successfully to {safe_name}",
+        "node": _node_info_from_entry(entry).model_dump(),
+        "parse_result": _parse_result_for_file(file_path, source).model_dump(),
+        "code": source,
+        "file_hash": hashlib.sha256(written).hexdigest(),
+        "load_error": entry.error,
+    }
+
+
+@router.post("/preview-custom-node", summary="Render canonical source for a DesignerState")
+def preview_custom_node(
+    request: PreviewCustomNodeRequest, current_user=Depends(get_current_active_user)
+) -> dict[str, str]:
+    """Generate canonical Python from a DesignerState without writing (powers the diff preview)."""
+    try:
+        return {"code": generate_source(request.designer_state)}
+    except CodegenError as e:
+        raise HTTPException(status_code=422, detail=f"Cannot generate node source: {e}") from e
+
+
+@router.post("/dry-run", summary="Run a candidate custom node against sample inputs")
+def dry_run_custom_node(request: DryRunRequest, current_user=Depends(require_admin)) -> DryRunResponse:
+    """Execute a candidate node in the worker against bounded sample inputs.
+
+    Never runs user code in core; a syntax error is caught before dispatch and an
+    unreachable worker, at submit or while the run is polled, surfaces as
+    ``error_kind='load'``. A worker that fails core's handshake on versions while the
+    run is polled answers 500 with the typed message. Admin-only, like save: the
+    candidate is arbitrary Python and the worker holds the master key.
+    """
+    try:
+        return run_dry_run(request, current_user.id)
+    except ComputeUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    except ComputeError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.get("/list-custom-nodes", summary="List all custom nodes", response_model=list[CustomNodeInfo])
+def list_custom_nodes(current_user=Depends(get_current_active_user)) -> list[CustomNodeInfo]:
+    """List all registered custom nodes, including files that failed to load (with their error)."""
+    nodes = [_node_info_from_entry(entry) for entry in registry.all() if not entry.file_name.startswith("_")]
+    nodes.sort(key=lambda x: x.node_name or x.file_name)
+    return nodes
+
+
+@router.get("/get-custom-node/{file_name}", summary="Get custom node details")
+def get_custom_node(file_name: str, current_user=Depends(get_current_active_user)) -> dict[str, Any]:
+    """
+    Get the full content and parsed metadata of a custom node file.
+    This endpoint is used by the Node Designer to load an existing node for editing.
+    """
+    if not file_name.endswith(".py"):
+        file_name += ".py"
+
+    safe_name = re.sub(r"[^a-zA-Z0-9_.]", "_", file_name)
+    file_path = storage.user_defined_nodes_directory / safe_name
+
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail=f"Node file '{safe_name}' not found")
+
+    try:
+        content_bytes = file_path.read_bytes()
+        content = content_bytes.decode("utf-8")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read file: {str(e)}") from e
+
+    parse_result = _parse_result_for_file(file_path, content)
+
+    return {
+        "file_name": safe_name,
+        "code": content,
+        "parse_result": parse_result.model_dump(),
+        "file_hash": hashlib.sha256(content_bytes).hexdigest(),
+        "designer_state": parse_result.designer_state.model_dump() if parse_result.designer_state else None,
+        "supports_visual_edit": parse_result.mode == "designer",
+        # Legacy alias for `code`; pre-designer-rewrite callers read `content`.
+        "content": content,
+    }
+
+
+@router.delete("/delete-custom-node/{file_name}", summary="Delete a custom node")
+def delete_custom_node(file_name: str, current_user=Depends(require_admin)) -> dict[str, Any]:
+    """Delete a custom node file and unregister it from the registry and the palette."""
+    if not file_name.endswith(".py"):
+        file_name += ".py"
+
+    safe_name = re.sub(r"[^a-zA-Z0-9_.]", "_", file_name)
+    file_path = storage.user_defined_nodes_directory / safe_name
+
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail=f"Node file '{safe_name}' not found")
+
+    removed = registry.remove_file(safe_name)
+    if removed is not None:
+        logger.info(f"Unregistered custom node '{removed.node_key}' from {safe_name}")
+    else:
+        logger.warning(f"File '{safe_name}' was not present in the custom node registry")
+
+    try:
+        file_path.unlink()
+        logger.info(f"Deleted custom node file: {file_path}")
+    except Exception as e:
+        logger.error(f"Failed to delete custom node file: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete file: {str(e)}") from e
+
+    _drop_community_receipt_for(safe_name)
+
+    return {"success": True, "file_name": safe_name, "message": f"Node '{safe_name}' deleted successfully"}
+
+
+def _drop_community_receipt_for(file_name: str) -> None:
+    """Deleting an installed community node through this legacy route must not orphan its receipt
+    or the icon/screenshots/README the install seeded."""
+    try:
+        from flowfile_core.flowfile.community_nodes.installer import remove_seeded_assets
+        from flowfile_core.flowfile.community_nodes.receipts import load_receipts, remove_receipt
+
+        for node_id, receipt in load_receipts().items():
+            if receipt.file_name == file_name:
+                remove_seeded_assets(receipt)
+                remove_receipt(node_id)
+                return
+    except Exception as e:
+        logger.warning(f"Could not reconcile community receipts after deleting {file_name}: {e}")
+
+
+@router.post("/rescan", summary="Rescan the custom nodes directory")
+def rescan_custom_nodes(current_user=Depends(get_current_active_user)) -> dict[str, Any]:
+    """Reload every custom node file from disk (picks up manually dropped files, no restart needed)."""
+    entries = registry.scan()
+    broken = [entry for entry in entries if entry.error]
+    return {
+        "total": len(entries),
+        "loaded": len(entries) - len(broken),
+        "broken": [{"file_name": entry.file_name, "error": entry.error} for entry in broken],
+    }
+
+
+# ==================== Custom Icon Endpoints ====================
+
+
+class IconInfo(BaseModel):
+    """Info about a custom icon file."""
+
+    file_name: str
+    is_custom: bool = True
+
+
+ALLOWED_ICON_EXTENSIONS = {".png", ".jpg", ".jpeg", ".svg", ".gif", ".webp"}
+MAX_ICON_SIZE = 5 * 1024 * 1024  # 5MB
+
+
+@router.get("/list-icons", summary="List all available icons", response_model=list[IconInfo])
+def list_icons(current_user=Depends(get_current_active_user)) -> list[IconInfo]:
+    """
+    List all icon files available for custom nodes.
+    Returns icons from the user_defined_nodes/icons directory.
+    """
+    icons_dir = storage.user_defined_nodes_icons
+    icons: list[IconInfo] = []
+
+    if not icons_dir.exists():
+        return icons
+
+    for file_path in icons_dir.iterdir():
+        if file_path.is_file() and file_path.suffix.lower() in ALLOWED_ICON_EXTENSIONS:
+            icons.append(IconInfo(file_name=file_path.name, is_custom=True))
+
+    icons.sort(key=lambda x: x.file_name.lower())
+    return icons
+
+
+@router.post("/upload-icon", summary="Upload a custom icon")
+async def upload_icon(file: UploadFile = File(...), current_user=Depends(get_current_active_user)) -> dict[str, Any]:
+    """
+    Upload a new icon file to the user_defined_nodes/icons directory.
+
+    Accepts PNG, JPG, JPEG, SVG, GIF, and WebP files up to 5MB.
+    """
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file provided")
+
+    file_ext = Path(file.filename).suffix.lower()
+    if file_ext not in ALLOWED_ICON_EXTENSIONS:
+        raise HTTPException(
+            status_code=400, detail=f"Invalid file type. Allowed types: {', '.join(ALLOWED_ICON_EXTENSIONS)}"
+        )
+
+    content = await file.read()
+
+    if len(content) > MAX_ICON_SIZE:
+        raise HTTPException(
+            status_code=400, detail=f"File too large. Maximum size is {MAX_ICON_SIZE // (1024 * 1024)}MB"
+        )
+
+    # Sanitize filename - preserve hyphens, dots, and underscores
+    safe_name = re.sub(r"[^a-zA-Z0-9_.\-]", "_", file.filename)
+    if not safe_name:
+        raise HTTPException(status_code=400, detail="Invalid file name")
+
+    icons_dir = storage.user_defined_nodes_icons
+
+    icons_dir.mkdir(parents=True, exist_ok=True)
+
+    file_path = icons_dir / safe_name
+
+    try:
+        with open(file_path, "wb") as f:
+            f.write(content)
+        logger.info(f"Uploaded icon: {file_path} (size: {len(content)} bytes)")
+    except Exception as e:
+        logger.error(f"Failed to save icon: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to save icon: {str(e)}") from e
+
+    return {
+        "success": True,
+        "file_name": safe_name,
+        "path": str(file_path),
+        "message": f"Icon '{safe_name}' uploaded successfully",
+    }
+
+
+@router.get("/icon/{file_name}", summary="Get a custom icon file")
+def get_icon(file_name: str, current_user=Depends(get_current_active_user)) -> FileResponse:
+    """
+    Retrieve a custom icon file by name.
+    Returns the icon file for display in the UI.
+    """
+    # Sanitize file name - preserve hyphens, dots, and underscores
+    safe_name = re.sub(r"[^a-zA-Z0-9_.\-]", "_", file_name)
+
+    icons_dir = storage.user_defined_nodes_icons
+    file_path = icons_dir / safe_name
+
+    if not file_path.exists():
+        logger.warning(f"Icon not found: {file_path}")
+        raise HTTPException(status_code=404, detail=f"Icon '{safe_name}' not found at {file_path}")
+
+    if file_path.suffix.lower() not in ALLOWED_ICON_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Invalid file type")
+
+    content_type_map = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".svg": "image/svg+xml",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+    }
+    content_type = content_type_map.get(file_path.suffix.lower(), "application/octet-stream")
+
+    return FileResponse(path=file_path, media_type=content_type, filename=safe_name)
+
+
+@router.delete("/delete-icon/{file_name}", summary="Delete a custom icon")
+def delete_icon(file_name: str, current_user=Depends(get_current_active_user)) -> dict[str, Any]:
+    """
+    Delete a custom icon file from the icons directory.
+    """
+    # Sanitize file name - preserve hyphens, dots, and underscores
+    safe_name = re.sub(r"[^a-zA-Z0-9_.\-]", "_", file_name)
+
+    icons_dir = storage.user_defined_nodes_icons
+    file_path = icons_dir / safe_name
+
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail=f"Icon '{safe_name}' not found")
+
+    try:
+        file_path.unlink()
+        logger.info(f"Deleted icon: {file_path}")
+    except Exception as e:
+        logger.error(f"Failed to delete icon: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete icon: {str(e)}") from e
+
+    return {"success": True, "file_name": safe_name, "message": f"Icon '{safe_name}' deleted successfully"}

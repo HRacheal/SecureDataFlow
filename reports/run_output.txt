@@ -1,0 +1,175 @@
+SecureDataFlow experiment run - 2026-11-11 18:36:34 UTC
+
+==============================================================================
+STAGE 0 - Synthetic data, baseline and controlled attack simulation
+==============================================================================
+Clean batch (October 2026)       :  1000 records  -> data\raw\transactions_clean.csv
+Historical reference (Jul-Sep)   :  5000 records  -> data\reference\historical_transactions.csv
+Baseline profile                 : 5 categories -> data\reference\baseline_profile.json
+Attacked incoming batch          :  1045 rows     -> data\attacked\transactions_incoming_attacked.csv
+Ground-truth manifest (eval only): data\attacked\attack_manifest.csv
++----------------------------+------+
+| Scenario in attacked batch | Rows |
++----------------------------+------+
+| LEGITIMATE                 |  982 |
+| S1_MISSING_FIELDS          |    6 |
+| S2_INVALID_TYPES           |    6 |
+| S3_NEGATIVE_VALUES         |    6 |
+| S4_DUPLICATE_IDS           |   10 |
+| S5_INVALID_TIMESTAMPS      |    6 |
+| S6_EXTREME_VALUES          |    5 |
+| S7_IN_TRANSIT_TAMPERING    |    8 |
+| S8_PLAUSIBLE_MANIPULATION  |   10 |
+| S9_RULE_VIOLATIONS         |    6 |
++----------------------------+------+
+
+==============================================================================
+EXPERIMENT A - Attacked batch ingested WITHOUT security controls
+==============================================================================
+Records loaded: 1045 (no checks; unparseable numbers silently became NaN: 3 amounts)
++---------------------------+--------------+-------------------------------+
+| Scenario                  | Rows counted | Effect on total revenue (KES) |
++---------------------------+--------------+-------------------------------+
+| S5_INVALID_TIMESTAMPS     |            6 |                     49,500.00 |
+| S7_IN_TRANSIT_TAMPERING   |            8 |                     12,995.34 |
+| S6_EXTREME_VALUES         |            5 |                  8,225,000.00 |
+| S4_DUPLICATE_IDS          |           10 |                    785,747.77 |
+| S9_RULE_VIOLATIONS        |            6 |                    736,460.00 |
+| S8_PLAUSIBLE_MANIPULATION |           10 |                     13,785.41 |
+| S2_INVALID_TYPES          |            6 |                     13,750.00 |
+| S1_MISSING_FIELDS         |            6 |                     24,000.00 |
+| S3_NEGATIVE_VALUES        |            6 |                   -292,400.00 |
++---------------------------+--------------+-------------------------------+
+
+==============================================================================
+EXPERIMENT B - Same attacked batch ingested WITH security controls
+==============================================================================
+Run id            : 20261111T183635Z-35aee6
+Ingested at (UTC) : 2026-11-11T18:36:35+00:00
+Source file       : data\attacked\transactions_incoming_attacked.csv
+SHA-256           : 5df2e73d7f6e02e20c4b2cef1bfa5b94160b445397516a466ff0f30dbb0d7185
+Archive copy      : data\archive\20261111T183635Z-35aee6__transactions_incoming_attacked.csv (hash re-verified: True)
+Columns OK        : missing=none unexpected=none
++-------------------------------------+---------+
+| Security decision                   | Records |
++-------------------------------------+---------+
+| Received                            |    1045 |
+| Accepted -> trusted/                |     988 |
+| Rejected (invalid) -> quarantine/   |      50 |
+| Flagged (suspicious) -> quarantine/ |       7 |
++-------------------------------------+---------+
++----------------------------------+-------+
+| Validation failure (reason code) | Count |
++----------------------------------+-------+
+| NEGATIVE_VALUE                   |    12 |
+| SIGNATURE_INVALID                |    11 |
+| DUPLICATE_REPLAY                 |     8 |
+| ANOMALY_AMOUNT                   |     7 |
+| MISSING_REQUIRED_FIELD           |     7 |
+| INVALID_TYPE                     |     6 |
+| INVALID_TIMESTAMP                |     4 |
+| ANOMALY_QUANTITY                 |     4 |
+| DUPLICATE_ID_CONFLICT            |     4 |
+| DISALLOWED_VALUE                 |     3 |
+| TIMESTAMP_OUTSIDE_WINDOW         |     2 |
+| ANOMALY_UNIT_PRICE               |     2 |
+| OUT_OF_RANGE                     |     1 |
+| INVALID_FORMAT                   |     1 |
+| AMOUNT_INCONSISTENT              |     1 |
++----------------------------------+-------+
+
+Sample quarantined records (first of each reason code):
+  row   26 TXN-2026-001022  REJECTED [INVALID_TIMESTAMP] '2026-10-15 14:22:05' is not ISO 8601 UTC (YYYY-MM-DDTHH:MM:SSZ)
+  row   52 TXN-2026-000049  REJECTED [SIGNATURE_INVALID] signature does not match record content
+  row   63 TXN-2026-001026  FLAGGED  [ANOMALY_AMOUNT] amount 2,775,000.00 has robust z=+8.11 vs Household history (median 4,140.74); |z|>3.5
+  row   63 TXN-2026-001026  FLAGGED  [ANOMALY_QUANTITY] quantity 150 > 2 x historical p99.5 (5.8) for Household
+  row   74 TXN-2026-000017  REJECTED [DUPLICATE_REPLAY] TXN-2026-000017 is an exact repeat of row 17 (rows [17, 74])
+  row  101 TXN-2026-001030  REJECTED [DISALLOWED_VALUE] source 'SRC-999' is not a registered source
+  row  183 TXN-2026-001009  REJECTED [INVALID_TYPE] quantity='5 units': Input should be a valid integer, unable to parse string as an integer
+  row  199 TXN-2026-001001  REJECTED [MISSING_REQUIRED_FIELD] required field 'source_id' is missing or blank
+  row  262 TXN-2026-001018  REJECTED [NEGATIVE_VALUE] quantity='-10': Input should be greater than or equal to 1
+  row  282 TXN-2026-001023  REJECTED [TIMESTAMP_OUTSIDE_WINDOW] 2027-03-15T09:30:00Z outside batch window 2026-10-01 to 2026-10-31
+  row  315 TXN-2026-001025  FLAGGED  [ANOMALY_UNIT_PRICE] unit_price 285,000.00 has robust z=+3.52 vs Electronics history (median 22,407.04); |z|>3.5
+  row  436 TXN-2026-000419  REJECTED [DUPLICATE_ID_CONFLICT] TXN-2026-000419 appears in rows [436, 723] with different content; genuine version cannot be determined
+  row  501 TXN-2026-001035  REJECTED [OUT_OF_RANGE] quantity='5000': Input should be less than or equal to 1000
+  row  531 TXN-26-77        REJECTED [INVALID_FORMAT] record_id='TXN-26-77': String should match pattern '^TXN-\d{4}-\d{6}$'
+  row  997 TXN-2026-001034  REJECTED [AMOUNT_INCONSISTENT] amount 30,000.00 != quantity x unit_price 3,000.00
+
+==============================================================================
+EXPERIMENT C - Comparison of downstream results
+==============================================================================
++---------------------------+--------------+----------------+------------+------------------+------------+
+| Metric                    | Clean truth  | A: no controls | A vs truth | B: with controls | B vs truth |
++---------------------------+--------------+----------------+------------+------------------+------------+
+| Records in report         |         1000 |           1045 |     +4.50% |              988 |     -1.20% |
+| Total revenue (KES)       | 9,042,545.44 |  18,611,383.96 |   +105.82% |     8,952,346.17 |     -1.00% |
+| Mean transaction (KES)    |     9,042.55 |      17,861.21 |    +97.52% |         9,061.08 |     +0.20% |
+| Median transaction (KES)  |     2,634.97 |       2,827.32 |     +7.30% |         2,644.02 |     +0.34% |
+| Largest transaction (KES) |   252,645.88 |   3,420,000.00 |  +1253.67% |       252,645.88 |     +0.00% |
+| Unparseable amounts       |            0 |              3 | n/a        |                0 | n/a        |
++---------------------------+--------------+----------------+------------+------------------+------------+
++------------------+--------------+----------------+------------+------------------+------------+
+| Category revenue | Clean truth  | A: no controls | A vs truth | B: with controls | B vs truth |
++------------------+--------------+----------------+------------+------------------+------------+
+| Clothing         |   835,014.13 |   1,351,539.91 |    +61.86% |       830,859.89 |     -0.50% |
+| Electronics      | 6,200,467.29 |  10,172,379.03 |    +64.06% |     6,207,631.26 |     +0.12% |
+| Groceries        |   545,767.71 |   1,526,475.59 |   +179.69% |       537,126.00 |     -1.58% |
+| Household        | 1,335,710.56 |   4,185,208.22 |   +213.33% |     1,250,747.81 |     -6.36% |
+| Stationery       |   125,585.75 |   1,295,981.21 |   +931.95% |       125,981.21 |     +0.31% |
+| (blank)          | n/a          |       4,800.00 | n/a        | n/a              | n/a        |
+| Crypto           | n/a          |      75,000.00 | n/a        | n/a              | n/a        |
++------------------+--------------+----------------+------------+------------------+------------+
+Residual difference with controls, by cause (B total - true total):
++---------------------------+------------------------+-------------------------------+
+| Scenario                  | Rows in trusted output | Effect on total revenue (KES) |
++---------------------------+------------------------+-------------------------------+
+| LEGITIMATE                |                    978 |                    -77,206.14 |
+| S7_IN_TRANSIT_TAMPERING   |                      0 |                    -26,778.54 |
+| S8_PLAUSIBLE_MANIPULATION |                     10 |                     13,785.41 |
++---------------------------+------------------------+-------------------------------+
+
+==============================================================================
+CONTROL EFFECTIVENESS (scored against the attack manifest)
+==============================================================================
++---------------------------+---------------------------+------+----------+----------+---------+-------------+
+| Scenario                  | Class                     | Rows | Accepted | Rejected | Flagged | Quarantined |
++---------------------------+---------------------------+------+----------+----------+---------+-------------+
+| LEGITIMATE                | legitimate                |  982 |      978 |        2 |       2 |        0.4% |
+| S1_MISSING_FIELDS         | invalid                   |    6 |        0 |        6 |       0 |      100.0% |
+| S2_INVALID_TYPES          | invalid                   |    6 |        0 |        6 |       0 |      100.0% |
+| S3_NEGATIVE_VALUES        | invalid                   |    6 |        0 |        6 |       0 |      100.0% |
+| S4_DUPLICATE_IDS          | invalid                   |   10 |        0 |       10 |       0 |      100.0% |
+| S5_INVALID_TIMESTAMPS     | invalid                   |    6 |        0 |        6 |       0 |      100.0% |
+| S6_EXTREME_VALUES         | suspicious                |    5 |        0 |        0 |       5 |      100.0% |
+| S7_IN_TRANSIT_TAMPERING   | plausible but manipulated |    8 |        0 |        8 |       0 |      100.0% |
+| S8_PLAUSIBLE_MANIPULATION | plausible but manipulated |   10 |       10 |        0 |       0 |        0.0% |
+| S9_RULE_VIOLATIONS        | invalid                   |    6 |        0 |        6 |       0 |      100.0% |
++---------------------------+---------------------------+------+----------+----------+---------+-------------+
+Legitimate records: 982 | Manipulated records: 63
+Manipulated records quarantined: 53 (84.1%), missed: 10; excluding the deliberately undetectable S8 set: 100.0%
+Legitimate records quarantined: 4 (0.41%)
+  legit quarantined: row 436 TXN-2026-000419 REJECTED: TXN-2026-000419 appears in rows [436, 723] with different content; genuine version cannot be determined
+  legit quarantined: row 518 TXN-2026-000499 REJECTED: TXN-2026-000499 appears in rows [518, 714] with different content; genuine version cannot be determined
+  legit quarantined: row 670 TXN-2026-000643 FLAGGED: amount 70,569.96 has robust z=+3.54 vs Household history (median 4,140.74); |z|>3.5
+  legit quarantined: row 706 TXN-2026-000678 FLAGGED: amount 79.27 has robust z=-4.01 vs Groceries history (median 1,266.01); |z|>3.5
+  missed: row 128 TXN-2026-000122 S8_PLAUSIBLE_MANIPULATION: price inflated 60% but still typical; amount 423.09 -> 676.94; re-signed
+  missed: row 361 TXN-2026-000345 S8_PLAUSIBLE_MANIPULATION: price inflated 60% but still typical; amount 817.97 -> 1308.75; re-signed
+  missed: row 404 TXN-2026-000388 S8_PLAUSIBLE_MANIPULATION: price inflated 60% but still typical; amount 315.12 -> 504.20; re-signed
+  missed: row 628 TXN-2026-000604 S8_PLAUSIBLE_MANIPULATION: price inflated 60% but still typical; amount 2490.90 -> 3985.44; re-signed
+  missed: row 649 TXN-2026-000624 S8_PLAUSIBLE_MANIPULATION: price inflated 60% but still typical; amount 11939.95 -> 19103.92; re-signed
+  missed: row 752 TXN-2026-000719 S8_PLAUSIBLE_MANIPULATION: price inflated 60% but still typical; amount 1543.58 -> 2469.73; re-signed
+  missed: row 834 TXN-2026-000800 S8_PLAUSIBLE_MANIPULATION: price inflated 60% but still typical; amount 2065.14 -> 3304.22; re-signed
+  missed: row 909 TXN-2026-000873 S8_PLAUSIBLE_MANIPULATION: price inflated 60% but still typical; amount 659.10 -> 1054.56; re-signed
+  missed: row 915 TXN-2026-000879 S8_PLAUSIBLE_MANIPULATION: price inflated 60% but still typical; amount 1316.70 -> 2106.70; re-signed
+  missed: row 973 TXN-2026-000935 S8_PLAUSIBLE_MANIPULATION: price inflated 60% but still typical; amount 1404.18 -> 2246.68; re-signed
+
+Downstream summary engine: pandas
+
+==============================================================================
+DONE in 2.0 s
+==============================================================================
+Results  : reports\experiment_results.json
+Trusted  : data\trusted\trusted_transactions.csv
+Quarantine: data\quarantine\quarantined_records.csv and data\quarantine\quarantined_records.jsonl
+Logs     : logs/security_events.jsonl, logs/ingestion_runs.jsonl, logs/pipeline.log
+Figures  : reports\figures\fig1_total_revenue.png, reports\figures\fig2_revenue_by_category.png, reports\figures\fig3_outcomes_by_scenario.png, reports\figures\fig4_failures_by_reason.png

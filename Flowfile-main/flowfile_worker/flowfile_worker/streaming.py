@@ -1,0 +1,554 @@
+"""
+WebSocket streaming endpoint for worker-core communication.
+
+Replaces the HTTP poll-based pattern with a single WebSocket connection per task:
+1. Core sends JSON metadata + binary payload
+2. Worker streams progress updates as JSON
+3. Worker sends result as binary frame (no base64 encoding)
+
+This eliminates:
+- HTTP polling latency (0.5s+ per poll cycle)
+- Base64 encode/decode overhead on result bytes
+- Multiple HTTP round-trips per task
+
+``v1_streaming_router`` serves ``/v1/ws/submit``: the ``/v1`` submit over one connection, with
+progress frames while its child runs.
+"""
+
+import asyncio
+import gc
+import os
+import threading
+import uuid
+from base64 import b64encode
+from dataclasses import dataclass
+from multiprocessing import Process
+from multiprocessing.queues import Queue
+from time import monotonic
+from typing import Any
+
+import anyio
+from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import JSONResponse
+
+from flowfile_worker import CACHE_DIR, funcs, models, mp_context, pool, service, status_dict, status_dict_lock
+from flowfile_worker.auth import websocket_authorized
+from flowfile_worker.configs import logger
+from flowfile_worker.pool import PoolMember
+from flowfile_worker.protocol_routes import parse_submit_meta, require_protocol_version, run_submit
+from flowfile_worker.spawner import (
+    _TASK_TIMEOUT,
+    drain_member_envelope,
+    drain_result_queue,
+    process_manager,
+    unpack_result,
+)
+from flowfile_worker.task_errors import FailureKind, describe_exception, split_failure
+
+streaming_router = APIRouter()
+
+_POLARS_RESULT_OPERATIONS = frozenset({"store"})
+
+# Progress polls back off exponentially: fast at first, capped so the monitor never busy-waits.
+_MONITOR_INITIAL_DELAY = 0.005
+_MONITOR_MAX_DELAY = 0.3
+_MONITOR_BACKOFF = 1.5
+
+# Resend progress at least this often: core reads silence past FLOWFILE_WORKER_WS_TIMEOUT as a wedge.
+_HEARTBEAT_INTERVAL = 10.0
+
+
+def _get_result_type(operation: str) -> str:
+    return "polars" if operation in _POLARS_RESULT_OPERATIONS else "other"
+
+
+# Task context
+
+
+@dataclass
+class _TaskContext:
+    """Parsed and resolved metadata for a WebSocket task."""
+
+    task_id: str
+    operation: str
+    flow_id: int
+    node_id: int | str
+    extra_kwargs: dict
+    file_path: str
+    result_type: str
+
+
+def _parse_metadata(metadata: dict) -> _TaskContext:
+    """Parse raw WebSocket metadata into a resolved TaskContext."""
+    task_id = metadata.get("task_id") or str(uuid.uuid4())
+    operation = metadata.get("operation", "store")
+    flow_id = int(metadata.get("flow_id", 1))
+    node_id = metadata.get("node_id", -1)
+    extra_kwargs = metadata.get("kwargs", {})
+
+    try:
+        node_id = int(node_id)
+    except (ValueError, TypeError):
+        pass
+
+    cache_dir = CACHE_DIR / str(flow_id)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    file_path = os.path.join(str(cache_dir), f"{task_id}.arrow")
+    result_type = _get_result_type(operation)
+
+    return _TaskContext(
+        task_id=task_id,
+        operation=operation,
+        flow_id=flow_id,
+        node_id=node_id,
+        extra_kwargs=extra_kwargs,
+        file_path=file_path,
+        result_type=result_type,
+    )
+
+
+def _register_status(ctx: _TaskContext) -> None:
+    """Register the task in status_dict for REST compatibility."""
+    status_dict[ctx.task_id] = models.Status(
+        background_task_id=ctx.task_id,
+        status="Starting",
+        file_ref=ctx.file_path,
+        result_type=ctx.result_type,
+    )
+
+
+# Subprocess management
+
+
+def _register_running(ctx: _TaskContext, p: Process, pooled: bool) -> None:
+    """Track the task's process and flip its status once it is underway."""
+    process_manager.add_process(ctx.task_id, p)
+    with status_dict_lock:
+        status_dict[ctx.task_id].status = "Processing"
+    logger.info(f"[WS] Started task {ctx.task_id} with operation: {ctx.operation}{' (pooled)' if pooled else ''}")
+
+
+def _spawn_subprocess(ctx: _TaskContext, polars_bytes: bytes) -> tuple[Process, Any, Any, Queue, PoolMember | None]:
+    """Lease a pool member or spawn a subprocess; returns (process, progress, error_message, queue, member).
+
+    *member* is None on the default spawn-per-task path.
+    """
+    kwargs = dict(ctx.extra_kwargs)
+    kwargs["polars_serializable_object"] = polars_bytes
+    kwargs["file_path"] = ctx.file_path
+    kwargs["flowfile_flow_id"] = ctx.flow_id
+    kwargs["flowfile_node_id"] = ctx.node_id
+
+    member = pool.task_pool.acquire(ctx.operation)
+    if member is not None:
+        try:
+            member.submit(ctx.operation, kwargs)
+            _register_running(ctx, member.process, pooled=True)
+        except Exception:
+            # A failed lease must not leak the slot; ws_submit owns checkin after this.
+            pool.task_pool.checkin(member, reusable=False)
+            raise
+        return member.process, member.progress, member.error_message, member.result_q, member
+
+    progress = mp_context.Value("i", 0)
+    error_message = mp_context.Array("c", 1024)
+    queue = mp_context.Queue(maxsize=1)
+    kwargs["progress"] = progress
+    kwargs["error_message"] = error_message
+    kwargs["queue"] = queue
+
+    p = mp_context.Process(target=getattr(funcs, ctx.operation), kwargs=kwargs)
+    p.start()
+    _register_running(ctx, p, pooled=False)
+    return p, progress, error_message, queue, None
+
+
+def _read_error_message(error_message) -> tuple[FailureKind, str]:
+    """Extract the failure kind and error string from the shared ctypes array."""
+    with error_message.get_lock():
+        return split_failure(error_message.value.decode().rstrip("\x00"))
+
+
+def _set_error_status(task_id: str, msg: str, kind: FailureKind) -> None:
+    """Update status_dict to reflect an error."""
+    with status_dict_lock:
+        status_dict[task_id].status = "Error"
+        status_dict[task_id].error_message = msg
+        status_dict[task_id].error_kind = kind
+
+
+def _task_error_frame(msg: str, kind: FailureKind) -> dict:
+    """Error frame for a task the worker ran; *kind* tells core whether to fail the node or degrade."""
+    return {"type": "error", "error_message": msg, "status": "Error", "error_kind": kind}
+
+
+# Progress monitoring
+
+
+async def _monitor_progress(websocket: WebSocket, p: Process, progress, error_message, task_id: str) -> bool:
+    """Stream progress updates while subprocess is alive.
+
+    Returns True if an error was detected and sent to the client.
+    """
+    last_progress = -1
+    last_sent = monotonic()
+
+    delay = _MONITOR_INITIAL_DELAY
+    deadline = (monotonic() + _TASK_TIMEOUT) if _TASK_TIMEOUT else None
+    while p.is_alive():
+        with progress.get_lock():
+            current = progress.value
+
+        if current != last_progress or monotonic() - last_sent >= _HEARTBEAT_INTERVAL:
+            try:
+                await websocket.send_json({"type": "progress", "progress": current})
+            except Exception:
+                return False
+            last_progress = current
+            last_sent = monotonic()
+
+        if current == -1:
+            kind, msg = _read_error_message(error_message)
+            _set_error_status(task_id, msg, kind)
+            await websocket.send_json(_task_error_frame(msg, kind))
+            return True
+
+        # A child blocked on a large put() never exits, so stop here; the caller drains its queue.
+        if current == 100:
+            return False
+
+        if deadline is not None and monotonic() > deadline:
+            p.terminate()
+            msg = f"Task exceeded the {_TASK_TIMEOUT:.0f}s time limit and was terminated"
+            _set_error_status(task_id, msg, "environment")
+            await websocket.send_json(_task_error_frame(msg, "environment"))
+            return True
+
+        await asyncio.sleep(delay)
+        delay = min(delay * _MONITOR_BACKOFF, _MONITOR_MAX_DELAY)
+
+    return False
+
+
+# Result handling
+
+
+def _update_completed_status(task_id: str, result_data: Any, number_of_records: int | None) -> None:
+    """Update status_dict for a successfully completed task."""
+    with status_dict_lock:
+        status_dict[task_id].status = "Completed"
+        status_dict[task_id].progress = 100
+        if number_of_records is not None:
+            status_dict[task_id].number_of_records = number_of_records
+        if result_data is not None:
+            if isinstance(result_data, bytes):
+                status_dict[task_id].results = b64encode(result_data).decode("ascii")
+            else:
+                status_dict[task_id].results = result_data
+
+
+async def _send_completion(
+    websocket: WebSocket,
+    task_id: str,
+    result_type: str,
+    file_path: str,
+    result_data: Any,
+    number_of_records: int | None,
+) -> None:
+    """Send completion message and result data over WebSocket.
+
+    *result_data* is drained from the result queue by the caller before joining the
+    child, so this coroutine never touches the queue (draining after join can deadlock).
+    """
+    _update_completed_status(task_id, result_data, number_of_records)
+
+    has_result = result_data is not None
+    await websocket.send_json(
+        {
+            "type": "complete",
+            "result_type": result_type,
+            "file_ref": file_path,
+            "has_result": has_result,
+            "number_of_records": number_of_records,
+        }
+    )
+
+    if has_result:
+        if isinstance(result_data, bytes):
+            await websocket.send_bytes(result_data)
+        else:
+            await websocket.send_json({"type": "result_data", "data": result_data})
+
+    logger.info(f"[WS] Task {task_id} completed successfully")
+
+
+async def _send_final_error(websocket: WebSocket, task_id: str, progress, error_message) -> None:
+    """Handle error or unexpected termination after subprocess exits."""
+    with progress.get_lock():
+        final = progress.value
+
+    if final == -1:
+        kind, msg = _read_error_message(error_message)
+        _set_error_status(task_id, msg, kind)
+        await websocket.send_json(_task_error_frame(msg, kind))
+    else:
+        with status_dict_lock:
+            status_dict[task_id].status = "Unknown Error"
+        await websocket.send_json(
+            {
+                "type": "error",
+                "error_message": "Process ended unexpectedly",
+            }
+        )
+
+
+# Disconnect handling
+
+
+def _handoff_to_background(
+    task_id: str, p: Process, progress, error_message, queue: Queue, member: PoolMember | None
+) -> None:
+    """Hand off a running subprocess to a background thread for REST status updates.
+
+    handle_task owns the process from here on, including checking a pool member
+    back in when the task finishes off-socket.
+    """
+    from flowfile_worker.spawner import handle_task as _handle_task
+
+    threading.Thread(
+        target=_handle_task,
+        args=(task_id, p, progress, error_message, queue),
+        kwargs={"member": member},
+        daemon=True,
+    ).start()
+
+
+# Cleanup
+
+
+def _cleanup_process(task_id: str | None, p: Process | None) -> None:
+    """Clean up subprocess resources."""
+    if p is not None:
+        if p.is_alive():
+            p.join(timeout=1)
+            if p.is_alive():
+                p.terminate()
+                p.join()
+        process_manager.remove_process(task_id)
+
+
+# WebSocket endpoint
+
+
+@streaming_router.websocket("/ws/submit")
+async def ws_submit(websocket: WebSocket):
+    """WebSocket endpoint for streaming task submission and result retrieval.
+
+    Protocol (Core -> Worker):
+        1. JSON message: task metadata (task_id, operation, flow_id, node_id, kwargs)
+        2. Binary message: serialized Polars LazyFrame bytes
+
+    Protocol (Worker -> Core):
+        - JSON: {"type": "progress", "progress": N}  (0-100, sent periodically)
+        - JSON: {"type": "complete", "result_type": "polars"|"other", "file_ref": "...", "has_result": bool}
+        - Binary: raw result bytes (only if has_result=True and result_type="polars")
+        - JSON: {"type": "result_data", "data": ...} (only if has_result=True and result_type="other")
+        - JSON: {"type": "error", "error_message": "...", "status": "Error"?, "error_kind": "task"|"environment"?}
+          (status and error_kind only when the task ran and failed; "environment" = the worker
+          could not load the plan, write the result or finish in time, so core degrades)
+
+    A pool member puts one completion envelope per task, on error too, which is the result on
+    success. Only a member that finished on its own is drained and reused: one the monitor
+    terminated, even after it reached 100, or one that died is not, since a killed writer's
+    partial envelope can block the read.
+    """
+    if not websocket_authorized(websocket):
+        await websocket.close(code=1008)
+        return
+    await websocket.accept()
+    p = None
+    task_id = None
+    progress = None
+    error_message = None
+    queue = None
+    member = None
+    envelope_received = False
+
+    try:
+        metadata = await websocket.receive_json()
+        ctx = _parse_metadata(metadata)
+        task_id = ctx.task_id
+        _register_status(ctx)
+
+        polars_bytes = await websocket.receive_bytes()
+
+        p, progress, error_message, queue, member = _spawn_subprocess(ctx, polars_bytes)
+
+        had_error = await _monitor_progress(websocket, p, progress, error_message, task_id)
+
+        raw = None
+        if member is not None:
+            with progress.get_lock():
+                final = progress.value
+            # At 100 with had_error the monitor timed the member out after its last read.
+            if final in (100, -1) and not (had_error and final == 100):
+                # Unmap first so a stale /cancel_task cannot terminate a reusable member.
+                process_manager.remove_process(task_id)
+                envelope_received, raw = await asyncio.to_thread(drain_member_envelope, queue, p)
+            elif not had_error and p.is_alive():
+                # The socket died mid-task: let the task finish off-socket, as the spawn path does.
+                _handoff_to_background(task_id, p, progress, error_message, queue, member)
+                p = None
+                progress = None
+                error_message = None
+                member = None
+                return
+        if had_error:
+            return
+
+        with progress.get_lock():
+            final = progress.value
+
+        if final == 100:
+            if member is None:
+                # Drain before joining: a large put() blocks the child until read, so joining deadlocks.
+                raw = await asyncio.to_thread(drain_result_queue, queue, p)
+                await asyncio.to_thread(p.join)
+            result_data, number_of_records = unpack_result(raw)
+            await _send_completion(websocket, task_id, ctx.result_type, ctx.file_path, result_data, number_of_records)
+        else:
+            if member is None:
+                await asyncio.to_thread(p.join)
+            await _send_final_error(websocket, task_id, progress, error_message)
+
+    except WebSocketDisconnect:
+        logger.warning(f"[WS] Client disconnected for task {task_id}")
+        # A drained member's task is terminal; a hand-off would re-drain and retire a healthy member.
+        if p is not None and p.is_alive() and queue is not None and not envelope_received:
+            _handoff_to_background(task_id, p, progress, error_message, queue, member)
+            # Prevent finally block from cleaning up - handle_task owns these now
+            p = None
+            progress = None
+            error_message = None
+            member = None
+    except Exception as e:
+        logger.error(f"[WS] Error for task {task_id}: {e}", exc_info=True)
+        try:
+            await websocket.send_json({"type": "error", "error_message": describe_exception(e)})
+        except Exception:
+            pass
+    finally:
+        if member is not None:
+            process_manager.remove_process(task_id)
+            # A cancel before the thread starts would drop the checkin and leak the member's slot.
+            with anyio.CancelScope(shield=True):
+                await asyncio.to_thread(pool.task_pool.checkin, member, envelope_received)
+        elif p is not None:
+            await asyncio.to_thread(_cleanup_process, task_id, p)
+        del p, progress, error_message
+        gc.collect(0)
+
+
+v1_streaming_router = APIRouter(prefix="/v1")
+
+
+def _job_progress(job_id: str) -> int | None:
+    """A running job's progress; ``None`` before it registers, once it ended, or for an earlier job's leftover entry."""
+    with status_dict_lock:
+        status = status_dict.get(job_id)
+        if status is None or status.status not in ("Starting", "Processing"):
+            return None
+        return status.progress
+
+
+async def _send_job_progress(websocket: WebSocket, job: asyncio.Future, job_id: str) -> bool:
+    """Send the job's progress until the job is done; ``False`` once a send failed, which stops the job.
+
+    A frame goes out on each change and every ``_HEARTBEAT_INTERVAL`` otherwise, polled with the
+    ``_monitor_progress`` backoff. A failed send means the client left, and core never reads a result after its
+    socket closed, so the job is stopped (``service.stop_job``, as a cancel does) and the wait ends with it.
+    """
+    connected = True
+    last_progress = None
+    last_sent = monotonic()
+    delay = _MONITOR_INITIAL_DELAY
+    while not job.done():
+        current = _job_progress(job_id)
+        if (
+            connected
+            and current is not None
+            and (current != last_progress or monotonic() - last_sent >= _HEARTBEAT_INTERVAL)
+        ):
+            try:
+                await websocket.send_json({"type": "progress", "progress": current})
+            except Exception:
+                logger.warning(f"[WS] Client left during /v1 submit {job_id}; the submit is stopped")
+                connected = False
+                await asyncio.to_thread(service.stop_job, job_id)
+            last_progress = current
+            last_sent = monotonic()
+        await asyncio.wait({job}, timeout=delay)
+        delay = min(delay * _MONITOR_BACKOFF, _MONITOR_MAX_DELAY)
+    return connected
+
+
+@v1_streaming_router.websocket("/ws/submit")
+async def ws_submit_v1(websocket: WebSocket):
+    """``POST /v1/submit`` over a WebSocket, with progress frames while the child runs.
+
+    Before accepting, a bad token closes 1008 and a missing or foreign ``X-Protocol-Version`` gets the
+    REST 426. Core sends the ``meta`` JSON as a text frame, then the plan as a binary frame. The worker sends:
+
+        - JSON: {"type": "progress", "progress": N}  (0-100, on each change and as a heartbeat)
+        - JSON: {"type": "complete", "result": <SubmitResult, bytes base64>}
+        - JSON: {"type": "error", "status_code": N, "detail": ...}  (what the REST route answers)
+
+    then closes with 1000. A client that leaves stops the submit: the first progress frame that fails to send
+    cancels the job, and a result that completed before the client left is released (``_release_unread``), since
+    core never reads a result after its socket closed. Cancel is ``POST /v1/jobs/{id}/cancel``.
+    """
+    if not websocket_authorized(websocket):
+        await websocket.close(code=1008)
+        return
+    try:
+        await require_protocol_version(websocket)
+    except HTTPException as e:
+        await websocket.send_denial_response(JSONResponse({"detail": e.detail}, status_code=e.status_code))
+        return
+    await websocket.accept()
+    try:
+        meta = await websocket.receive_text()
+        plan = await websocket.receive_bytes()
+    except WebSocketDisconnect:
+        return
+
+    connected = True
+    result_id = None
+    try:
+        submit_meta = parse_submit_meta(meta)
+        result_id = submit_meta.result_id
+        job = asyncio.ensure_future(run_in_threadpool(run_submit, submit_meta, plan))
+        connected = await _send_job_progress(websocket, job, result_id)
+        frame = {"type": "complete", "result": job.result().model_dump(mode="json")}
+    except HTTPException as e:
+        frame = {"type": "error", "status_code": e.status_code, "detail": e.detail}
+    except Exception as e:
+        logger.error(f"[WS] /v1 submit failed: {e}", exc_info=True)
+        frame = {"type": "error", "status_code": 500, "detail": describe_exception(e)}
+    if not connected:
+        await _release_unread(result_id, frame)
+        return
+    try:
+        await websocket.send_json(frame)
+        await websocket.close()
+    except Exception:
+        logger.warning(f"[WS] Client left before the /v1 submit's final frame ({result_id})")
+        await _release_unread(result_id, frame)
+
+
+async def _release_unread(result_id: str | None, frame: dict[str, Any]) -> None:
+    """Release the result a submit completed for a client that left; core never reads it once its socket closed."""
+    if result_id is not None and frame.get("type") == "complete":
+        await asyncio.to_thread(service.release, result_id)
+        logger.warning(f"[WS] Released result {result_id}: its /v1 submit completed for a client that left")

@@ -1,0 +1,1749 @@
+<script setup lang="ts">
+// TODO(refactor): bundles several concerns. Still to extract:
+//   - 6 draggable panel wrappers → individual *Panel components
+//   - context menu handling → useContextMenu composable
+// (clipboard/copy-paste now lives in composables/useFlowClipboard, keyboard
+//  shortcuts in composables/useFlowHotkeys.)
+import {
+  ref,
+  computed,
+  markRaw,
+  onMounted,
+  onUnmounted,
+  defineExpose,
+  nextTick,
+  defineEmits,
+  provide,
+  watch,
+} from "vue";
+import {
+  VueFlow,
+  NodeTypesObject,
+  NodeComponent,
+  EdgeComponent,
+  Node,
+  useVueFlow,
+  ConnectionMode,
+} from "@vue-flow/core";
+import type { EdgeChange, GraphNode, NodeChange } from "@vue-flow/core";
+import { MiniMap } from "@vue-flow/minimap";
+
+import CustomNode from "../../components/nodes/NodeWrapper.vue";
+import GroupNode from "../../components/nodes/GroupNode.vue";
+import CommentNode from "../../components/nodes/CommentNode.vue";
+import {
+  commentBackendId,
+  isCommentNodeId,
+  useCanvasComments,
+} from "../../composables/useCanvasComments";
+import {
+  useNodeGroups,
+  isGroupNodeId,
+  GROUP_PROXY_EDGE_PREFIX,
+  GROUP_PROXY_EDGE_TYPE,
+} from "../../composables/useNodeGroups";
+import DeletableEdge from "./DeletableEdge.vue";
+import GroupProxyEdge from "./GroupProxyEdge.vue";
+import useDragAndDrop from "./useDnD";
+import {
+  isCommittedEdgeRemoval,
+  markHoveredEdge,
+  detectEdgeUnderPointer,
+  markAutoConnectNode,
+} from "../../composables/useDragAndDrop";
+import type { AutoConnectMatch } from "../../utils/autoConnect";
+import { useStaleModifierGuard } from "../../composables/useStaleModifierGuard";
+import { isMultiSelectClick } from "./multiSelect";
+import NodeList from "./NodeList.vue";
+import { useAiStore } from "../../stores/ai-store";
+import { useNodeStore } from "../../stores/column-store";
+import { useEditorStore } from "../../stores/editor-store";
+import { useFlowStore, FLOW_ID_STORAGE_KEY } from "../../stores/flow-store";
+import { useDrawerStore } from "../../stores/drawer-store";
+import { useTutorialStore } from "../../stores/tutorial-store";
+import { FlowApi } from "../../api";
+import {
+  mutationGeneration,
+  releaseMutationSlot,
+  reserveMutationSlot,
+  whenMutationsIdle,
+} from "../../services/axios.config";
+import { flushPendingEdits, registerPendingEdit } from "../../services/mutationChannel";
+import { recoverFromFailedMutation } from "../../services/mutationFailure";
+import {
+  buildRemovalBatch,
+  connection,
+  createRemovalCollector,
+  type RemovalTick,
+} from "../../utils/graphOperations";
+import {
+  copyNodesToBuffer,
+  copySingleNodeToBuffer,
+  hasTextSelection,
+  isCanvasClipboardTarget,
+  readNodeClipboardBuffer,
+  resolvePasteIntent,
+  writeSentinelToOsClipboard,
+} from "../../composables/useFlowClipboard";
+import type { CopyableNodeData, PasteIntent } from "../../composables/useFlowClipboard";
+import { useContextMenu } from "../../composables/useContextMenu";
+import { useFlowExecution } from "../../composables/useFlowExecution";
+import { useFlowHotkeys } from "../../composables/useFlowHotkeys";
+import { broadcastSelection, usePopout } from "../../composables/usePopout";
+import { desktop, isDesktop } from "../../../lib/desktop";
+import DraggableItem from "../../components/common/DraggableItem/DraggableItem.vue";
+import layoutControls from "../../components/common/DraggableItem/layoutControls.vue";
+import { useItemStore } from "../../components/common/DraggableItem/stateStore";
+import TabbedDrawer from "./TabbedDrawer.vue";
+import { drawers } from "./drawerRegistry";
+import type { DrawerDef } from "../../types/drawer.types";
+import ContextMenu from "./ContextMenu.vue";
+import FileDropOverlay from "./FileDropOverlay.vue";
+import FileDropUploadDialog from "./FileDropUploadDialog.vue";
+import { useFileDropImport } from "../../composables/useFileDropImport";
+import AiCommandPalette from "../../features/ai/AiCommandPalette.vue";
+import AiGhostNode from "../../features/ai/AiGhostNode.vue";
+import { useGhostNodeSuggestions } from "../../features/ai/useGhostNodeSuggestions";
+import { useAiGhostNodeStore } from "../../stores/ai-ghost-node-store";
+import { CatalogApi } from "../../api/catalog.api";
+import { nodeDocsUrl } from "./nodeDocsLinks";
+import { NodeCopyInput, ContextMenuAction, CursorPosition } from "./types";
+import type { GraphOperation, NodeHandle, NodeTemplate } from "../../types/flow.types";
+import type { RunFlowReference } from "../../types/node.types";
+import type { Connection } from "@vue-flow/core";
+import { applyStandardLayout } from "./editorLayoutInterface";
+import { ElMessage, ElMessageBox } from "element-plus";
+import axios from "axios";
+
+/** Typed subset of VueFlow node data used for edge label computation. */
+interface FlowNodeData {
+  id?: number;
+  nodeReference?: string;
+  outputs?: NodeHandle[];
+}
+
+const itemStore = useItemStore();
+// Live height of the canvas <main> element, from the store's shared container
+// measurement (registered in onMounted). Falls back to the window while the
+// container is unmeasured (first frame).
+const availableHeight = computed(() => itemStore.containerBounds.height || window.innerHeight - 50);
+const nodeStore = useNodeStore();
+const editorStore = useEditorStore();
+const flowStore = useFlowStore();
+const drawerStore = useDrawerStore();
+const aiStore = useAiStore();
+const rawCustomNode = markRaw(CustomNode);
+const rawGroupNode = markRaw(GroupNode);
+const rawCommentNode = markRaw(CommentNode);
+const rawDeletableEdge = markRaw(DeletableEdge);
+const rawGroupProxyEdge = markRaw(GroupProxyEdge);
+const { updateEdge, addEdges, fitView, screenToFlowCoordinate, addSelectedNodes, onPaneReady } =
+  useVueFlow();
+
+useStaleModifierGuard();
+
+let resolvePaneReady: () => void;
+const paneReadyPromise = new Promise<void>((resolve) => {
+  resolvePaneReady = resolve;
+});
+onPaneReady(() => resolvePaneReady());
+
+// Closure-scoped (non-reactive) counter used to discard stale loadFlow runs
+// when a newer one starts. Each call captures its own myToken; if loadToken
+// has advanced past it at any await boundary, that run bails out.
+let loadToken = 0;
+// Reactive flag the parent (DesignerView) reads to drive its switch-indicator.
+// Stays true for the entire async load so the spinner doesn't flicker off
+// before the canvas actually finishes populating.
+const isLoadingFlow = ref(false);
+const vueFlow = ref<InstanceType<typeof VueFlow>>();
+const nodeTypes: NodeTypesObject = {
+  "custom-node": rawCustomNode as NodeComponent,
+  group: rawGroupNode as NodeComponent,
+  comment: rawCommentNode as NodeComponent,
+};
+const edgeTypes = {
+  default: rawDeletableEdge as EdgeComponent,
+  [GROUP_PROXY_EDGE_TYPE]: rawGroupProxyEdge as EdgeComponent,
+};
+const hoveredEdgeId = ref<string | null>(null);
+// Short delay before clearing on edge-leave so the cursor can cross the SVG→HTML
+// boundary onto the delete button (rendered via EdgeLabelRenderer/Teleport)
+// without the button hiding from under it. Also lets a same-frame enter on a
+// neighbouring edge cancel the clear, killing a race where mouseleave on the
+// previous edge would wipe state set by mouseenter on the next one.
+let leaveTimeout: ReturnType<typeof setTimeout> | null = null;
+
+const cancelEdgeLeave = () => {
+  if (leaveTimeout) {
+    clearTimeout(leaveTimeout);
+    leaveTimeout = null;
+  }
+};
+
+const scheduleEdgeLeave = (edgeId: string) => {
+  cancelEdgeLeave();
+  leaveTimeout = setTimeout(() => {
+    if (hoveredEdgeId.value === edgeId) {
+      hoveredEdgeId.value = null;
+    }
+    leaveTimeout = null;
+  }, 150);
+};
+
+provide("hoveredEdgeId", hoveredEdgeId);
+provide("cancelEdgeLeave", cancelEdgeLeave);
+provide("scheduleEdgeLeave", scheduleEdgeLeave);
+
+// Schema-grounded "suggest next node" — a deliberate action (right-click a
+// node → "Suggest next node…") that opens an inline intent box and, on submit,
+// previews AI-proposed downstream nodes to confirm. The popover + request
+// state live in the composable/store; dismiss is wired into handleCanvasClick.
+const ghostNode = useGhostNodeSuggestions();
+
+function onEdgeMouseEnter(payload: {
+  edge: { id: string; source: string; target: string };
+  event: unknown;
+}) {
+  cancelEdgeLeave();
+  hoveredEdgeId.value = payload.edge.id;
+}
+
+function onEdgeMouseLeave({ edge }: { edge: { id: string } }) {
+  if (hoveredEdgeId.value !== edge.id) return;
+  scheduleEdgeLeave(edge.id);
+}
+
+/**
+ * Dragging an existing, still-unconnected canvas node onto an edge splices it
+ * in the same way a palette-dropped node does, and releasing it next to a
+ * node auto-connects the two. We reuse the edge hit-test and neighbour
+ * detection from the composable; the node is already on both the UI and
+ * backend, so only edges change. Connected nodes never do either — the new
+ * edges could clash with existing ones or close a cycle.
+ */
+let nodeDragInsertCandidate: string | null = null;
+let nodeDragConnectCandidate: AutoConnectMatch | null = null;
+
+function onNodeDrag({
+  event,
+  node,
+  nodes: dragged,
+}: {
+  event: MouseEvent | TouchEvent;
+  node: Node;
+  nodes: Node[];
+}) {
+  nodeDragInsertCandidate = null;
+  nodeDragConnectCandidate = null;
+  const template = (node.data as { nodeTemplate?: NodeTemplate } | undefined)?.nodeTemplate;
+  const nodeAlreadyConnected = instance.getEdges.value.some(
+    (e) => e.source === node.id || e.target === node.id,
+  );
+  // Dynamic-input nodes never splice or auto-connect: input-0 is the parameter handle.
+  if (!template || template.dynamic_inputs || nodeAlreadyConnected || dragged.length > 1) {
+    markHoveredEdge(null);
+    markAutoConnectNode(null);
+    return;
+  }
+  // `multi` nodes render one input handle that accepts many sources, so they
+  // qualify as 1-input for splice purposes even though template.input is high.
+  const effectiveInputCount = template.multi ? 1 : template.input;
+  const canSplice = effectiveInputCount === 1 && template.output >= 1;
+  const evt = event as MouseEvent;
+  const edgeId = canSplice ? detectEdgeUnderPointer(evt.clientX, evt.clientY) : null;
+  markHoveredEdge(edgeId);
+  nodeDragInsertCandidate = edgeId;
+  nodeDragConnectCandidate = edgeId ? null : detectAutoConnectForNode(node.id);
+  markAutoConnectNode(nodeDragConnectCandidate?.nodeId ?? null);
+}
+
+// Absolute positions at drag start, so a drag that moved nothing sends nothing.
+let dragStartPositions = new Map<string, { x: number; y: number }>();
+
+function onNodeDragStart({ nodes: dragged }: { nodes: GraphNode[] }) {
+  resetAutoConnectCandidates();
+  dragStartPositions = new Map(dragged.map((n) => [n.id, { ...n.computedPosition }]));
+}
+
+const movedSinceDragStart = (node: GraphNode): boolean => {
+  const start = dragStartPositions.get(node.id);
+  return !start || start.x !== node.computedPosition.x || start.y !== node.computedPosition.y;
+};
+
+/** One drag = one step: the whole dragged selection's layout plus any splice/auto-connect. */
+async function onNodeDragStop({ node, nodes: dragged }: { node: GraphNode; nodes: GraphNode[] }) {
+  const edgeId = nodeDragInsertCandidate;
+  const match = nodeDragConnectCandidate;
+  nodeDragInsertCandidate = null;
+  nodeDragConnectCandidate = null;
+  markHoveredEdge(null);
+  markAutoConnectNode(null);
+  resetAutoConnectCandidates();
+  const flowId = flowStore.flowId;
+  const moved = dragged
+    .map((n) => instance.findNode(n.id))
+    .filter((n): n is GraphNode => !!n && movedSinceDragStart(n));
+  dragStartPositions = new Map();
+  const nodeId = Number(node.id);
+  const plan = edgeId
+    ? planEdgeSplice(nodeId, edgeId)
+    : match
+      ? planAutoConnect(nodeId, match)
+      : null;
+  if (moved.length === 0 && !plan) return;
+  // Keep this drag's place in the channel while the layout is measured.
+  const slot = reserveMutationSlot();
+  let layout: Awaited<ReturnType<typeof layoutForMovedNodes>> | null;
+  try {
+    layout = moved.length > 0 ? await layoutForMovedNodes(moved) : null;
+  } catch (error) {
+    releaseMutationSlot(slot);
+    throw error;
+  }
+  try {
+    if (!plan) {
+      if (layout) await FlowApi.updateLayout(flowId, layout, slot);
+      return;
+    }
+    const type = (node.data as { nodeTemplate?: NodeTemplate } | undefined)?.nodeTemplate?.item;
+    const label = `${edgeId ? "Insert" : "Connect"} ${type ? `${type} ` : ""}node`;
+    const operations: GraphOperation[] = layout ? [{ op: "update_layout", layout }] : [];
+    await FlowApi.applyOperations(flowId, label, [...operations, ...plan.operations], slot);
+  } catch (error) {
+    recoverFromFailedMutation(error, "Could not save the move");
+    return;
+  } finally {
+    // Frees the slot if nothing was sent; a no-op once the channel has released it.
+    releaseMutationSlot(slot);
+  }
+  plan?.apply();
+}
+const nodes = ref<Node[]>([]);
+const edges = ref([]);
+const instance = useVueFlow();
+const mainContainerRef = ref<HTMLElement | null>(null);
+const {
+  onDrop,
+  onDragOver,
+  onDragStart,
+  importFlow,
+  createEmptyFlow,
+  createCopyNode,
+  createMultiCopyNodes,
+  createManualInputFromClipboard,
+  planEdgeSplice,
+  planAutoConnect,
+  detectAutoConnectForNode,
+  resetAutoConnectCandidates,
+} = useDragAndDrop();
+const fileDrop = useFileDropImport();
+const { groupSelectedNodes, removeSelectedFromGroup, layoutForMovedNodes } = useNodeGroups();
+const { addCommentAt } = useCanvasComments();
+// Default drawer sizing. The bottom dock takes ~25% of the canvas height; the
+// right-side drawers span from the canvas top down to the dock, so the two
+// tile the right column without overlap. These are reactive DEFAULTS — they
+// apply until the user commits an explicit size (then intent wins).
+const tablePreviewHeight = computed(() => Math.max(120, Math.floor(availableHeight.value * 0.25)));
+const drawerHeightOverride = (d: DrawerDef): number | undefined => {
+  if (d.id === "bottomDock") return tablePreviewHeight.value;
+  if (d.side === "right") return Math.max(200, availableHeight.value - tablePreviewHeight.value);
+  return undefined;
+};
+const DATA_ACTIONS_WIDTH = 230;
+// The bottom dock starts right next to the docked palette, tracking its live
+// width (only while the user hasn't chosen an explicit dock offset).
+const dataActionsWidth = computed(() => {
+  const intent = itemStore.items["dataActions"];
+  if (!intent || intent.dock !== "left") return 0;
+  return intent.h.size ?? DATA_ACTIONS_WIDTH;
+});
+const drawerLeftOverride = (d: DrawerDef): number | undefined =>
+  d.id === "bottomDock" ? dataActionsWidth.value : undefined;
+// Node-level "Run Now" from the context menu. No custom pollingKey: Canvas
+// mounts once and outlives flow switches, so a key baked at setup would stop
+// tracking the active flow — the default key derives from the live flow id
+// per call, keeping run bookkeeping namespaced per flow.
+const { triggerNodeFetch, isPollingActive } = useFlowExecution(
+  () => flowStore.flowId,
+  { interval: 2000, enabled: true },
+  { persistPolling: true },
+);
+
+const ghostStore = useAiGhostNodeStore();
+
+const {
+  showContextMenu,
+  menuPosition: contextMenuPosition,
+  target: contextMenuTarget,
+  targetInGroup: contextMenuTargetInGroup,
+  canPasteNode,
+  targetIsRunFlow,
+  targetIsRunning,
+  targetCacheResults,
+  openForPane: handleContextMenu,
+  openForNode: handleNodeContextMenu,
+  openForSelection: handleSelectionContextMenu,
+  closeMenu,
+  fetchNodeSettingsSnapshot,
+} = useContextMenu({
+  onNodeTargeted: (node) => {
+    // Ensure the right-clicked node participates in the selection-based group action.
+    if (!node.selected) addSelectedNodes([node]);
+  },
+  isNodeRunning: (nodeId) => isPollingActive(`node_${nodeId}`),
+});
+const emit = defineEmits<{
+  (e: "save", flowId: number): void;
+  (e: "run", flowId: number): void;
+  (e: "new"): void;
+  (e: "openSettings"): void;
+  (e: "open"): void;
+}>();
+
+useFlowHotkeys({
+  flowId: () => flowStore.flowId,
+  selectAll: () => addSelectedNodes(instance.getNodes.value),
+  newFlow: () => emit("new"),
+  save: () => emit("save", flowStore.flowId),
+  run: () => emit("run", flowStore.flowId),
+  toggleCodeGenerator: () => nodeStore.toggleCodeGenerator(),
+  openFlowSettings: () => emit("openSettings"),
+  openFile: () => emit("open"),
+  toggleAiDrawer: () => editorStore.toggleAiDrawer(),
+});
+
+// Closing runs the drawer's close save, which persists nothing for a node that is gone.
+const dismissSettingsDrawer = () => {
+  nodeStore.nodeId = -1;
+  editorStore.activeDrawerComponent = null;
+};
+
+// False when the open drawer refused to save (it stays open) or the selection moved meanwhile.
+const releaseOpenSettings = async (): Promise<boolean> => {
+  const nodeId = nodeStore.nodeId;
+  return (await editorStore.saveDrawerBeforeLeave()) && nodeStore.nodeId === nodeId;
+};
+
+const handleCanvasClick = async () => {
+  ghostNode.onViewportClick();
+  window.getSelection()?.removeAllRanges();
+  if (!(await releaseOpenSettings())) return;
+  drawerStore.clearPreview();
+  dismissSettingsDrawer();
+  nodeStore.hideLogViewer();
+};
+
+// VueFlow only emits @pane-click — there's no @pane-dblclick. We listen for
+// native dblclick on <main> instead, then ignore double-clicks that landed on
+// a node, edge, handle, or any floating panel. What's left is the empty pane.
+const handleMainDblClick = async (event: MouseEvent) => {
+  const target = event.target as HTMLElement | null;
+  if (!target) return;
+
+  // Double-click on a node body: open Settings AND the Data preview.
+  const nodeEl = target.closest(".vue-flow__node") as HTMLElement | null;
+  if (nodeEl) {
+    // Leave the description editor (node header) alone — it owns dblclick there.
+    if (target.closest(".custom-node-header")) return;
+    const dataId = nodeEl.getAttribute("data-id");
+    if (dataId && !isGroupNodeId(dataId) && !isCommentNodeId(dataId)) {
+      const id = parseInt(dataId);
+      if (await openNodeSettings(id)) openNodeData(id);
+    }
+    return;
+  }
+
+  if (
+    target.closest(".overlay") ||
+    target.closest(".vue-flow__edge") ||
+    target.closest(".vue-flow__handle") ||
+    target.closest(".vue-flow__minimap") ||
+    target.closest(".layout-widget-wrapper")
+  ) {
+    return;
+  }
+  window.getSelection()?.removeAllRanges();
+  if (!(await releaseOpenSettings())) return;
+  editorStore.hideAllPanels();
+  nodeStore.nodeId = -1;
+};
+
+function onEdgeUpdate({ edge, connection }: { edge: any; connection: any }) {
+  updateEdge(edge, connection);
+}
+
+// The flow the canvas last rendered: a reload of the same flow keeps viewport and selection.
+let loadedFlowId: number | null = null;
+
+/**
+ * A window's Return asked for the dock on a tab. Only the loaded flow's request applies: a flow
+ * switch hides every panel before loadFlow, which calls this at its end.
+ */
+const applyDockRequest = () => {
+  const request = drawerStore.dockRequest;
+  if (!request || request.flowId !== loadedFlowId) return;
+  drawerStore.consumeDockRequest();
+  if (request.tab === "data") {
+    // Nothing to show without a node: the dock stays as it is.
+    if (request.nodeId === undefined) return;
+    drawerStore.setPreviewNode(request.nodeId);
+  } else {
+    editorStore.showLogViewer();
+  }
+  drawerStore.setActiveTab("bottomDock", request.tab);
+  nextTick().then(() => itemStore.bringToFront("bottomDock"));
+};
+
+const loadFlow = async () => {
+  const myToken = ++loadToken;
+  isLoadingFlow.value = true;
+  try {
+    // Wait for VueFlow to finish its first internal mount before populating it.
+    // Already-resolved on every call after the first.
+    await paneReadyPromise;
+    if (myToken !== loadToken) return;
+
+    const flowIdAtStart = flowStore.flowId;
+    const sameFlow = loadedFlowId === flowIdAtStart;
+    const selectedIds = sameFlow ? instance.getSelectedNodes.value.map((node) => node.id) : [];
+    let historyState: Awaited<ReturnType<typeof FlowApi.getHistoryStatus>> | null;
+    // Once: a nudge burst that starts mid-reload is waited for (its reserved slot), not split.
+    await flushPendingEdits();
+    // Show only a settled graph: re-read if a mutation was enqueued while fetching or importing.
+    for (;;) {
+      await whenMutationsIdle();
+      if (myToken !== loadToken) return;
+      const generation = mutationGeneration();
+      let vueFlowInput: Awaited<ReturnType<typeof FlowApi.getFlowData>>;
+      [vueFlowInput, historyState] = await Promise.all([
+        FlowApi.getFlowData(flowIdAtStart),
+        FlowApi.getHistoryStatus(flowIdAtStart).catch((error) => {
+          console.error("Failed to fetch history state:", error);
+          return null;
+        }),
+      ]);
+      if (myToken !== loadToken) return;
+      if (generation !== mutationGeneration()) continue;
+      // Seed before nodes mount so their description reads hit the cache.
+      nodeStore.seedNodeDescriptions(flowIdAtStart, vueFlowInput.node_inputs);
+      await importFlow(vueFlowInput, { keepExisting: sameFlow });
+      // A same-flow reload kept the live nodes, a switch cleared them; a newer run repopulates.
+      if (myToken !== loadToken) return;
+      if (generation === mutationGeneration()) break;
+    }
+    loadedFlowId = flowIdAtStart;
+    // The settings drawer must not keep showing a node the reloaded graph no longer has.
+    if (nodeStore.nodeId !== -1 && !instance.findNode(String(nodeStore.nodeId))) {
+      dismissSettingsDrawer();
+    }
+
+    await nextTick();
+    if (sameFlow) {
+      addSelectedNodes(
+        selectedIds.map((id) => instance.findNode(id)).filter((node): node is GraphNode => !!node),
+      );
+    } else {
+      restoreViewport(flowIdAtStart);
+    }
+    if (historyState) flowStore.updateHistoryState(historyState);
+    // Fire-and-forget; fetchArtifacts re-checks flowId before writing.
+    flowStore.fetchArtifacts(flowIdAtStart);
+    flowStore.fetchSettingsValidation(flowIdAtStart);
+    applyDockRequest();
+  } finally {
+    // Only clear if we're still the most recent run — otherwise the newer
+    // run's spinner would be turned off prematurely.
+    if (myToken === loadToken) isLoadingFlow.value = false;
+  }
+};
+
+const reloadCurrentFlow = () => loadFlow();
+
+/**
+ * Compute the label for an edge based on its source node.
+ * Priority: output handle label > nodeReference > df_{nodeId} default.
+ */
+function computeEdgeLabel(
+  sourceNode: ReturnType<typeof instance.findNode>,
+  sourceHandle?: string,
+): string {
+  const data = sourceNode?.data as FlowNodeData | undefined;
+  if (data?.outputs && sourceHandle) {
+    const output = data.outputs.find((o) => o.id === sourceHandle);
+    if (output?.label) {
+      return output.label;
+    }
+  }
+  if (data?.nodeReference) {
+    return data.nodeReference;
+  }
+  return `df_${data?.id ?? sourceNode?.id ?? ""}`;
+}
+
+/**
+ * Refresh labels on all edges (respects showEdgeLabels toggle).
+ */
+function refreshAllEdgeLabels() {
+  const allEdges = instance.getEdges.value;
+  for (const edge of allEdges) {
+    if (editorStore.showEdgeLabels) {
+      const sourceNode = instance.findNode(edge.source);
+      edge.label = computeEdgeLabel(sourceNode, edge.sourceHandle ?? undefined);
+    } else {
+      edge.label = undefined;
+    }
+  }
+}
+
+/**
+ * Update edge labels for all outgoing edges of a specific node.
+ */
+function updateEdgeLabelsForNode(nodeId: string) {
+  if (!editorStore.showEdgeLabels) return;
+  const allEdges = instance.getEdges.value;
+  const sourceNode = instance.findNode(nodeId);
+  for (const edge of allEdges) {
+    if (edge.source === nodeId) {
+      edge.label = computeEdgeLabel(sourceNode, edge.sourceHandle ?? undefined);
+    }
+  }
+}
+
+/**
+ * Reject a would-be connection that violates a frontend invariant.
+ *
+ * Two rules:
+ *   1. A target handle on a non-multi node accepts at most one connection.
+ *   2. The edge must not close a cycle (source reachable from target today).
+ *
+ * Returning false blocks the drop. If any rejection happened during the drag,
+ * onConnectEnd surfaces it as a toast. State is reset per drag via
+ * onConnectStart so retries after the first rejection still fire.
+ */
+let rejectionDuringDrag: string | null = null;
+
+function rejectConnection(reason: string): false {
+  rejectionDuringDrag = reason;
+  return false;
+}
+
+function isValidConnection(connection: Connection): boolean {
+  const source = connection.source;
+  const target = connection.target;
+  if (!source || !target) return false;
+  // A collapsed group's pill edges are added programmatically but still validated through
+  // here, so they must be accepted or they won't render. Users can't draw them by hand
+  // (group nodes are connectable:false); this only greenlights those UI-only proxy edges.
+  if (isGroupNodeId(source) || isGroupNodeId(target)) return true;
+  if (source === target) return rejectConnection("A node can't connect to itself");
+
+  const currentEdges = instance.getEdges.value;
+
+  const targetNode = instance.findNode(target);
+  const targetTemplate = (targetNode?.data as { nodeTemplate?: NodeTemplate } | undefined)
+    ?.nodeTemplate;
+  // Every handle of a dynamic_inputs node (run_flow) is single-edge, including
+  // the parameter handle input-0.
+  if (
+    targetTemplate &&
+    (targetTemplate.dynamic_inputs || !targetTemplate.multi) &&
+    connection.targetHandle
+  ) {
+    // A same-flow reload re-sets every edge while the old copy is still in the store: the same
+    // connection does not occupy the handle it is re-added to.
+    const sameConnection = (e: { source: string; sourceHandle?: string | null }) =>
+      e.source === source &&
+      (e.sourceHandle ?? "output-0") === (connection.sourceHandle ?? "output-0");
+    const handleOccupied = currentEdges.some(
+      (e) =>
+        e.target === target && e.targetHandle === connection.targetHandle && !sameConnection(e),
+    );
+    if (handleOccupied) {
+      return rejectConnection(
+        `Input on "${targetTemplate.name}" already has a connection — remove it first`,
+      );
+    }
+  }
+
+  const adjacency = new Map<string, string[]>();
+  for (const e of currentEdges) {
+    const list = adjacency.get(e.source);
+    if (list) list.push(e.target);
+    else adjacency.set(e.source, [e.target]);
+  }
+  const visited = new Set<string>([target]);
+  const stack = [target];
+  while (stack.length) {
+    const node = stack.pop() as string;
+    const outgoing = adjacency.get(node);
+    if (!outgoing) continue;
+    for (const next of outgoing) {
+      if (next === source) {
+        return rejectConnection("This connection would create a loop in the flow");
+      }
+      if (!visited.has(next)) {
+        visited.add(next);
+        stack.push(next);
+      }
+    }
+  }
+  // Moving onto a valid target supersedes any earlier rejection in this drag.
+  rejectionDuringDrag = null;
+  return true;
+}
+
+function onConnectStart() {
+  rejectionDuringDrag = null;
+}
+
+function onConnectEnd() {
+  if (rejectionDuringDrag) {
+    ElMessage.warning(rejectionDuringDrag);
+    rejectionDuringDrag = null;
+  }
+}
+
+async function onConnect(params: Connection & { label?: string }) {
+  if (!params.target || !params.source) return;
+  if (!isValidConnection(params)) {
+    // Belt-and-suspenders: if VueFlow ever lets an invalid drop through, bail quietly.
+    return;
+  }
+  const nodeConnection = connection(
+    parseInt(params.source, 10),
+    params.sourceHandle ?? "output-0",
+    parseInt(params.target, 10),
+    params.targetHandle ?? "input-0",
+  );
+  try {
+    await FlowApi.connectNode(flowStore.flowId, nodeConnection);
+  } catch (err) {
+    recoverFromFailedMutation(err, "Failed to create connection");
+    return;
+  }
+
+  if (editorStore.showEdgeLabels) {
+    const sourceNode = instance.findNode(params.source);
+    params.label = computeEdgeLabel(sourceNode, params.sourceHandle ?? undefined);
+  }
+
+  addEdges([params]);
+  const sourceId = parseInt(params.source, 10);
+  const targetId = parseInt(params.target, 10);
+  if (Number.isFinite(sourceId) && Number.isFinite(targetId)) {
+    useTutorialStore().notify({ type: "edge-connected", sourceId, targetId });
+  }
+  flowStore.fetchSettingsValidation();
+}
+
+// A double-click fires nodeClick twice plus the dblclick handler: they share one switch per node.
+let pendingSettingsOpen: { nodeId: number; done: Promise<boolean> } | null = null;
+
+// Open + front a node's Settings drawer. Settings only ever opens by setting
+// nodeStore.nodeId, which the per-node nodeButton watcher turns into openDrawer.
+// Resolves false when the open drawer refused to save, so it kept its node.
+const openNodeSettings = (nodeId: number): Promise<boolean> => {
+  if (pendingSettingsOpen?.nodeId === nodeId) return pendingSettingsOpen.done;
+  const done = switchNodeSettings(nodeId).finally(() => {
+    if (pendingSettingsOpen?.done === done) pendingSettingsOpen = null;
+  });
+  pendingSettingsOpen = { nodeId, done };
+  return done;
+};
+
+const switchNodeSettings = async (nodeId: number): Promise<boolean> => {
+  if (isGroupNodeId(String(nodeId))) return true;
+  if (nodeStore.nodeId === nodeId && editorStore.drawerOpen) {
+    // Already the selected node and the drawer is open — just front it. (Don't
+    // re-trigger the watcher; that would reload settings, e.g. the second click
+    // of a double-click.)
+    itemStore.bringToFront("rightDrawer");
+    drawerStore.setActiveTab("rightDrawer", "settings");
+    useTutorialStore().notify({ type: "node-settings-opened", nodeId });
+    return true;
+  }
+  if (!(await editorStore.saveDrawerBeforeLeave())) return false;
+  if (nodeStore.nodeId === nodeId) {
+    // Same node but the drawer is closed/minimized: assigning the same value is
+    // a no-op and won't reopen it. Bounce through -1 across a tick so the
+    // watcher observes old(-1)->new and re-runs openDrawer.
+    nodeStore.nodeId = -1;
+    await nextTick();
+  }
+  nodeStore.nodeId = nodeId;
+  await nextTick(); // settings tab mounts before fronting
+  itemStore.bringToFront("rightDrawer");
+  drawerStore.setActiveTab("rightDrawer", "settings");
+  useTutorialStore().notify({ type: "node-settings-opened", nodeId });
+  return true;
+};
+
+// Open + front the bottom Data preview for a node. The dock's Data tab reacts to
+// drawerStore.previewNodeId; re-selecting the same node bumps a refresh token.
+const openNodeData = (nodeId: number) => {
+  if (isGroupNodeId(String(nodeId))) return;
+  drawerStore.setPreviewNode(nodeId);
+  // The flow's Data window hosts the preview: the node went there, so show that window.
+  if (editorStore.isPoppedOut("table", flowStore.flowId)) {
+    void usePopout("table").focus(flowStore.flowId);
+    return;
+  }
+  drawerStore.setActiveTab("bottomDock", "data");
+  nextTick().then(() => itemStore.bringToFront("bottomDock"));
+};
+
+/**
+ * Single click opens Settings; if the dock is already open (data or logs), show this node's Data.
+ * With the flow's Data in its own window the node goes there instead, and the dock is left alone.
+ * An Alt (or Cmd/Ctrl) click only toggles the node in the selection, which VueFlow already did.
+ */
+const nodeClick = async (mouseEvent: any) => {
+  const rawId = String(mouseEvent.node.id);
+  if (isCommentNodeId(rawId)) return; // comments have no settings or data
+  if (isMultiSelectClick(mouseEvent.event)) return;
+  if (!(await openNodeSettings(parseInt(rawId)))) return;
+  const tableOut = editorStore.isPoppedOut("table", flowStore.flowId);
+  const dockOpen = drawerStore.previewNodeId !== null || editorStore.isShowingLogViewer;
+  if (!isGroupNodeId(rawId) && (dockOpen || tableOut)) {
+    drawerStore.setPreviewNode(parseInt(rawId));
+    if (!tableOut) drawerStore.setActiveTab("bottomDock", "data");
+  }
+};
+
+// The per-node right-click menu (NodeWrapper) can't reach Canvas-local refs, so
+// it asks via these editor-store counters. Watch the token, dispatch by node id.
+watch(
+  () => editorStore.nodeSettingsOpenRequest.token,
+  () => openNodeSettings(editorStore.nodeSettingsOpenRequest.nodeId),
+);
+watch(
+  () => editorStore.nodeDataOpenRequest.token,
+  () => openNodeData(editorStore.nodeDataOpenRequest.nodeId),
+);
+
+const flushRemovals = async (removal: RemovalTick) => {
+  const { flowId } = removal;
+  if (removal.nodes.has(String(nodeStore.nodeId))) dismissSettingsDrawer();
+  const { label, operations } = buildRemovalBatch(removal.nodes, removal.edges, removal.comments);
+  if (operations.length === 0) return;
+  try {
+    await FlowApi.applyOperations(flowId, label, operations);
+  } catch (error) {
+    recoverFromFailedMutation(error, "Could not delete");
+    return;
+  }
+  for (const id of removal.nodes.keys()) {
+    useTutorialStore().notify({ type: "node-removed", nodeId: Number(id) });
+  }
+  flowStore.fetchSettingsValidation();
+};
+
+// One tick of VueFlow removals is one delete gesture, sent as one batch.
+const removalsThisTick = createRemovalCollector(
+  () => flowStore.flowId,
+  (removal) => void flushRemovals(removal),
+);
+
+// Arrow-key nudges: one burst is one step, sent in the channel slot its first nudge reserved.
+const NUDGE_SETTLE_MS = 300;
+const nudgedNodeIds = new Set<string>();
+let nudgeFlowId = -1;
+let nudgeSlot: number | null = null;
+let nudgeTimer: ReturnType<typeof setTimeout> | null = null;
+
+const flushNudges = async (): Promise<void> => {
+  if (nudgeTimer) clearTimeout(nudgeTimer);
+  nudgeTimer = null;
+  const slot = nudgeSlot;
+  nudgeSlot = null;
+  if (slot === null) return;
+  const flowId = nudgeFlowId;
+  const moved = [...nudgedNodeIds]
+    .map((id) => instance.findNode(id))
+    .filter((n): n is GraphNode => !!n);
+  nudgedNodeIds.clear();
+  // Only while the canvas still shows the nudged flow (a flow switch flushes first).
+  if (moved.length === 0 || flowId !== loadedFlowId) {
+    releaseMutationSlot(slot);
+    return;
+  }
+  let layout: Awaited<ReturnType<typeof layoutForMovedNodes>>;
+  try {
+    layout = await layoutForMovedNodes(moved);
+  } catch (error) {
+    releaseMutationSlot(slot);
+    throw error;
+  }
+  FlowApi.updateLayout(flowId, layout, slot).catch((error) =>
+    recoverFromFailedMutation(error, "Could not save the move"),
+  );
+};
+
+const noteNudge = (nodeId: string) => {
+  if (nudgeSlot === null) {
+    nudgeFlowId = flowStore.flowId;
+    nudgeSlot = reserveMutationSlot();
+  }
+  nudgedNodeIds.add(nodeId);
+  if (nudgeTimer) clearTimeout(nudgeTimer);
+  nudgeTimer = setTimeout(() => void flushNudges(), NUDGE_SETTLE_MS);
+};
+
+const handleNodeChange = (changes: NodeChange[]) => {
+  for (const change of changes) {
+    // Only a keyboard move carries a position without dragging (drag-end omits it).
+    if (change.type === "position") {
+      if (!change.dragging && change.position) noteNudge(change.id);
+      continue;
+    }
+    if (change.type !== "remove") continue;
+    // Group boxes are not real nodes — their removal is handled by the ungroup action.
+    if (isGroupNodeId(change.id)) continue;
+    const removal = removalsThisTick();
+    if (isCommentNodeId(change.id)) {
+      removal.comments.push(commentBackendId(change.id));
+      continue;
+    }
+    // VueFlow emits before applying, so the node is still there to read its type.
+    const data = instance.findNode(change.id)?.data as { nodeTemplate?: NodeTemplate } | undefined;
+    removal.nodes.set(change.id, data?.nodeTemplate?.item);
+  }
+};
+
+const handleEdgeChange = (changes: EdgeChange[]) => {
+  for (const change of changes) {
+    if (change.type !== "remove") continue;
+    // UI-only proxy edges must not trigger a backend deleteConnection.
+    if (change.id.startsWith(GROUP_PROXY_EDGE_PREFIX)) continue;
+    // Already deleted on the backend by the gesture that removed it from the canvas.
+    if (isCommittedEdgeRemoval(change.id)) continue;
+    removalsThisTick().edges.push(change);
+  }
+};
+
+// OS file drops are consumed synchronously by fileDrop; anything else is a palette drag.
+const handleDrop = async (event: DragEvent) => {
+  if (fileDrop.handleDrop(event)) return;
+  if (!nodeStore.isRunning) {
+    await onDrop(event, flowStore.flowId);
+  }
+};
+
+const handleDragOver = (event: DragEvent) => {
+  if (fileDrop.handleDragOver(event)) return;
+  onDragOver(event);
+};
+
+// Paste the node buffer at screen coordinates. The buffer only exists when a
+// copy armed it; failures (including cross-flow copies whose source flow is
+// gone) surface as a toast instead of silence.
+const pasteNodeFromBuffer = async (x: number, y: number) => {
+  const buffer = readNodeClipboardBuffer();
+  if (!buffer) return;
+  const flowPosition = screenToFlowCoordinate({ x, y });
+
+  if (buffer.multi) {
+    await createMultiCopyNodes(buffer.multi, flowPosition.x, flowPosition.y, flowStore.flowId);
+    return;
+  }
+
+  if (!buffer.single) return;
+  const nodeCopyInput: NodeCopyInput = {
+    ...buffer.single,
+    posX: Math.round(flowPosition.x),
+    posY: Math.round(flowPosition.y),
+    flowId: flowStore.flowId,
+  };
+  await createCopyNode(nodeCopyInput);
+};
+
+// Guards two fast Cmd+Vs from creating two nodes at identical coordinates
+// while the first request is still in flight.
+let pasteInFlight = false;
+
+const handleCanvasPaste = async (x: number, y: number, intent: PasteIntent) => {
+  // The document-level ClipboardEvent listener bypasses the empty-state
+  // overlay — never paste against a dead flow id.
+  if (flowStore.flowId <= 0) return;
+  if (intent.kind === "none" || pasteInFlight) return;
+  pasteInFlight = true;
+  try {
+    if (intent.kind === "node") {
+      await pasteNodeFromBuffer(x, y);
+      return;
+    }
+    const flowPosition = screenToFlowCoordinate({ x, y });
+    await createManualInputFromClipboard(
+      flowStore.flowId,
+      Math.round(flowPosition.x),
+      Math.round(flowPosition.y),
+      intent.text,
+    );
+  } finally {
+    pasteInFlight = false;
+  }
+};
+
+const promptLineageQuestion = async (focusLabel: string): Promise<string | null> => {
+  // — use Element Plus's imperative prompt (already in use elsewhere
+  // in the codebase, e.g. CatalogView) instead of a new dialog component.
+  // Returns the trimmed question on confirm, or ``null`` on cancel.
+  try {
+    const result = await ElMessageBox.prompt(
+      `Ask the AI a lineage question about ${focusLabel}. The AI will read recent run history alongside the current flow graph to answer.`,
+      "Ask about lineage",
+      {
+        confirmButtonText: "Ask",
+        cancelButtonText: "Cancel",
+        inputType: "textarea",
+        inputPlaceholder: "e.g. Why is column customer_id null since Tuesday?",
+        inputValidator: (value: string) =>
+          (value && value.trim().length > 0) || "Please type a question.",
+      },
+    );
+    const value = (result as { value?: string }).value;
+    return value?.trim() || null;
+  } catch {
+    // ElMessageBox throws on cancel/close.
+    return null;
+  }
+};
+
+const handleContextMenuAction = async (actionData: ContextMenuAction) => {
+  const { actionId, position, targetId } = actionData;
+  if (actionId === "fit-view") {
+    fitView();
+  } else if (actionId === "zoom-in") {
+    instance.zoomIn();
+  } else if (actionId === "zoom-out") {
+    instance.zoomOut();
+  } else if (actionId === "paste-node") {
+    // Explicit intent: the user picked "Paste Node" from the menu, so the
+    // buffer pastes without any clipboard read or sentinel check (a read is
+    // impossible outside a paste event on web Firefox / insecure contexts).
+    handleCanvasPaste(position.x, position.y, { kind: "node" });
+  } else if (actionId === "generate-documentation") {
+    // — pull the canonical flow name server-side so the doc title
+    // matches what the user sees in the title bar. Falsy → undefined so
+    // the store falls back to ``flow ${flowId}``.
+    if (flowStore.flowId <= 0) return;
+    const settings = await FlowApi.getFlowSettings(flowStore.flowId);
+    const name = settings?.display_name?.trim() || settings?.name?.trim() || undefined;
+    await aiStore.generateDocumentation(flowStore.flowId, name);
+  } else if (actionId === "add-descriptions-all") {
+    // Bulk variant of the per-node ✨ "Add description" action. Confirms
+    // first since each node is a separate LLM call (cost + time scale
+    // linearly with N), then streams them sequentially through the quiet
+    // ai-store path that writes straight to node.setting_input.description
+    // without flooding the chat drawer.
+    if (flowStore.flowId <= 0) return;
+    const allNodes = instance.getNodes.value;
+    if (allNodes.length === 0) {
+      ElMessage.info("No nodes on the canvas.");
+      return;
+    }
+    try {
+      await ElMessageBox.confirm(
+        `Generate AI descriptions for all ${allNodes.length} node${allNodes.length === 1 ? "" : "s"}? Existing descriptions will be replaced.`,
+        "Add description to all nodes",
+        {
+          confirmButtonText: "Generate",
+          cancelButtonText: "Cancel",
+          type: "warning",
+        },
+      );
+    } catch {
+      return;
+    }
+    const nodeIds = allNodes.map((n) => Number(n.id)).filter((id) => Number.isFinite(id));
+    ElMessage.info(
+      `Generating descriptions for ${nodeIds.length} node${nodeIds.length === 1 ? "" : "s"}…`,
+    );
+    const { succeeded, failed, aborted } = await aiStore.runBulkAddDescriptions(
+      flowStore.flowId,
+      nodeIds,
+    );
+    if (aborted) {
+      ElMessage.warning(`Aborted. Updated ${succeeded} of ${nodeIds.length}.`);
+    } else if (failed === 0) {
+      ElMessage.success(`Updated ${succeeded} description${succeeded === 1 ? "" : "s"}.`);
+    } else {
+      ElMessage.warning(`Updated ${succeeded} of ${nodeIds.length} (${failed} failed).`);
+    }
+  } else if (actionId === "ask-lineage") {
+    // — whole-flow lineage Q&A.
+    if (flowStore.flowId <= 0) return;
+    const question = await promptLineageQuestion("this flow");
+    if (!question) return;
+    await aiStore.askLineageQuestion(flowStore.flowId, question);
+  } else if (actionId === "ask-lineage-node") {
+    // — focused lineage Q&A on a single node id.
+    if (flowStore.flowId <= 0) return;
+    const focusNodeId = Number(targetId);
+    if (!Number.isFinite(focusNodeId)) return;
+    const question = await promptLineageQuestion(`node ${focusNodeId}`);
+    if (!question) return;
+    await aiStore.askLineageQuestion(flowStore.flowId, question, focusNodeId);
+  } else if (actionId === "group-selection") {
+    await groupSelectedNodes();
+  } else if (actionId === "add-comment") {
+    await addCommentAt(screenToFlowCoordinate(position));
+  } else if (actionId === "remove-from-group") {
+    await removeSelectedFromGroup();
+  } else if (actionId === "open-node-settings") {
+    await openNodeSettings(Number(targetId));
+  } else if (actionId === "view-node-data") {
+    openNodeData(Number(targetId));
+  } else if (actionId === "run-node") {
+    await runNodeFromMenu(Number(targetId));
+  } else if (actionId === "toggle-cache") {
+    await toggleNodeCache(Number(targetId));
+  } else if (actionId === "copy-node") {
+    copyNodeFromMenu(targetId);
+  } else if (actionId === "delete-node") {
+    instance.removeNodes(targetId, true);
+  } else if (actionId === "open-node-docs") {
+    const node = instance.findNode(targetId);
+    const template = (node?.data as { nodeTemplate?: NodeTemplate } | undefined)?.nodeTemplate;
+    void desktop.openExternal(nodeDocsUrl(template));
+  } else if (actionId === "suggest-next-node") {
+    suggestNextNodeFromMenu(targetId, position);
+  } else if (actionId === "open-target-flow") {
+    await openTargetFlow(Number(targetId));
+  }
+};
+
+// ---- node-target context-menu actions (the per-node menu lives here now) ----
+
+const runNodeFromMenu = async (nodeId: number) => {
+  if (!Number.isFinite(nodeId) || isPollingActive(`node_${nodeId}`)) return;
+  try {
+    await triggerNodeFetch(nodeId);
+  } catch (error) {
+    console.error("Error running node:", error);
+  }
+};
+
+// Optimistic: the menu is already closed when this runs — reconcile in the
+// background, surface and revert on failure.
+const toggleNodeCache = async (nodeId: number) => {
+  if (!Number.isFinite(nodeId)) return;
+  const next = !(targetCacheResults.value ?? false);
+  targetCacheResults.value = next;
+  try {
+    const nodeData = await fetchNodeSettingsSnapshot(nodeId);
+    if (!nodeData?.setting_input) throw new Error("node settings unavailable");
+    nodeData.setting_input.cache_results = next;
+    await nodeStore.updateSettingsDirectly(nodeData.setting_input);
+  } catch (error) {
+    console.error("Error toggling cache:", error);
+    // Revert only if the menu still targets this node — a menu re-opened for
+    // another node owns targetCacheResults by then (and re-hydrates anyway).
+    if (contextMenuTarget.value.id === String(nodeId)) {
+      targetCacheResults.value = !next;
+    }
+    ElMessage.error("Could not update the node's cache setting.");
+  }
+};
+
+const copyNodeFromMenu = (targetId: string) => {
+  const node = instance.findNode(targetId);
+  if (!node) return;
+  const description =
+    nodeStore.nodeDescriptions[flowStore.flowId]?.[Number(targetId)]?.description ?? "";
+  const sentinel = copySingleNodeToBuffer(
+    node.data as CopyableNodeData,
+    flowStore.flowId,
+    description,
+  );
+  void writeSentinelToOsClipboard(sentinel);
+};
+
+const suggestNextNodeFromMenu = (targetId: string, position: CursorPosition) => {
+  const flowId = flowStore.flowId;
+  if (!flowId || flowId <= 0) return;
+  const node = instance.findNode(targetId);
+  if (!node) return;
+  // Popover anchors at the menu's screen position; the materialised node is
+  // placed relative to the source node's own flow-coords position.
+  const pos = node.computedPosition ?? node.position ?? { x: 0, y: 0 };
+  ghostStore.beginIntent(
+    {
+      upstreamNodeId: Number(targetId),
+      screenX: position.x,
+      screenY: position.y,
+      nodeX: pos.x,
+      nodeY: pos.y,
+    },
+    flowId,
+  );
+};
+
+const openTargetFlow = async (nodeId: number) => {
+  try {
+    const nodeData = await fetchNodeSettingsSnapshot(nodeId);
+    const flowRef = nodeData?.setting_input?.flow_reference as RunFlowReference | undefined;
+    const registrationId = flowRef?.registration_id ?? 0;
+    let flowPath = flowRef?.flow_path ?? null;
+    let name: string | undefined;
+    if (registrationId > 0) {
+      try {
+        const reg = await CatalogApi.getFlow(registrationId);
+        flowPath = reg?.flow_path ?? flowPath;
+        name = reg?.name;
+      } catch {
+        // Registration lookup failed (e.g. deleted) — fall back to stored path.
+      }
+    }
+    if (!flowPath) {
+      ElMessage.warning("No target flow is selected for this node.");
+      return;
+    }
+    editorStore.requestOpenFlow(flowPath, name);
+  } catch (error) {
+    console.error("Error opening target flow:", error);
+  }
+};
+
+const handleResetLayoutGraph = async () => {
+  await applyStandardLayout(flowStore.flowId);
+  await loadFlow();
+  // loadFlow already fetches history state
+  fitView({ padding: 0.2 });
+  saveViewportToSession();
+};
+
+// Clipboard events aimed at <body> carry no location information, so they are
+// classified by the last pointerdown target (see isCanvasClipboardTarget).
+let lastPointerDownEl: Element | null = null;
+const trackPointerDown = (event: PointerEvent) => {
+  if (event.target instanceof Element) {
+    lastPointerDownEl = event.target;
+  }
+};
+
+// Live pointer position over the canvas: a keyboard paste drops the node under
+// the cursor (falling back to the canvas centre before any pointer movement).
+let lastPointerPosition: CursorPosition | null = null;
+const trackPointerMove = (event: PointerEvent) => {
+  lastPointerPosition = { x: event.clientX, y: event.clientY };
+};
+// The only writer of multi-select (VueFlow's key listener is off): a lost keyup can't latch it, no keydown is swallowed.
+const syncMultiSelection = (event: PointerEvent) => {
+  instance.multiSelectionActive.value = isMultiSelectClick(event);
+};
+const keyboardPastePosition = (): CursorPosition => {
+  if (lastPointerPosition) return lastPointerPosition;
+  const bounds = mainContainerRef.value?.getBoundingClientRect();
+  return bounds
+    ? { x: bounds.left + bounds.width / 2, y: bounds.top + bounds.height / 2 }
+    : { x: 0, y: 0 };
+};
+
+// Native `copy`/`paste` ClipboardEvents drive canvas node copy/paste. They fire
+// for both browser shortcuts (web mode) and the Tauri Edit-menu copy:/paste:
+// roles (desktop). Keydown can't be used on macOS desktop because the menu
+// accelerator consumes Cmd+C / Cmd+V before it reaches the keydown handler.
+// Both handlers decide intent first and only then cancel the native action.
+const handleCopyEvent = (event: ClipboardEvent) => {
+  if (event.defaultPrevented) return; // someone (e.g. the data grid) already handled it
+  if (!isCanvasClipboardTarget(event.target, lastPointerDownEl)) return;
+  if (hasTextSelection()) return; // selected canvas text (node descriptions) — native copy wins
+  if (flowStore.flowId <= 0) return; // parity with paste: never arm the buffer without a live flow
+  const sentinel = copyNodesToBuffer(
+    instance.getSelectedNodes.value.filter((node) => !isCommentNodeId(node.id)),
+    instance.getEdges.value,
+    flowStore.flowId,
+  );
+  if (!sentinel) return; // nothing selected — leave the native copy alone
+  if (event.clipboardData) {
+    event.clipboardData.setData("text/plain", sentinel);
+    event.preventDefault(); // required in the same handler, or setData is discarded
+  } else {
+    void writeSentinelToOsClipboard(sentinel);
+  }
+};
+
+const handlePasteEvent = (event: ClipboardEvent) => {
+  if (event.defaultPrevented) return; // CodeMirror preventDefaults pastes it consumes
+  if (!isCanvasClipboardTarget(event.target, lastPointerDownEl)) return;
+  if (flowStore.flowId <= 0) return;
+  const text = event.clipboardData?.getData("text/plain") ?? null;
+  const intent = resolvePasteIntent({
+    buffer: readNodeClipboardBuffer(),
+    clipboardText: text,
+    isCanvasTarget: true,
+  });
+  if (intent.kind === "none") return; // not ours — never swallow a paste we don't handle
+  event.preventDefault();
+  const position = keyboardPastePosition();
+  void handleCanvasPaste(position.x, position.y, intent);
+};
+
+const closeContextMenu = () => {
+  closeMenu();
+};
+
+// Prevent text selection during shift+drag selection on canvas
+const handleSelectionStart = () => {
+  document.body.style.userSelect = "none";
+};
+
+const handleSelectionEnd = () => {
+  document.body.style.userSelect = "";
+};
+
+// Viewport persistence helpers
+const getViewportStorageKey = (flowId: number) => `flowfile_viewport_${flowId}`;
+
+const saveViewportToSession = () => {
+  if (flowStore.flowId <= 0) return;
+  const viewport = instance.getViewport();
+  const key = getViewportStorageKey(flowStore.flowId);
+  sessionStorage.setItem(key, JSON.stringify(viewport));
+};
+
+const restoreViewport = (flowId: number) => {
+  const key = getViewportStorageKey(flowId);
+  const saved = sessionStorage.getItem(key);
+  if (saved) {
+    try {
+      instance.setViewport(JSON.parse(saved));
+    } catch (e) {
+      console.error("Failed to restore viewport from session:", e);
+    }
+  }
+};
+
+const handleMoveEnd = () => {
+  saveViewportToSession();
+};
+
+let unregisterContainer: (() => void) | null = null;
+let viewZoom: Promise<() => void> | null = null;
+let unregisterNudges: (() => void) | null = null;
+
+onMounted(() => {
+  unregisterNudges = registerPendingEdit(flushNudges);
+  if (mainContainerRef.value) {
+    // Single shared container measurement for every overlay panel (and the
+    // derived drawer heights above).
+    unregisterContainer = itemStore.registerContainer(mainContainerRef.value);
+  }
+  document.addEventListener("copy", handleCopyEvent);
+  document.addEventListener("paste", handlePasteEvent);
+  // Capture phase so panels that stopPropagation on pointerdown still register.
+  document.addEventListener("pointerdown", trackPointerDown, true);
+
+  nodeStore.setVueFlowInstance(instance);
+
+  watch(
+    () => flowStore.flowId,
+    async (id) => {
+      // Nudges of the previous flow's nodes are sent before its canvas is replaced.
+      void flushNudges();
+      // Switching flows: clear selection + overlays so a drawer/preview from the
+      // previous flow can't leak (node ids collide across flows).
+      editorStore.hideAllPanels({ keepCodePane: !!id && id > 0 });
+      nodeStore.nodeId = -1;
+      nodeStore.nodeData = null;
+      nodeStore.nodeDataFlowId = -1;
+      if (id && id > 0) {
+        try {
+          await loadFlow();
+        } catch (e: unknown) {
+          console.error("loadFlow failed:", e);
+          // A stale flowId in sessionStorage causes a permanent boot loop
+          // (every refresh 404s). Clear storage and reset the in-memory id
+          // so the current session recovers without a hard refresh.
+          if (axios.isAxiosError(e) && e.response?.status === 404) {
+            sessionStorage.removeItem(FLOW_ID_STORAGE_KEY);
+            flowStore.flowId = -1;
+          }
+          ElMessage.error("Failed to load flow");
+        }
+      } else {
+        // No active flow — visually clear the canvas (previously handled by
+        // the v-if unmount in DesignerView, which we no longer use). Goes
+        // through the same loadToken so a concurrent loadFlow can't lose to
+        // a slow createEmptyFlow.
+        const myToken = ++loadToken;
+        isLoadingFlow.value = true;
+        try {
+          await createEmptyFlow();
+          if (myToken !== loadToken) return;
+          loadedFlowId = null;
+        } finally {
+          if (myToken === loadToken) isLoadingFlow.value = false;
+        }
+      }
+    },
+    { immediate: true },
+  );
+
+  watch(
+    () => editorStore.isRunning,
+    (running, wasRunning) => {
+      if (!running && wasRunning) {
+        flowStore.fetchArtifacts();
+        flowStore.fetchSettingsValidation();
+      }
+    },
+  );
+
+  // Every edit, a flow load and a Flow Settings change bump the version: re-read where each node runs.
+  watch(
+    () => editorStore.graphVersion,
+    () => flowStore.fetchPlacement(),
+    { immediate: true },
+  );
+
+  // The node sent to the flow's Data window changed, or was sent again: tell the window.
+  watch(
+    () => drawerStore.popoutPreview[flowStore.flowId]?.token,
+    () => broadcastSelection(flowStore.flowId),
+  );
+
+  // A window's Return for the flow already loaded; a flow switch applies it at the end of loadFlow.
+  watch(
+    () => drawerStore.dockRequest?.token,
+    () => applyDockRequest(),
+  );
+
+  // Refresh edge labels when toggle changes
+  watch(
+    () => editorStore.showEdgeLabels,
+    () => {
+      refreshAllEdgeLabels();
+    },
+  );
+
+  // Re-read the graph from core: after AI edits, undo/redo and any failed mutation.
+  watch(
+    () => flowStore.pendingReloadCounter,
+    (count, prev) => {
+      if (count > (prev ?? 0)) {
+        void loadFlow();
+      }
+    },
+  );
+
+  // — Layout-reset signal. Bumped by
+  // ``flowStore.requestLayoutReset()`` from the post-agent_live
+  // banner's [Reorganize] button. Re-runs the same code path the
+  // manual "Reset layout graph" toolbar button triggers.
+  watch(
+    () => flowStore.pendingLayoutResetCounter,
+    (count, prev) => {
+      if (count > (prev ?? 0)) {
+        void handleResetLayoutGraph();
+      }
+    },
+  );
+
+  // Desktop View-menu zoom, never awaited: a watch made after an await would outlive the canvas.
+  if (isDesktop) {
+    viewZoom = desktop.onViewZoom((direction) => {
+      if (direction === "in") {
+        instance.zoomIn();
+      } else if (direction === "out") {
+        instance.zoomOut();
+      } else {
+        instance.zoomTo(1);
+      }
+    });
+  }
+});
+
+onUnmounted(() => {
+  document.removeEventListener("copy", handleCopyEvent);
+  document.removeEventListener("paste", handlePasteEvent);
+  document.removeEventListener("pointerdown", trackPointerDown, true);
+  void viewZoom?.then((unlisten) => unlisten());
+  viewZoom = null;
+  unregisterContainer?.();
+  unregisterContainer = null;
+  unregisterNudges?.();
+  unregisterNudges = null;
+  void flushNudges();
+  cancelEdgeLeave();
+});
+
+defineExpose({
+  reloadCurrentFlow,
+  isLoadingFlow,
+  updateEdgeLabelsForNode,
+  refreshAllEdgeLabels,
+});
+</script>
+
+<template>
+  <div class="container">
+    <main
+      ref="mainContainerRef"
+      @drop="handleDrop"
+      @dragover="handleDragOver"
+      @dragenter="fileDrop.handleDragEnter"
+      @dragleave="fileDrop.handleDragLeave"
+      @dragend="fileDrop.handleDragEnd"
+      @dblclick="handleMainDblClick"
+      @pointermove="trackPointerMove"
+      @pointerdown.capture="syncMultiSelection"
+    >
+      <VueFlow
+        ref="vueFlow"
+        :nodes="nodes"
+        :edges="edges"
+        :node-types="nodeTypes"
+        :edge-types="edgeTypes"
+        class="custom-node-flow"
+        :connection-mode="ConnectionMode.Strict"
+        :connection-radius="60"
+        :edge-updater-radius="15"
+        :default-viewport="{ zoom: 1 }"
+        :zoom-on-double-click="false"
+        :multi-selection-key-code="null"
+        :is-valid-connection="isValidConnection"
+        @edge-update="onEdgeUpdate"
+        @edge-mouse-enter="onEdgeMouseEnter"
+        @edge-mouse-leave="onEdgeMouseLeave"
+        @connect="onConnect"
+        @connect-start="onConnectStart"
+        @connect-end="onConnectEnd"
+        @node-drag-start="onNodeDragStart"
+        @node-drag="onNodeDrag"
+        @node-drag-stop="onNodeDragStop"
+        @pane-click="handleCanvasClick"
+        @node-click="nodeClick"
+        @nodes-change="handleNodeChange"
+        @edges-change="handleEdgeChange"
+        @pane-context-menu="handleContextMenu"
+        @node-context-menu="handleNodeContextMenu"
+        @selection-context-menu="handleSelectionContextMenu"
+        @click="closeContextMenu"
+        @selection-start="handleSelectionStart"
+        @selection-end="handleSelectionEnd"
+        @move-end="handleMoveEnd"
+      >
+        <MiniMap />
+      </VueFlow>
+      <AiGhostNode :composable="ghostNode" @accepted="reloadCurrentFlow" />
+      <FileDropOverlay :controller="fileDrop" />
+      <FileDropUploadDialog :controller="fileDrop" />
+      <context-menu
+        v-if="showContextMenu"
+        :x="contextMenuPosition.x"
+        :y="contextMenuPosition.y"
+        :target-type="contextMenuTarget.type"
+        :target-id="contextMenuTarget.id"
+        :target-in-group="contextMenuTargetInGroup"
+        :can-paste-node="canPasteNode"
+        :is-run-flow-node="targetIsRunFlow"
+        :is-running="targetIsRunning"
+        :cache-results="targetCacheResults"
+        :on-close="closeContextMenu"
+        @action="handleContextMenuAction"
+      />
+      <!-- Floating panels sit above the DesignerView empty-state overlay
+           (z-index 100000) — hide them while no flow is open. -->
+      <draggable-item
+        v-if="flowStore.flowId > 0"
+        id="dataActions"
+        :show-left="true"
+        :initial-width="DATA_ACTIONS_WIDTH"
+        initial-position="left"
+        height-behaviour="scale"
+        title="Data actions"
+        :allow-free-move="true"
+      >
+        <NodeList @dragstart="onDragStart" />
+      </draggable-item>
+      <TabbedDrawer
+        v-for="d in drawers"
+        :key="d.id"
+        :def="d"
+        :height-override="drawerHeightOverride(d)"
+        :left-override="drawerLeftOverride(d)"
+      />
+      <AiCommandPalette />
+      <layoutControls v-if="flowStore.flowId > 0" @reset-layout-graph="handleResetLayoutGraph" />
+    </main>
+  </div>
+</template>
+
+<style>
+@import "@vue-flow/core/dist/style.css";
+@import "@vue-flow/core/dist/theme-default.css";
+@import "@vue-flow/controls/dist/style.css";
+@import "@vue-flow/minimap/dist/style.css";
+@import "@vue-flow/node-resizer/dist/style.css";
+
+html,
+body,
+#app {
+  margin: 0;
+  height: 100%;
+}
+
+#app {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-style: default;
+}
+
+.vue-flow__minimap {
+  transform: scale(75%);
+  transform-origin: bottom right;
+}
+
+[data-theme="dark"] .vue-flow__minimap {
+  background-color: var(--color-background-secondary);
+  border: 1px solid var(--color-border-primary);
+}
+
+[data-theme="dark"] .vue-flow__minimap-mask {
+  fill: rgba(15, 23, 42, 0.6);
+}
+
+[data-theme="dark"] .vue-flow__minimap-node {
+  fill: var(--color-border-secondary);
+  stroke: none;
+}
+
+/* Custom cursors for Windows: system grab/crosshair cursors can be white
+   and invisible on light backgrounds. These SVG cursors guarantee contrast. */
+.custom-node-flow .vue-flow__pane.draggable,
+.custom-node-flow .vue-flow__node.draggable,
+.custom-node-flow .vue-flow__nodesselection-rect {
+  cursor:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='20' fill='none'%3E%3Cpath d='M6.5 12V7.5a1.25 1.25 0 0 1 2.5 0V11m0-4a1.25 1.25 0 0 1 2.5 0V11m0-3a1.25 1.25 0 0 1 2.5 0V11m0-1a1.25 1.25 0 0 1 2.5 0v3c0 3-2 5-5 5S6 16 6 13' stroke='white' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M6.5 12V7.5a1.25 1.25 0 0 1 2.5 0V11m0-4a1.25 1.25 0 0 1 2.5 0V11m0-3a1.25 1.25 0 0 1 2.5 0V11m0-1a1.25 1.25 0 0 1 2.5 0v3c0 3-2 5-5 5S6 16 6 13' stroke='%23333' stroke-width='1.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
+      10 5,
+    grab;
+}
+
+.custom-node-flow .vue-flow__pane.dragging,
+.custom-node-flow .vue-flow__node.dragging,
+.custom-node-flow .vue-flow__nodesselection-rect.dragging {
+  cursor:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='20' fill='none'%3E%3Cpath d='M6.5 13v-2c0-1 .8-1.5 2-1.5h4c1.2 0 2 .5 2 1.5v2c0 3-2 5-4 5s-4-2-4-5' stroke='white' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M6.5 13v-2c0-1 .8-1.5 2-1.5h4c1.2 0 2 .5 2 1.5v2c0 3-2 5-4 5s-4-2-4-5' stroke='%23333' stroke-width='1.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
+      10 10,
+    grabbing;
+}
+
+.custom-node-flow .vue-flow__handle {
+  width: 8px;
+  height: 8px;
+}
+
+.custom-node-flow .vue-flow__handle.connectable {
+  cursor:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='20'%3E%3Cpath d='M10 3v14M3 10h14' stroke='white' stroke-width='3' stroke-linecap='round'/%3E%3Cpath d='M10 3v14M3 10h14' stroke='%23333' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E")
+      10 10,
+    crosshair;
+}
+
+.custom-node-flow .vue-flow__edges {
+  filter: invert(100%);
+}
+
+.custom-node-flow .vue-flow__edge-textwrapper {
+  filter: invert(100%);
+}
+
+.custom-node-flow .vue-flow__edge-text {
+  font-size: 11px;
+  font-weight: 500;
+  fill: #555;
+}
+
+.custom-node-flow .vue-flow__edge-textbg {
+  fill: #fff;
+  rx: 4;
+  ry: 4;
+  opacity: 0.9;
+}
+
+/* Visual cue while a dragged node hovers an edge — the drop will splice
+   the node into this edge (A -> new -> B). Thick + dashed reads through
+   VueFlow's color-inverted edge layer. */
+.custom-node-flow .vue-flow__edge.edge-drop-target .vue-flow__edge-path {
+  stroke-width: 4;
+  stroke-dasharray: 6 4;
+}
+
+/* Selected nodes (Alt/Cmd/Ctrl+click, Shift+drag); the node whose settings are open keeps its own border. */
+.custom-node-flow .vue-flow__node.selected .node-button:not(.selected) {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 1px;
+}
+
+/* Palette drag within snapping range of this node: the drop auto-connects. */
+.custom-node-flow .vue-flow__node.auto-connect-target {
+  outline: 2px dashed var(--color-primary);
+  outline-offset: 4px;
+  border-radius: 8px;
+}
+
+.animated-bg-gradient {
+  background: linear-gradient(
+    122deg,
+    var(--color-gradient-canvas-1),
+    var(--color-gradient-canvas-2),
+    var(--color-gradient-canvas-3),
+    var(--color-gradient-canvas-4)
+  );
+  background-size: 800% 800%;
+  -webkit-animation: gradient 4s ease infinite;
+  -moz-animation: gradient 4s ease infinite;
+  animation: gradient 4s ease infinite;
+}
+
+@-webkit-keyframes gradient {
+  0% {
+    background-position: 0% 22%;
+  }
+  50% {
+    background-position: 100% 79%;
+  }
+  to {
+    background-position: 0% 22%;
+  }
+}
+
+@-moz-keyframes gradient {
+  0% {
+    background-position: 0% 22%;
+  }
+  50% {
+    background-position: 100% 79%;
+  }
+  to {
+    background-position: 0% 22%;
+  }
+}
+
+@keyframes gradient {
+  0% {
+    background-position: 0% 22%;
+  }
+  50% {
+    background-position: 100% 79%;
+  }
+  to {
+    background-position: 0% 22%;
+  }
+}
+
+.container {
+  display: flex;
+  height: 100%;
+  position: relative;
+}
+
+main {
+  flex-grow: 1;
+  position: relative;
+  overflow: hidden;
+}
+</style>

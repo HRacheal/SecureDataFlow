@@ -1,0 +1,96 @@
+import logging
+import os
+import sys
+
+from flowfile_worker.configs import FLOWFILE_CORE_URI
+from flowfile_worker.internal_token import resolve_internal_token
+from flowfile_worker.log_models import RawLogInput
+
+LOGGING_URL = FLOWFILE_CORE_URI + "/raw_logs"
+# Core's header for worker/kernel callbacks; core→worker calls use X-Flowfile-Internal instead.
+CORE_INTERNAL_TOKEN_HEADER = "X-Internal-Token"
+HEADLESS_RUN_ENV_VAR = "FLOWFILE_HEADLESS_RUN"
+"""``1`` while a headless runner runs its flow (core's ``registry.headless_run``); the children it spawns inherit it
+and post no log to core."""
+
+
+def _runs_jobs_in_process() -> bool:
+    """Whether this process runs the worker's jobs itself (``spawner.in_process``): a library host, no core beside it.
+
+    Read through ``sys.modules`` so a child, where the mode is never set, does not import the spawner for it.
+    """
+    spawner = sys.modules.get("flowfile_worker.spawner")
+    return spawner is not None and spawner.in_process
+
+
+class FlowfileLogHandler(logging.Handler):
+    def __init__(self, flowfile_flow_id: int = 1, flowfile_node_id: int | str = -1):
+        super().__init__()
+        self.flowfile_flow_id = flowfile_flow_id
+        self.flowfile_node_id = flowfile_node_id
+
+    def emit(self, record):
+        try:
+            log_message = self.format(record)
+
+            extra = {"Node Id": self.flowfile_node_id}
+            for k, v in extra.items():
+                log_message = f"{k}: {v} - {log_message}"
+            raw_log_input = RawLogInput(
+                flowfile_flow_id=self.flowfile_flow_id,
+                log_message=log_message,
+                log_type=record.levelname.upper(),
+                extra={},
+            )
+            # No token, a library host or a headless runner's child: nothing is posted; the stream handler has it.
+            if (
+                self.flowfile_flow_id != -1
+                and self.flowfile_node_id != -1
+                and not _runs_jobs_in_process()
+                and os.environ.get(HEADLESS_RUN_ENV_VAR) != "1"
+                and (token := resolve_internal_token())
+            ):
+                import requests
+
+                response = requests.post(
+                    LOGGING_URL,
+                    json=raw_log_input.__dict__,
+                    headers={
+                        "Content-Type": "application/json",
+                        CORE_INTERNAL_TOKEN_HEADER: token,
+                    },
+                    timeout=(2, 5),
+                )
+                if response.status_code != 200:
+                    raise Exception(f"Failed to send log: {response.text}")
+        except Exception as e:
+            print(f"Error sending log to {LOGGING_URL}: {e}")
+
+
+def get_worker_logger(flowfile_flow_id: int, flowfile_node_id: int | str) -> logging.Logger:
+    """Return the process-cached logger that ships this node's logs to core.
+
+    Keyed on (flow_id, node_id): FlowfileLogHandler freezes flow_id at construction,
+    so a node_id-only key would let a process that serves a second flow (e.g. a pooled
+    worker child) ship that flow's logs to the first flow's /raw_logs.
+    """
+    logger_name = f"NodeLog: {flowfile_flow_id}:{flowfile_node_id}"
+    logger = logging.getLogger(logger_name)
+    logger.propagate = False
+    logger.setLevel(logging.DEBUG)
+
+    # Only add handlers if they don't already exist to avoid duplicates
+    if not logger.handlers:
+        stream_handler = logging.StreamHandler()
+        stream_handler.setLevel(logging.DEBUG)
+        stream_formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+        stream_handler.setFormatter(stream_formatter)
+        logger.addHandler(stream_handler)
+
+        http_handler = FlowfileLogHandler(flowfile_flow_id=flowfile_flow_id, flowfile_node_id=flowfile_node_id)
+        http_handler.setLevel(logging.INFO)
+        http_formatter = logging.Formatter("%(message)s")
+        http_handler.setFormatter(http_formatter)
+        logger.addHandler(http_handler)
+
+    return logger

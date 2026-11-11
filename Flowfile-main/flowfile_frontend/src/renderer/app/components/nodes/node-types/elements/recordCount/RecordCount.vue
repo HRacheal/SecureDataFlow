@@ -1,0 +1,50 @@
+<template>
+  <div v-if="dataLoaded && nodeRecordCount" class="listbox-wrapper">
+    <generic-node-settings
+      v-model="nodeRecordCount"
+      @update:model-value="handleGenericSettingsUpdate"
+      @request-save="saveSettings"
+    >
+      <p>
+        This node helps you quickly retrieve the total number of records from the selected table.
+      </p>
+      <p>This node does not need a setup</p>
+    </generic-node-settings>
+  </div>
+</template>
+
+<script lang="ts" setup>
+import { ref, onMounted, nextTick } from "vue";
+import { NodeData } from "../../../baseNode/nodeInterfaces";
+import { NodeBase } from "../../../baseNode/nodeInput";
+import { useNodeStore } from "../../../../../stores/node-store";
+import { useNodeSettings } from "../../../../../composables/useNodeSettings";
+import GenericNodeSettings from "../../../baseNode/genericNodeSettings.vue";
+
+const nodeStore = useNodeStore();
+const dataLoaded = ref(false);
+const nodeData = ref<null | NodeData>(null);
+const nodeRecordCount = ref<NodeBase | null>(null);
+
+const { saveSettings, pushNodeData, handleGenericSettingsUpdate } = useNodeSettings({
+  nodeRef: nodeRecordCount,
+});
+
+const loadNodeData = async (nodeId: number) => {
+  nodeData.value = await nodeStore.getNodeData(nodeId, false);
+  nodeRecordCount.value = nodeData.value?.setting_input as NodeBase;
+  if (nodeRecordCount.value) {
+    dataLoaded.value = true;
+  }
+};
+
+defineExpose({
+  loadNodeData,
+  pushNodeData,
+  saveSettings,
+});
+
+onMounted(async () => {
+  await nextTick();
+});
+</script>

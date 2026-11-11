@@ -1,0 +1,126 @@
+"""Kafka helper functions for FlowFrame operations.
+
+This module provides functions for reading from Kafka topics using
+stored Flowfile connections.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from flowfile_frame._identity import current_user_id
+
+if TYPE_CHECKING:
+    from flowfile_frame.flow_frame import FlowFrame
+
+
+def get_current_user_id() -> int:
+    """Get the current user ID for Kafka operations.
+
+    Returns:
+        int: The current user ID; see ``_identity.current_user_id``.
+    """
+    return current_user_id()
+
+
+def add_kafka_source(
+    flow_graph,
+    *,
+    connection_name: str,
+    topic_name: str,
+    max_messages: int = 100_000,
+    start_offset: str = "latest",
+    poll_timeout_seconds: float = 30.0,
+    value_format: str = "json",
+    description: str | None = None,
+) -> int:
+    """Add a Kafka source node to the flow graph.
+
+    Args:
+        flow_graph: The flow graph to add the node to.
+        connection_name: Name of the stored Kafka connection to use.
+        topic_name: Kafka topic to consume from.
+        max_messages: Maximum number of messages to consume.
+        start_offset: Where to start consuming ('earliest' or 'latest').
+        poll_timeout_seconds: How long to poll for messages.
+        value_format: Message value format ('json').
+        description: Optional description for the node.
+
+    Returns:
+        int: The node ID of the created Kafka source node.
+    """
+    from flowfile_core.schemas.input_schema import KafkaSourceSettings, NodeKafkaSource
+    from flowfile_frame.utils import generate_node_id
+
+    node_id = generate_node_id()
+    flow_id = flow_graph.flow_id
+
+    settings = NodeKafkaSource(
+        flow_id=flow_id,
+        node_id=node_id,
+        user_id=get_current_user_id(),
+        description=description,
+        kafka_settings=KafkaSourceSettings(
+            kafka_connection_name=connection_name,
+            topic_name=topic_name,
+            max_messages=max_messages,
+            start_offset=start_offset,
+            poll_timeout_seconds=poll_timeout_seconds,
+            value_format=value_format,
+        ),
+    )
+
+    flow_graph.add_kafka_source(settings)
+    return node_id
+
+
+def read_kafka(
+    connection_name: str,
+    *,
+    topic_name: str,
+    max_messages: int = 100_000,
+    start_offset: str = "latest",
+    poll_timeout_seconds: float = 30.0,
+    value_format: str = "json",
+    description: str | None = None,
+    flow_graph=None,
+) -> FlowFrame:
+    """Read messages from a Kafka topic using a named Flowfile connection.
+
+    Resolves the Kafka connection by name, creates a Kafka source node
+    in the flow graph, and returns a FlowFrame.
+
+    Args:
+        connection_name: Name of the stored Kafka connection to use.
+        topic_name: Kafka topic to consume from.
+        max_messages: Maximum number of messages to consume.
+        start_offset: Where to start consuming ('earliest' or 'latest').
+        poll_timeout_seconds: How long to poll for messages.
+        value_format: Message value format ('json').
+        description: Optional description for the node.
+        flow_graph: Optional existing FlowGraph to add the node to.
+
+    Returns:
+        FlowFrame: A FlowFrame backed by a Kafka source node.
+
+    Raises:
+        ValueError: If the connection is not found.
+    """
+    from flowfile_frame.native import source_frame
+    from flowfile_frame.utils import _implicit_graph
+
+    if flow_graph is None:
+        flow_graph = _implicit_graph()
+
+    node_id = add_kafka_source(
+        flow_graph,
+        connection_name=connection_name,
+        topic_name=topic_name,
+        max_messages=max_messages,
+        start_offset=start_offset,
+        poll_timeout_seconds=poll_timeout_seconds,
+        value_format=value_format,
+        description=description,
+    )
+
+    return source_frame(flow_graph, node_id)

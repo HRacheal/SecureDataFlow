@@ -1,0 +1,194 @@
+import pytest
+
+from flowfile_core.configs.flow_logger import FlowLogger
+from flowfile_core.flowfile.execution.context import use_context
+from flowfile_core.flowfile.flow_graph import FlowGraph, RunInformation, add_connection
+from flowfile_core.flowfile.handler import FlowfileHandler
+from flowfile_core.schemas import input_schema, schemas, transform_schema
+
+try:
+    from tests.flowfile_core_test_utils import ensure_password_is_available, is_docker_available
+except ModuleNotFoundError:
+    import os
+    import sys
+
+    sys.path.append(os.path.dirname(os.path.abspath("flowfile_core/tests/flowfile_core_test_utils.py")))
+    # noinspection PyUnresolvedReferences
+
+
+@pytest.fixture
+def flow_logger() -> FlowLogger:
+    return FlowLogger(1)
+
+
+@pytest.fixture
+def raw_data() -> list[dict]:
+    return [
+        {"name": "John", "city": "New York"},
+        {"name": "Jane", "city": "Los Angeles"},
+        {"name": "Edward", "city": "Chicago"},
+        {"name": "Courtney", "city": "Chicago"},
+    ]
+
+
+def handle_run_info(run_info: RunInformation):
+    if not run_info.success:
+        errors = "errors:"
+        for node_step in run_info.node_step_result:
+            if not node_step.success:
+                errors += f"\n node_id:{node_step.node_id}, error: {node_step.error}"
+        raise ValueError(f"Graph should run successfully:\n{errors}")
+
+
+def create_flowfile_handler():
+    handler = FlowfileHandler()
+    assert handler._flows == {}, "Flow should be empty"
+    return handler
+
+
+def create_graph(execution_mode: str = "Development"):
+    handler = create_flowfile_handler()
+    handler.register_flow(schemas.FlowSettings(flow_id=1, name="new_flow", path=".", execution_mode=execution_mode))
+    graph = handler.get_flow(1)
+    return graph
+
+
+def add_manual_input(graph: FlowGraph, data, node_id: int = 1):
+    raw_data = input_schema.RawData.from_pylist(data)
+    node_promise = input_schema.NodePromise(flow_id=1, node_id=node_id, node_type="manual_input")
+    graph.add_node_promise(node_promise)
+    input_file = input_schema.NodeManualInput(flow_id=1, node_id=node_id, raw_data_format=raw_data)
+    graph.add_manual_input(input_file)
+    return graph
+
+
+def get_graph():
+    graph = create_graph()
+    add_manual_input(graph, data=[{"name": "John", "city": "New York"}], node_id=1)
+    return graph
+
+
+def add_node_promise_on_type(graph: FlowGraph, node_type: str, node_id: int, flow_id: int = 1):
+    node_promise = input_schema.NodePromise(flow_id=flow_id, node_id=node_id, node_type=node_type)
+    graph.add_node_promise(node_promise)
+
+
+def get_dependency_example():
+    graph = create_graph()
+    graph = add_manual_input(
+        graph,
+        data=[
+            {"name": "John", "city": "New York"},
+            {"name": "Jane", "city": "Los Angeles"},
+            {"name": "Edward", "city": "Chicago"},
+            {"name": "Courtney", "city": "Chicago"},
+        ],
+    )
+    node_promise = input_schema.NodePromise(flow_id=1, node_id=2, node_type="unique")
+    graph.add_node_promise(node_promise)
+
+    node_connection = input_schema.NodeConnection.create_from_simple_input(from_id=1, to_id=2)
+    add_connection(graph, node_connection)
+    input_file = input_schema.NodeUnique(
+        flow_id=1, node_id=2, unique_input=transform_schema.UniqueInput(columns=["city"])
+    )
+    graph.add_unique(input_file)
+    return graph
+
+
+def test_node_step_needs_run():
+    graph = get_graph()
+    node = graph.get_node(1)
+    node_logger = graph.flow_logger.get_node_logger(node.node_id)
+    assert node.needs_run(False), "Node should run"
+    with use_context(graph.execution_context):
+        node.execute_node(performance_mode=False, node_logger=node_logger)
+    assert not node.needs_run(False), "Node should not need to run"
+
+
+def test_example_data_from_main_output():
+    graph = get_graph()
+    graph.run_graph()
+    node = graph.get_node(1)
+    node_info = node.get_node_data(1, True)
+    data = node_info.main_output.data
+    assert data == [{"name": "John", "city": "New York"}], "Data should be the same"
+
+
+def test_hash_change_data_with_old_data():
+    graph = get_dependency_example()
+    graph.run_graph()
+    data = graph.get_node_data(2, True).main_output.data
+    assert len(data) > 0, "Data should be present"
+    graph = add_manual_input(
+        graph,
+        data=[
+            {"name": "John", "city": "New York"},
+            {"name": "Jane", "city": "Los Angeles"},
+            {"name": "Edward", "city": "Chicago"},
+            {"name": "Courtney", "city": "Chicago"},
+            {"name": "John", "city": "New York"},
+            {"name": "Jane", "city": "Los Angeles"},
+            {"name": "Edward", "city": "Chicago"},
+            {"name": "Courtney", "city": "Chicago"},
+        ],
+    )
+    data = graph.get_node_data(2, True).main_output.data
+    assert len(data) > 0, "Data should be present, cause we did not run yet"
+
+
+def test_cache_results_in_performance():
+    graph = get_dependency_example()
+    graph.flow_settings.execution_mode = "Performance"
+    graph.run_graph()
+
+    data = graph.get_node_data(2, True).main_output.data
+    assert len(data) == 0, "Data should not be present"
+    graph.get_node(2).node_settings.cache_results = True
+    graph.run_graph()
+    data = graph.get_node_data(2, True).main_output.data
+    assert len(data) > 0, "Data should be present since we cached the results"
+
+
+def test_cache_results_manual_input():
+    graph = create_graph()
+    graph.flow_settings.execution_mode = "Performance"
+    graph = add_manual_input(graph, data=[{"name": "John", "city": "New York"}], node_id=1)
+    node = graph.get_node(1)
+    node.node_settings.cache_results = True
+    graph.run_graph()
+    data = graph.get_node_data(1, True).main_output.data
+    assert len(data) > 0, "Data should be present since we cached the results"
+
+
+def test_add_connection_tracks_output_handle():
+    graph = create_graph()
+    add_manual_input(graph, data=[{"name": "John", "city": "New York"}], node_id=1)
+    add_node_promise_on_type(graph, node_type="unique", node_id=2)
+
+    node_connection = input_schema.NodeConnection(
+        input_connection=input_schema.NodeInputConnection(node_id=2, connection_class="input-0"),
+        output_connection=input_schema.NodeOutputConnection(node_id=1, connection_class="output-1"),
+    )
+    add_connection(graph, node_connection)
+
+    input_file = input_schema.NodeUnique(
+        flow_id=1,
+        node_id=2,
+        unique_input=transform_schema.UniqueInput(columns=["city"]),
+    )
+    graph.add_unique(input_file)
+
+    node = graph.get_node(2)
+    assert node._input_output_handles[1] == "output-1"
+    edges = node.get_edge_input()
+    assert edges[0].sourceHandle == "output-1"
+
+
+@pytest.mark.parametrize(
+    "input_type, expected",
+    [("main", "input-0"), ("right", "input-1"), ("left", "input-2"), ("input-1", "input-1"), ("input-3", "input-3")],
+)
+def test_create_from_simple_input_target_handle(input_type, expected):
+    connection = input_schema.NodeConnection.create_from_simple_input(1, 2, input_type=input_type)
+    assert connection.input_connection.connection_class == expected

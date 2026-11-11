@@ -1,0 +1,209 @@
+//flowfile_frontend/src/renderer/app/pages/databaseManager/DatabaseConnectionForm.vue
+
+<template>
+  <form class="form" @submit.prevent="submitForm">
+    <div class="form-grid">
+      <div class="form-field">
+        <label for="connection-name" class="form-label">Connection Name</label>
+        <input
+          id="connection-name"
+          v-model="connection.connectionName"
+          type="text"
+          class="form-input"
+          placeholder="my_postgres_db"
+          required
+          :disabled="props.isEditing"
+        />
+      </div>
+
+      <div class="form-field">
+        <label for="database-type" class="form-label">Database Type</label>
+        <select id="database-type" v-model="connection.databaseType" class="form-input" required>
+          <option v-for="dialect in dialects" :key="dialect.name" :value="dialect.name">
+            {{ dialect.display_name }}
+          </option>
+        </select>
+      </div>
+
+      <div v-if="!isFileBasedType" class="form-field">
+        <label for="host" class="form-label">Host</label>
+        <input
+          id="host"
+          v-model="connection.host"
+          type="text"
+          class="form-input"
+          placeholder="localhost or IP address"
+          required
+        />
+      </div>
+
+      <div v-if="!isFileBasedType" class="form-field">
+        <label for="port" class="form-label">Port</label>
+        <input
+          id="port"
+          v-model="connection.port"
+          type="number"
+          class="form-input"
+          :placeholder="String(defaultPort(connection.databaseType) || 5432)"
+        />
+      </div>
+
+      <div class="form-field">
+        <label for="database" class="form-label">{{
+          isFileBasedType ? "File Path" : "Database"
+        }}</label>
+        <input
+          id="database"
+          v-model="connection.database"
+          type="text"
+          class="form-input"
+          :placeholder="isFileBasedType ? '/path/to/database.db' : 'Database name'"
+        />
+      </div>
+
+      <div v-if="!isFileBasedType" class="form-field">
+        <label for="username" class="form-label">Username</label>
+        <input
+          id="username"
+          v-model="connection.username"
+          type="text"
+          class="form-input"
+          placeholder="Username"
+          required
+        />
+      </div>
+
+      <div v-if="!isFileBasedType" class="form-field">
+        <label for="password" class="form-label">Password</label>
+        <div class="password-field">
+          <input
+            id="password"
+            v-model="connection.password"
+            :type="showPassword ? 'text' : 'password'"
+            class="form-input"
+            :placeholder="props.isEditing ? 'Leave blank to keep existing' : 'Password'"
+            :required="!props.isEditing"
+          />
+          <button
+            type="button"
+            class="toggle-visibility"
+            aria-label="Toggle password visibility"
+            @click="showPassword = !showPassword"
+          >
+            <i :class="showPassword ? 'fa-solid fa-eye-slash' : 'fa-solid fa-eye'"></i>
+          </button>
+        </div>
+      </div>
+
+      <div v-if="!isFileBasedType" class="form-field">
+        <div class="checkbox-container">
+          <input
+            id="ssl-enabled"
+            v-model="connection.sslEnabled"
+            type="checkbox"
+            class="checkbox-input"
+          />
+          <label for="ssl-enabled" class="form-label">Enable SSL</label>
+        </div>
+      </div>
+    </div>
+
+    <div class="form-actions">
+      <button type="button" class="btn btn-secondary" @click="$emit('cancel')">Cancel</button>
+      <button type="submit" class="btn btn-primary" :disabled="!isValid || isSubmitting">
+        {{ submitButtonText }}
+      </button>
+    </div>
+  </form>
+</template>
+
+<script lang="ts" setup>
+import { ref, computed, defineProps, defineEmits, watch } from "vue";
+import type { FullDatabaseConnection } from "./databaseConnectionTypes";
+import { useDbDialects } from "../../composables/useDbDialects";
+
+const props = defineProps<{
+  initialConnection?: FullDatabaseConnection;
+  isSubmitting?: boolean;
+  isEditing?: boolean;
+}>();
+
+const emit = defineEmits<{
+  (e: "submit", connection: FullDatabaseConnection): void;
+  (e: "cancel"): void;
+}>();
+
+const { dialects, isFileBased, defaultPort } = useDbDialects();
+
+const defaultConnection = (): FullDatabaseConnection => ({
+  connectionName: "",
+  databaseType: "postgresql",
+  username: "",
+  password: "",
+  host: "",
+  port: 5432,
+  database: "",
+  sslEnabled: false,
+  url: "",
+});
+
+const connection = ref<FullDatabaseConnection>(
+  props.initialConnection ? { ...props.initialConnection } : defaultConnection(),
+);
+
+watch(
+  () => props.initialConnection,
+  (newVal) => {
+    if (newVal) {
+      connection.value = { ...newVal };
+    }
+  },
+);
+
+watch(
+  () => connection.value.databaseType,
+  (newType, oldType) => {
+    if (newType !== oldType) {
+      const newDefault = defaultPort(newType);
+      if (isFileBased(newType)) {
+        // File-based databases have no port
+        connection.value.port = undefined;
+      } else {
+        const oldDefault = defaultPort(oldType);
+        if (!connection.value.port || connection.value.port === oldDefault) {
+          connection.value.port = newDefault;
+        }
+      }
+    }
+  },
+);
+
+const showPassword = ref(false);
+
+const isFileBasedType = computed(() => isFileBased(connection.value.databaseType));
+
+const isValid = computed(() => {
+  if (isFileBasedType.value) {
+    return !!connection.value.connectionName && !!connection.value.database;
+  }
+  return (
+    !!connection.value.connectionName &&
+    !!connection.value.username &&
+    (props.isEditing || !!connection.value.password) &&
+    !!connection.value.host
+  );
+});
+
+const submitButtonText = computed(() => {
+  if (props.isSubmitting) {
+    return "Saving...";
+  }
+  return props.initialConnection ? "Update Connection" : "Create Connection";
+});
+
+const submitForm = () => {
+  if (isValid.value) {
+    emit("submit", connection.value);
+  }
+};
+</script>

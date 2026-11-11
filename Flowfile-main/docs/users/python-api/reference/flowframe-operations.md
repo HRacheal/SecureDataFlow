@@ -1,0 +1,198 @@
+# DataFrame Operations
+
+Core row- and column-level transforms: filter, select, add or modify columns, sort, deduplicate, and the string/date/list expression namespaces. Every FlowFrame method mirrors its Polars counterpart and accepts an optional `description` that shows up as node documentation in the visual editor.
+
+The `flowfile_formula` examples below use the [Flowfile formula language](../../formulas/index.md); everything else is a [Polars expression](../concepts/expressions.md).
+
+## A worked example
+
+This runs against committed data and is executed by the docs test suite:
+
+```python
+--8<-- "docs/examples/python_api_operations.py:example"
+```
+
+The sections below break down each operation.
+
+## Filtering
+
+```python
+import flowfile as ff
+
+df = ff.FlowFrame({"price": [10, 20, 30], "qty": [5, 0, 10]})
+
+# Polars expression predicate
+df = df.filter(ff.col("price") > 15)
+
+# With a description (surfaces in the visual editor)
+df = df.filter(ff.col("price") > 15, description="Keep items over $15")
+
+# Flowfile formula syntax
+df = df.filter(flowfile_formula="[price] > 15 and [qty] > 0")
+```
+
+!!! note "Which node the filter becomes"
+    Both `filter(flowfile_formula=...)` and a plain `filter(ff.col(...) > x)` predicate emit an editable Filter node. A predicate with no formula form, such as a lambda, falls back to a `polars_code` node; see [which operations become which node](../concepts/design-concepts.md#which-operations-become-which-node).
+
+## Selecting columns
+
+```python
+# Select specific columns by name
+df = df.select(["price", "qty"])
+
+# Select with expressions
+df = df.select([
+    ff.col("price"),
+    ff.col("qty").alias("quantity"),
+])
+
+# Keep everything except one column with a column selector.
+# There is no ff.exclude() — use ff.col("*").exclude(...) or the selectors module.
+df = df.select(ff.col("*").exclude("internal_id"))
+```
+
+!!! tip "Selectors"
+    `ff.numeric()`, `ff.string()`, `ff.all_()`, and the other [selector helpers](../concepts/expressions.md) pick columns by dtype or pattern — e.g. `df.select(ff.numeric())` keeps only numeric columns.
+
+## Adding and modifying columns
+
+```python
+# Expression form
+df = df.with_columns([
+    (ff.col("price") * ff.col("qty")).alias("total"),
+])
+
+# Flowfile formula form
+df = df.with_columns(
+    flowfile_formulas=["[price] * [qty]"],
+    output_column_names=["total"],
+    description="Calculate line totals",
+)
+```
+
+## Sorting
+
+```python
+df = df.sort("price")
+df = df.sort("price", descending=True)
+
+# Multi-column sort
+df = df.sort(["category", "price"], descending=[False, True])
+```
+
+## Removing duplicates
+
+```python
+# Drop fully duplicate rows
+df = df.unique()
+
+# Deduplicate on a subset of columns
+df = df.unique(subset=["product_id"])
+```
+
+!!! warning "No `drop_duplicates`"
+    FlowFrame does not expose `drop_duplicates`. Use `unique()` (optionally with `subset=[...]` and `keep="first"`).
+
+## Cleaning messy text
+
+`data_cleansing()` is the Python form of the [Data Cleansing node](../../visual-editor/nodes/transform.md#data-cleansing): one call that fills nulls, trims and normalizes whitespace, strips unwanted characters, and fixes casing. Pass a list of column names to limit it; with no list it cleanses every column. Text rules only touch String columns and the null-to-zero rule only Numeric ones, so a mixed frame is safe to pass whole.
+
+```python
+--8<-- "docs/examples/data_cleansing.py:example"
+```
+
+`remove_null_rows` and `remove_null_columns` look at the whole frame regardless of the column list. `remove_null_columns` is the one data-dependent keyword: which columns go is decided from a null count taken when the method is called, not at `collect()`.
+
+## One formula over many columns
+
+`multi_field_formula()` is the Python form of the [Multi-Field Formula node](../../visual-editor/nodes/transform.md#multi-field-formula): one [Flowfile formula](../../formulas/index.md) applied to many columns in a single call. Inside the formula `[_CurrentField_]` is the value of the column being processed, `[_CurrentFieldName_]` its name and `[_CurrentFieldType_]` its dtype, the last two as text. Narrow the selection with `columns=[...]` or `data_type="Numeric"` — they are mutually exclusive, and passing neither applies the formula to every column.
+
+```python
+--8<-- "docs/examples/multi_field_formula.py:example"
+```
+
+`prefix` or `suffix` sends the results to new columns and leaves the sources alone; with neither, each result overwrites the column it came from. `output_data_type` casts every result. All the expressions run in one `with_columns`, so a formula may reference a column that is itself being overwritten and still read its original value. Selecting nothing — an empty `columns` list, or a `data_type` no column matches — is a no-op rather than an error.
+
+## Exploding a hierarchy
+
+`explode_hierarchy()` is the Python form of the [Explode hierarchy node](../../visual-editor/nodes/combine.md#explode-hierarchy) and has no Polars counterpart. Each input row is one parent → child edge, such as an assembly and a component or a parent account and an account. The result links every item to everything below it, with quantities multiplied along each route and added up across routes. `output_detail` picks the shape: `"totals"` (the default) gives one row per ancestor and descendant, `"levels"` splits that per level, and `"paths"` gives one row per route, depth-first.
+
+```python
+--8<-- "docs/examples/explode_hierarchy.py:example"
+```
+
+The result is a new table with the columns `ancestor`, `descendant`, `level`, `quantity` and `is_leaf`, plus `parent`, `quantity_per` and `path` for `"paths"`; the input's other columns are not carried through. `top_level_only=True` explodes only the items that never appear as a child, `include_self=True` adds a level-0 row from each exploded item to itself (only the top-level ones with `top_level_only=True`), and `max_depth` stops after that many levels. A cycle or a null quantity raises a `ComputeError` when the result is collected, not when the method is called.
+
+## SQL queries
+
+`frame.sql(query)` and `ff.sql(query, ...)` place a [SQL Query node](../../visual-editor/nodes/transform.md#sql-query) and return its output frame. The query uses the Polars SQL dialect and must be a single `SELECT` or `WITH` statement.
+
+```python
+--8<-- "docs/examples/sql_query.py:example"
+```
+
+```python
+FlowFrame.sql(query: str, *, table_name: str = "self", description: str | None = None) -> FlowFrame
+
+ff.sql(query: str, /, *frames: FlowFrame, description: str | None = None, **tables: FlowFrame) -> FlowFrame
+```
+
+- `frame.sql` mirrors `polars.LazyFrame.sql`: the frame is the table `self`, or `table_name`.
+- In `ff.sql`, positional frames are the tables `input_1`, `input_2`, … and each keyword frame is the table of that name, numbered after the positional ones. `description` is the node label, so it is the one name that cannot be a table. Frames on different graphs are merged onto one. Without frames the query reads no tables and the node starts a new graph: `ff.sql("SELECT 1 AS x")`. Unlike `pl.sql`, `ff.sql` takes its frames as arguments and never reads variables from the calling namespace.
+- The node itself names its inputs `input_1`, `input_2`, …, so a named table is stored as a header in front of the query, merged into the query's own `WITH` when it has one: `WITH orders AS (SELECT * FROM input_1), regions AS (SELECT * FROM input_2)`. The designer shows that header as part of the query. Table names are case-sensitive, as in Polars. The query is trimmed before it is stored, and dedented unless a quoted string in it spans lines.
+- Without `description`, the node is labelled with the first line of the query.
+- A flow parameter goes in as `${name}`, or `min_amount.ref` in an f-string, and is substituted as text, so a string value needs its SQL quotes: `WHERE region = '${region}'`. See [Flow parameters](native-nodes.md#flow-parameters).
+- An empty query, a table name that is not a plain identifier, a name that is another input's `input_<n>`, a statement other than `SELECT`/`WITH`, and a query that does not resolve against its inputs all raise `NativeNodeError` when the node is built, and the node is removed again.
+
+## String operations
+
+```python
+df = df.with_columns([
+    ff.col("name").str.to_uppercase().alias("name_upper"),
+    ff.col("code").str.slice(0, 3).alias("prefix"),
+    ff.col("text").str.contains("pattern").alias("has_pattern"),
+])
+```
+
+## Conditional logic
+
+```python
+df = df.with_columns([
+    ff.when(ff.col("price") > 100)
+    .then(ff.lit("Premium"))
+    .when(ff.col("price") > 50)
+    .then(ff.lit("Standard"))
+    .otherwise(ff.lit("Budget"))
+    .alias("tier"),
+])
+```
+
+## Date operations
+
+```python
+df = df.with_columns([
+    ff.col("date").dt.year().alias("year"),
+    ff.col("date").dt.month().alias("month"),
+    ff.col("date").dt.day().alias("day"),
+    ff.col("date").dt.weekday().alias("weekday"),
+])
+```
+
+!!! note "Polars renames apply"
+    The expression namespaces track the pinned Polars version: use `dt.weekday()` (not `day_of_week`) and `cum_sum()` (not `cumsum`).
+
+## List operations
+
+```python
+df = df.with_columns([
+    ff.col("tags").list.len().alias("tag_count"),
+    ff.col("values").list.sum().alias("total"),
+    ff.col("items").list.first().alias("first_item"),
+])
+```
+
+!!! note "Polars compatibility"
+    Most Polars `Expr` methods are available. See the [Polars docs](https://pola-rs.github.io/polars/py-polars/html/reference/dataframe/index.html) for the full method reference; a few methods are renamed or fall back to `polars_code` nodes — see [Expressions](../concepts/expressions.md).
+
+---
+[← Previous: Data Types](data-types.md) | [Next: Aggregations →](aggregations.md)

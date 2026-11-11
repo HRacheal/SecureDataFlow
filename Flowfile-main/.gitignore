@@ -1,0 +1,130 @@
+/mysql
+/mysql/*
+.idea
+.build-logs
+files/*
+.env
+/.env
+./.env
+flowfile_core/files/*
+flowfile_core/files/excel_files/
+flowfile_core/files/csv/
+flowfile_core/db_data
+*__pycache__*
+/flowfile_core/.cache_data
+/flowfile_frontend/node_modules
+/node_modules/*
+/flowfile_core/analysis/
+/flowfile_core/.cache_data/*
+/flowfile_core/.venv-*
+/.venv-*
+/flowfile_core/.cache*
+*.cache*
+/flowfile_core/saved_flows/**.json
+/flowfile_core/saved_flows/
+/flowfile_core/flowfile_core/saved_flows/
+/flowfile_frontend/dist-electron/*
+/flowfile_core/tests/data/*
+/dist
+/build
+/.vscode
+/.idea
+/.venv.DS_Store
+site/ # Also ignore mkdocs build directory
+**/.DS_Store
+/docs/.venv/
+docs/.venv/
+**/.venv/**
+/site/
+/.venv
+print_structure.py
+/venv_flowfile/**
+services_dist/
+shared_data/
+saved_flows/
+/flowfile.db
+/flowfile_catalog.db
+/flowfile_frontend/flowfile.db
+/flowfile_frontend/flowfile_catalog.db
+/flowfile_worker.spec
+/test_utils/postgres/postgres-docker-samples/
+**/test_flowfile.db
+**/test_flowfile_catalog.db
+
+playwright-report/
+test-results/
+
+/flowfile/flowfile/web/static/
+flowfile.db
+flowfile_catalog.db
+local_data
+/custom_nodes/
+/flowfile_core/tests/support_files/flows/new_flow.flowfile
+/flowfile_frame/tests/output_csv.csv
+/output_csv.csv
+/flowfile_core/tests/support_files/flows/sample_flow_path.flowfile
+/flowfile_core/tests/support_files/flows/second_flow.flowfile
+/flowfile_core/tests/support_files/flows/tmp/
+
+# Coverage
+.coverage
+coverage.xml
+htmlcov/
+
+# Docker
+flowfile_data/
+
+# Egg info
+*.egg-info/
+
+# Secrets and keys - NEVER commit these
+master_key.txt
+*.key
+*.pem
+!requirements*.txt
+test-embed
+/expr_transformer/
+/.opencode/
+
+# Local remote-image compose setup
+/docker-remote/
+
+# Local review artefacts
+/diff.txt
+
+# Local editor / one-off backup files (e.g. *.local-backup-YYYYMMDD-HHMMSS)
+*.local-backup-*
+
+# Stray runtime artefacts
+error-linux
+.claude/scheduled_tasks.lock
+
+# Repo-root Claude state: track the shared skills/investigation/launch config,
+# keep only machine-local settings out of version control
+# (scheduled_tasks.lock is ignored above under runtime artefacts).
+.claude/settings.local.json
+
+# Signing checklist holds real cert/notarization secrets — never commit
+flowfile_frontend/src-tauri/SIGNING_CHECKLIST.md
+/.claude/agents/
+
+# Docs planning/working notes (untracked)
+DOCS_IMAGE_TODO.md
+DOCS_DIAGRAMS_AGENT_PROMPT.md
+/notes/
+
+# Collected telemetry (the compose file bind-mounts this into the working tree)
+tools/telemetry_collector/data/
+/scratch/
+
+# Alteryx material: Designer samples, macros and data files are proprietary and must never be committed.
+# Hand-written .yxmd fixtures are allowed only in the converter test fixtures directory.
+*.yxmd
+!flowfile_core/tests/flowfile/converters/fixtures/*.yxmd
+*.yxmc
+*.yxwz
+*.yxdb
+*.yxzp
+*.yxi
+/alteryx_nodes/
+/alteryx_nodes_data/

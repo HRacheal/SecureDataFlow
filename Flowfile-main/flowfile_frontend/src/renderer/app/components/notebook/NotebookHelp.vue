@@ -1,0 +1,428 @@
+<template>
+  <Teleport to="body">
+    <div class="modal-overlay" @click="$emit('close')">
+      <div class="modal-container" @click.stop>
+        <div class="modal-header">
+          <h3 class="modal-title">Notebook reference</h3>
+          <button class="modal-close" aria-label="Close" @click="$emit('close')">
+            <i class="fa-solid fa-times"></i>
+          </button>
+        </div>
+        <div class="modal-content">
+          <section class="api-section">
+            <h4>Getting started</h4>
+            <p v-if="kernelMode" class="section-description">
+              This notebook is the open flow written as <code>ff</code> code, running as real Python
+              in a session on the kernel you picked. The session starts from the canvas, so every
+              node's frame is already bound. Run never changes the canvas; Push does.
+            </p>
+            <p v-else-if="flowMode" class="section-description">
+              This notebook is the open flow written as <code>ff</code> code. Cells are read as a
+              description of the flow, never executed: rows are only computed when the flow runs on
+              the canvas. <code>print()</code>, <code>display()</code>, loops and other imports need
+              a kernel: pick one in the toolbar (when offered) to run cells as Python.
+            </p>
+            <p v-else class="section-description">
+              Notebooks run Python (and Markdown) on a kernel. Pick a kernel in the toolbar — Python
+              cells need one; Markdown renders without. The catalog API is exposed as
+              <code>flowfile_ctx</code>.
+            </p>
+            <template v-if="kernelMode">
+              <div class="api-item">
+                <code>Run</code>
+                <p>
+                  Executes the cell in the kernel session and shows its prints, errors and
+                  <code>display()</code> output. The canvas is unchanged.
+                </p>
+              </div>
+              <div class="api-item">
+                <code>Run all</code>
+                <p>Runs every cell in the session, top to bottom.</p>
+              </div>
+              <div class="api-item">
+                <code>Push</code>
+                <p>
+                  Runs every cell on the kernel in a fresh session and applies what they build to
+                  the canvas as one undo step (it asks before deleting nodes). The session is then
+                  re-seeded from the canvas.
+                </p>
+              </div>
+              <div class="api-item">
+                <code>Run and preview on canvas</code>
+                <p>
+                  Node cell ⋯ menu. Syncs the notebook when it was edited, runs the node on the
+                  canvas and opens its preview.
+                </p>
+              </div>
+              <div class="api-item">
+                <code>Reset session</code>
+                <p>Toolbar ⋯ menu. Re-seeds the session from the canvas as it is now.</p>
+              </div>
+            </template>
+            <template v-else-if="flowMode">
+              <div class="api-item">
+                <code>Run</code>
+                <p>
+                  When a cell was edited, added, removed or moved, first syncs the notebook to the
+                  canvas (one undo step on the canvas; it asks before deleting nodes). A node cell
+                  then runs its node and the nodes before it on the canvas and shows a preview of up
+                  to 100 of its rows; the parameters cell lists each parameter with its type and
+                  default; imports and plain values show nothing.
+                </p>
+              </div>
+              <div class="api-item">
+                <code>Run all</code>
+                <p>
+                  Syncs first when the notebook no longer matches the canvas, runs the whole flow on
+                  the canvas, then refreshes the output of the parameters cell and every node cell.
+                </p>
+              </div>
+              <div class="api-item">
+                <code>Push</code>
+                <p>Syncs the cells to the canvas without running anything.</p>
+              </div>
+              <div class="api-item">
+                <code>Edited · Synced · Sync failed</code>
+                <p>
+                  Whether the canvas holds a cell's code. A failed sync marks the line it stopped
+                  at; fix it and run again.
+                </p>
+              </div>
+            </template>
+            <div class="api-item">
+              <code>Shift + Enter</code>
+              <p>Run the cell and move to the next one; a blank cell is added after the last.</p>
+            </div>
+            <div class="api-item">
+              <code>Cmd / Ctrl + Enter</code>
+              <p>Run the cell in place (render a Markdown cell).</p>
+            </div>
+            <div class="api-item">
+              <code>Enter on a rendered Markdown cell</code>
+              <p>Opens it for editing (the cell itself must be focused, not its editor).</p>
+            </div>
+            <div class="api-item">
+              <code>Alt + ↑ / ↓</code>
+              <p>Move the cell up or down (with the drag handle focused); or drag the handle.</p>
+            </div>
+            <div class="api-item">
+              <code>⋯ Cell menu</code>
+              <p v-if="flowMode">
+                Insert above / Insert below, Duplicate, Collapse code / Collapse output, Convert to
+                Markdown / Convert to Python, Run and preview on canvas (node cells: runs the cell,
+                then opens the node's preview on the canvas), and Delete.
+              </p>
+              <p v-else>
+                Insert above / Insert below, Duplicate, Collapse code / Collapse output, and Delete.
+              </p>
+            </div>
+            <div class="api-item">
+              <code>Undo / Redo</code>
+              <p>
+                Toolbar buttons. Revert or replay cell inserts, deletes and moves. Cmd/Ctrl+Z inside
+                a cell still undoes text.
+              </p>
+            </div>
+            <div v-if="!flowMode" class="api-item">
+              <code>Reset session</code>
+              <p>
+                Toolbar ⋯ menu. Clears this notebook's variables on the kernel; the kernel keeps
+                running. Outputs and the execution counter go with them, and a reset that fails
+                changes nothing.
+              </p>
+            </div>
+            <div v-if="!flowMode" class="api-item">
+              <code>Outdated results</code>
+              <p>
+                <strong>Code changed — rerun</strong>: this cell's code changed after the result was
+                produced. <strong>Earlier cells changed — rerun</strong>: a cell above it was
+                edited, moved or run again. <strong>Previous session</strong>: the result predates
+                the kernel session you are in now. A label never removes a result — rerun the cell
+                to refresh it.
+              </p>
+            </div>
+            <div v-if="!flowMode" class="api-item">
+              <code>Column names</code>
+              <p>
+                Open a quote in a column position — <code>df.select("</code>, <code>pl.col("</code>,
+                <code>df["</code> — and the popup lists that frame's columns with their dtype and
+                where the names came from. Catalog tables, node inputs and plain
+                <code>select</code> / <code>rename</code> / <code>drop</code> chains are known
+                before anything runs; after a run the kernel's own columns appear, labelled
+                <strong>last run</strong>. When the editor cannot know the frame, it offers nothing
+                rather than guessing.
+              </p>
+            </div>
+            <div v-if="!flowMode" class="api-item">
+              <code>df</code>
+              <p>A bare value on the last line shows its repr (what the object is).</p>
+            </div>
+            <div v-if="!flowMode" class="api-item">
+              <code>display(df)</code>
+              <p>Render a DataFrame as an interactive, sortable table.</p>
+            </div>
+            <div v-if="!flowMode" class="api-item">
+              <code>explore(df)</code>
+              <p>Open the Graphic Walker explorer (data grid + drag-to-chart).</p>
+            </div>
+          </section>
+
+          <section v-if="!flowMode" class="api-section">
+            <h4>Read catalog data</h4>
+            <p class="section-description">
+              Read tables straight from the catalog — no upstream flow needed. These return a Polars
+              <code>LazyFrame</code>; call <code>.collect()</code> for a DataFrame.
+            </p>
+            <div class="api-item">
+              <code>flowfile_ctx.list_catalogs()</code>
+              <p>
+                List top-level catalogs. Navigate with <code>.get_schema()</code> /
+                <code>.list_schemas()</code> / <code>.get_table_ref()</code>.
+              </p>
+            </div>
+            <div class="api-item">
+              <code
+                >flowfile_ctx.get_catalog("Demo").get_schema("market").read_table("fx_rates")</code
+              >
+              <p>Read a table by catalog → schema → name.</p>
+            </div>
+            <div class="api-item">
+              <code>flowfile_ctx.read_catalog_table("fx_rates", schema="market")</code>
+              <p>
+                Shortcut read by name. Pass <code>schema=</code> / <code>namespace_id=</code> to
+                disambiguate, <code>delta_version=</code> for time travel.
+              </p>
+            </div>
+            <div class="api-item">
+              <code>flowfile_ctx.list_catalog_tables(schema="market")</code>
+              <p>List available tables as <code>TableRef</code> objects.</p>
+            </div>
+          </section>
+
+          <section v-if="!flowMode" class="api-section">
+            <h4>Display &amp; explore</h4>
+            <p class="section-description">
+              Render results inline in the cell output. Both are available as bare names —
+              <code>flowfile_ctx.display</code> and <code>flowfile_ctx.explore</code> are the same
+              functions.
+            </p>
+            <div class="api-item">
+              <code>display(obj, title?)</code>
+              <p>
+                Polars frames → interactive table; also matplotlib / plotly figures, PIL images, and
+                HTML strings.
+              </p>
+            </div>
+            <div class="api-item">
+              <code>explore(df)</code>
+              <p>Full Graphic Walker explorer (Data + Visualization tabs).</p>
+            </div>
+          </section>
+
+          <section v-if="!flowMode" class="api-section">
+            <h4>Write back to the catalog</h4>
+            <div class="api-item">
+              <code>flowfile_ctx.write_catalog_table(df, "result")</code>
+              <p>Write a DataFrame to a catalog table.</p>
+            </div>
+            <div class="api-item">
+              <code
+                >flowfile_ctx.get_catalog("Demo").get_schema("market").write_table(df, "result",
+                write_mode="overwrite")</code
+              >
+              <p>
+                Write via a schema ref. <code>write_mode=</code> overwrite / append / upsert…,
+                <code>merge_keys=</code> for upsert.
+              </p>
+            </div>
+          </section>
+
+          <section v-if="!flowMode" class="api-section">
+            <h4>Artifacts &amp; logging</h4>
+            <div class="api-item">
+              <code>flowfile_ctx.publish_global("model", obj)</code>
+              <p>Persist a Python object to the catalog (survives across sessions).</p>
+            </div>
+            <div class="api-item">
+              <code>flowfile_ctx.get_global("model")</code>
+              <p>Retrieve a global artifact.</p>
+            </div>
+            <div class="api-item">
+              <code>flowfile_ctx.log_info("message")</code>
+              <p>Send a message to the log viewer (also log_warning / log_error).</p>
+            </div>
+          </section>
+
+          <section v-if="!flowMode" class="api-section">
+            <h4>Common patterns</h4>
+
+            <div class="pattern">
+              <h5>Read, transform, display</h5>
+              <pre><code>import polars as pl
+
+df = flowfile_ctx.get_catalog("Demo").get_schema("market").read_table("fx_rates")
+strong = df.filter(pl.col("rate") > 1).collect()
+display(strong)</code></pre>
+            </div>
+
+            <div class="pattern">
+              <h5>Explore a table</h5>
+              <pre><code>df = flowfile_ctx.read_catalog_table("fx_rates", schema="market")
+explore(df)</code></pre>
+            </div>
+
+            <div class="pattern">
+              <h5>Write a result back to the catalog</h5>
+              <pre><code>import polars as pl
+
+df = flowfile_ctx.read_catalog_table("fx_rates", schema="market").collect()
+summary = df.group_by("currency").agg(pl.col("rate").mean())
+flowfile_ctx.write_catalog_table(summary, "fx_rate_avg")</code></pre>
+            </div>
+          </section>
+        </div>
+      </div>
+    </div>
+  </Teleport>
+</template>
+
+<script setup lang="ts">
+/** `flowMode`: the canvas notebook; `kernelMode`: it runs in a session on a picked kernel. */
+defineProps<{ flowMode?: boolean; kernelMode?: boolean }>();
+
+defineEmits<{
+  (e: "close"): void;
+}>();
+</script>
+
+<style scoped>
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 200002;
+}
+
+.modal-container {
+  background-color: var(--el-bg-color);
+  border-radius: var(--el-border-radius-base);
+  box-shadow: var(--el-box-shadow);
+  max-width: 700px;
+  width: 90%;
+  max-height: 85vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 1rem 1.5rem;
+  border-bottom: 1px solid var(--el-border-color-lighter);
+  flex-shrink: 0;
+}
+
+.modal-title {
+  margin: 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+
+.modal-close {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 1.1rem;
+  color: var(--el-text-color-secondary);
+  padding: 0.25rem;
+}
+
+.modal-close:hover {
+  color: var(--el-text-color-primary);
+}
+
+.modal-content {
+  padding: 1.5rem;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.api-section {
+  margin-bottom: 1.5rem;
+}
+
+.api-section:last-child {
+  margin-bottom: 0;
+}
+
+.api-section h4 {
+  font-size: 1rem;
+  font-weight: 600;
+  margin: 0 0 0.75rem 0;
+  color: var(--el-text-color-primary);
+}
+
+.section-description {
+  font-size: 0.85rem;
+  color: var(--el-text-color-secondary);
+  margin: 0 0 0.75rem 0;
+  line-height: 1.5;
+}
+
+.api-item {
+  margin-bottom: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  background-color: var(--el-fill-color-lighter);
+  border-radius: 4px;
+}
+
+.api-item code {
+  font-family: var(--el-font-family, monospace);
+  font-size: 0.85rem;
+  color: var(--el-color-primary);
+  font-weight: 500;
+}
+
+.api-item p {
+  margin: 0.25rem 0 0 0;
+  font-size: 0.8rem;
+  color: var(--el-text-color-secondary);
+}
+
+.api-item p code {
+  font-size: 0.78rem;
+}
+
+.pattern {
+  margin-bottom: 1rem;
+}
+
+.pattern h5 {
+  font-size: 0.85rem;
+  font-weight: 600;
+  margin: 0 0 0.5rem 0;
+  color: var(--el-text-color-regular);
+}
+
+.pattern pre {
+  background-color: #282c34;
+  border-radius: 4px;
+  padding: 0.75rem 1rem;
+  overflow-x: auto;
+  margin: 0;
+}
+
+.pattern pre code {
+  font-family: var(--el-font-family, monospace);
+  font-size: 0.8rem;
+  color: #abb2bf;
+  white-space: pre;
+}
+</style>

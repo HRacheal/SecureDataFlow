@@ -1,0 +1,88 @@
+import {
+  OutputAvroTable,
+  OutputCsvTable,
+  OutputExcelTable,
+  OutputIpcTable,
+  OutputNdjsonTable,
+  OutputParquetTable,
+  OutputSettings,
+} from "../../../baseNode/nodeInput";
+
+export const createDefaultParquetSettings = (): OutputParquetTable => {
+  return {
+    file_type: "parquet",
+    compression: "zstd",
+  };
+};
+
+export const createDefaultCsvSettings = (): OutputCsvTable => {
+  return {
+    delimiter: ",",
+    encoding: "utf-8",
+    file_type: "csv",
+  };
+};
+
+export const createDefaultExcelSettings = (): OutputExcelTable => {
+  return {
+    sheet_name: "Sheet1",
+    file_type: "excel",
+  };
+};
+
+export function createDefaultOutputSettings(): OutputSettings {
+  return {
+    name: "output.csv",
+    directory: ".",
+    file_type: "csv",
+    write_mode: "overwrite",
+    table_settings: {
+      file_type: "csv",
+      delimiter: ",",
+      encoding: "utf-8",
+    },
+  };
+}
+
+export function createCsvTableSettings(): OutputCsvTable {
+  return {
+    file_type: "csv",
+    delimiter: ",",
+    encoding: "utf-8",
+  };
+}
+
+export function createParquetTableSettings(): OutputParquetTable {
+  return {
+    file_type: "parquet",
+    compression: "zstd",
+  };
+}
+
+export function createExcelTableSettings(): OutputExcelTable {
+  return {
+    file_type: "excel",
+    sheet_name: "Sheet1",
+  };
+}
+
+export function createIpcTableSettings(): OutputIpcTable {
+  return {
+    file_type: "ipc",
+    compression: "uncompressed",
+  };
+}
+
+export function createNdjsonTableSettings(): OutputNdjsonTable {
+  return {
+    file_type: "ndjson",
+    compression: "uncompressed",
+  };
+}
+
+export function createAvroTableSettings(): OutputAvroTable {
+  return {
+    file_type: "avro",
+    compression: "uncompressed",
+  };
+}

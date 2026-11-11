@@ -1,0 +1,134 @@
+// Cloud storage connection types and interfaces for S3, ADLS, and other cloud providers
+
+export type CloudStorageType = "s3" | "adls" | "gcs";
+
+export const cloudStorageTypes: CloudStorageType[] = ["adls", "gcs", "s3"];
+
+export type AuthMethod =
+  | "access_key"
+  | "iam_role"
+  | "service_principal"
+  | "managed_identity"
+  | "sas_token"
+  | "aws-cli"
+  | "service_account"
+  | "env_vars"
+  | "auto";
+
+// "auto" is a node-level mode only; the backend rejects it on a saved connection.
+export const authMethodsByStorageType: Record<
+  CloudStorageType,
+  { value: AuthMethod; label: string }[]
+> = {
+  s3: [
+    { value: "access_key", label: "Access Key" },
+    { value: "iam_role", label: "IAM Role" },
+    { value: "aws-cli", label: "AWS CLI" },
+  ],
+  adls: [
+    { value: "access_key", label: "Access Key" },
+    { value: "service_principal", label: "Service Principal" },
+    { value: "managed_identity", label: "Managed Identity" },
+    { value: "sas_token", label: "SAS Token" },
+  ],
+  gcs: [
+    { value: "service_account", label: "Service Account" },
+    { value: "env_vars", label: "Application Default Credentials" },
+  ],
+};
+
+export interface PythonAuthSettingsInput {
+  storage_type: CloudStorageType;
+  auth_method: AuthMethod;
+  connection_name?: string;
+}
+
+export interface AuthSettingsInput {
+  storageType: CloudStorageType;
+  authMethod: AuthMethod;
+  connectionName?: string;
+}
+
+export interface PythonFullCloudStorageConnection extends PythonAuthSettingsInput {
+  // AWS S3
+  aws_region?: string;
+  aws_access_key_id?: string;
+  aws_secret_access_key?: string;
+  aws_role_arn?: string;
+  aws_allow_unsafe_html?: boolean;
+  aws_session_token?: string;
+  aws_profile?: string;
+
+  // Azure ADLS
+  azure_account_name?: string;
+  azure_account_key?: string;
+  azure_tenant_id?: string;
+  azure_client_id?: string;
+  azure_client_secret?: string;
+  azure_sas_token?: string;
+
+  // Google Cloud Storage
+  gcs_service_account_key?: string;
+  gcs_project_id?: string;
+
+  // Common
+  endpoint_url?: string;
+  verify_ssl: boolean;
+}
+
+export interface FullCloudStorageConnection extends AuthSettingsInput {
+  // AWS S3
+  awsRegion?: string;
+  awsAccessKeyId?: string;
+  awsSecretAccessKey?: string;
+  awsRoleArn?: string;
+  awsAllowUnsafeHtml?: boolean;
+  awsSessionToken?: string;
+  awsProfile?: string;
+
+  // Azure ADLS
+  azureAccountName?: string;
+  azureAccountKey?: string;
+  azureTenantId?: string;
+  azureClientId?: string;
+  azureClientSecret?: string;
+  azureSasToken?: string;
+
+  // Google Cloud Storage
+  gcsServiceAccountKey?: string;
+  gcsProjectId?: string;
+
+  // Common
+  endpointUrl?: string;
+  verifySsl: boolean;
+}
+
+export interface PythonFullCloudStorageConnectionInterface extends PythonAuthSettingsInput {
+  // Public fields only
+  aws_allow_unsafe_html?: boolean;
+  aws_region?: string;
+  aws_access_key_id?: string;
+  aws_role_arn?: string;
+  aws_profile?: string;
+  azure_account_name?: string;
+  azure_tenant_id?: string;
+  azure_client_id?: string;
+  gcs_project_id?: string;
+  endpoint_url?: string;
+  verify_ssl: boolean;
+}
+
+export interface FullCloudStorageConnectionInterface extends AuthSettingsInput {
+  // Public fields only
+  awsAllowUnsafeHtml?: boolean;
+  awsRegion?: string;
+  awsAccessKeyId?: string;
+  awsRoleArn?: string;
+  awsProfile?: string;
+  azureAccountName?: string;
+  azureTenantId?: string;
+  azureClientId?: string;
+  gcsProjectId?: string;
+  endpointUrl?: string;
+  verifySsl: boolean;
+}

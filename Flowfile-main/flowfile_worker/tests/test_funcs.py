@@ -1,0 +1,313 @@
+from logging import getLogger
+from multiprocessing import Queue
+
+import fastexcel
+import polars as pl
+import pytest
+
+from flowfile_worker import mp_context
+from flowfile_worker.external_sources.s3_source.models import (
+    CloudStorageWriteSettings,
+    WriteSettings,
+)
+from flowfile_worker.funcs import fuzzy_join_task, generic_task, write_parquet, write_to_cloud_storage
+
+logger = getLogger(__name__)
+
+
+try:
+    # noinspection PyUnresolvedReferences
+    from test_utils.s3.fixtures import get_minio_client
+    from tests.utils import cloud_storage_connection_settings, is_docker_available
+except ModuleNotFoundError:
+    import os
+    import sys
+    sys.path.append(os.path.dirname(os.path.abspath("flowfile_worker/tests/utils.py")))
+    sys.path.append(os.path.dirname(os.path.abspath("test_utils/s3/fixtures.py")))
+    # noinspection PyUnresolvedReferences
+    from utils import cloud_storage_connection_settings, is_docker_available
+
+
+def test_write_parquet(tmp_path):
+    """Direct-call regression test: the post-write fsync must use a writable fd
+    (read-only handles raise EBADF on Windows)."""
+    lf = pl.LazyFrame({"value": [1, 2, 3]})
+    progress = mp_context.Value("i", 0)
+    error_message = mp_context.Array("c", 1024)
+    output_path = str(tmp_path / "1" / "2" / "inputs" / "main_0.parquet")
+
+    write_parquet(
+        polars_serializable_object=lf.serialize(),
+        progress=progress,
+        error_message=error_message,
+        queue=Queue(maxsize=1),
+        file_path="",
+        output_path=output_path,
+    )
+
+    assert progress.value == 100, error_message[:].decode(errors="replace")
+    assert pl.read_parquet(output_path)["value"].to_list() == [1, 2, 3]
+
+
+@pytest.mark.parametrize("data_type,ext,compression", [
+    ("ipc", "arrow", None),
+    ("ndjson", "ndjson", None),
+    ("avro", "avro", None),
+    ("ipc", "arrow", "zstd"),
+    ("ndjson", "ndjson", "gzip"),
+    ("avro", "avro", "deflate"),
+    ("parquet", "parquet", "snappy"),
+])
+def test_write_output_new_formats(tmp_path, data_type, ext, compression):
+    """The worker write path must actually produce a non-empty, readable file for
+    each new format and compression (a missing execute_write_method branch silently
+    no-ops)."""
+    from flowfile_worker.funcs import write_output
+
+    lf = pl.LazyFrame({"value": [1, 2, 3], "name": ["a", "b", "c"]})
+    progress = mp_context.Value("i", 0)
+    error_message = mp_context.Array("c", 1024)
+    out = tmp_path / f"out.{ext}"
+
+    write_output(
+        polars_serializable_object=lf.serialize(),
+        progress=progress,
+        error_message=error_message,
+        queue=Queue(maxsize=1),
+        file_path="",
+        data_type=data_type,
+        path=str(out),
+        write_mode="overwrite",
+        compression=compression,
+    )
+
+    assert progress.value == 100, error_message[:].decode(errors="replace")
+    assert out.exists() and out.stat().st_size > 0, f"{data_type} file not written"
+    assert getattr(pl, f"read_{data_type}")(str(out)).shape == (3, 2)
+
+
+def test_write_output_excel_update_preserves_other_sheets(tmp_path):
+    """The worker's excel update path must add its sheet to an existing workbook without dropping sheet A."""
+    from flowfile_worker.funcs import write_output
+
+    out = tmp_path / "book.xlsx"
+    pl.DataFrame({"keep": ["a"]}).write_excel(str(out), worksheet="A")
+    progress = mp_context.Value("i", 0)
+    error_message = mp_context.Array("c", 1024)
+
+    write_output(
+        polars_serializable_object=pl.LazyFrame({"value": [1, 2, 3]}).serialize(),
+        progress=progress,
+        error_message=error_message,
+        queue=Queue(maxsize=1),
+        file_path="",
+        data_type="excel",
+        path=str(out),
+        write_mode="update",
+        sheet_name="B",
+    )
+
+    assert progress.value == 100, error_message[:].decode(errors="replace")
+    assert fastexcel.read_excel(str(out)).sheet_names == ["A", "B"]
+    assert pl.read_excel(str(out), sheet_name="A").to_dicts() == [{"keep": "a"}]
+    assert pl.read_excel(str(out), sheet_name="B")["value"].to_list() == [1, 2, 3]
+
+
+def test_write_output_excel_overwrite_replaces_whole_workbook(tmp_path):
+    """overwrite keeps its historical meaning: the previous workbook and every sheet in it are gone."""
+    from flowfile_worker.funcs import write_output
+
+    out = tmp_path / "book.xlsx"
+    pl.DataFrame({"keep": ["a"]}).write_excel(str(out), worksheet="A")
+    progress = mp_context.Value("i", 0)
+    error_message = mp_context.Array("c", 1024)
+
+    write_output(
+        polars_serializable_object=pl.LazyFrame({"value": [1, 2, 3]}).serialize(),
+        progress=progress,
+        error_message=error_message,
+        queue=Queue(maxsize=1),
+        file_path="",
+        data_type="excel",
+        path=str(out),
+        write_mode="overwrite",
+        sheet_name="B",
+    )
+
+    assert progress.value == 100, error_message[:].decode(errors="replace")
+    assert fastexcel.read_excel(str(out)).sheet_names == ["B"]
+
+
+def test_write_output_excel_create_reports_error_message(tmp_path):
+    """A refused excel create must surface as progress=-1 plus an error message, not a silent progress-0 hang."""
+    from flowfile_worker.funcs import write_output
+
+    out = tmp_path / "book.xlsx"
+    pl.DataFrame({"keep": ["a"]}).write_excel(str(out), worksheet="A")
+    progress = mp_context.Value("i", 0)
+    error_message = mp_context.Array("c", 1024)
+
+    write_output(
+        polars_serializable_object=pl.LazyFrame({"value": [1, 2, 3]}).serialize(),
+        progress=progress,
+        error_message=error_message,
+        queue=Queue(maxsize=1),
+        file_path="",
+        data_type="excel",
+        path=str(out),
+        write_mode="create",
+        sheet_name="B",
+    )
+
+    assert progress.value == -1
+    assert "already exists" in error_message[:].decode(errors="replace")
+    assert fastexcel.read_excel(str(out)).sheet_names == ["A"]
+
+
+def test_table_creator_factory_new_formats():
+    from flowfile_worker.create import table_creator_factory_method
+
+    for file_type in ("ipc", "ndjson", "avro", "ipc_stream"):
+        assert callable(table_creator_factory_method(file_type))
+
+
+def test_create_from_path_ipc_stream(tmp_path):
+    """The stream format has no footer, so it must go through read_ipc_stream rather than scan_ipc."""
+    from flowfile_worker.create import table_creator_factory_method
+    from flowfile_worker.create.models import InputIpcStreamTable, ReceivedTable
+
+    path = tmp_path / "data.arrows"
+    pl.DataFrame({"value": [1, 2, 3]}).write_ipc_stream(str(path))
+    received = ReceivedTable(
+        name="data.arrows", path=str(path), file_type="ipc_stream", table_settings=InputIpcStreamTable()
+    )
+    received.set_absolute_filepath()
+
+    df = table_creator_factory_method("ipc_stream")(received)
+    assert df["value"].to_list() == [1, 2, 3]
+
+
+def test_create_from_path_csv_gzipped_non_utf8(tmp_path):
+    """Polars gunzips only on its utf8 path; a latin1 .csv.gz used to decode the compressed bytes
+    into a silent garbage frame instead of the rows."""
+    import gzip
+
+    from flowfile_worker.create import table_creator_factory_method
+    from flowfile_worker.create.models import InputCsvTable, ReceivedTable
+
+    path = tmp_path / "data.csv.gz"
+    with gzip.open(path, "wb") as fh:
+        fh.write("id,name\n1,café\n2,naïve\n".encode("latin1"))
+    received = ReceivedTable(
+        name="data.csv.gz", path=str(path), file_type="csv", table_settings=InputCsvTable(encoding="latin1")
+    )
+    received.set_absolute_filepath()
+
+    df = table_creator_factory_method("csv")(received)
+    assert df.columns == ["id", "name"]
+    assert df["name"].to_list() == ["café", "naïve"]
+
+
+@pytest.mark.skipif(not is_docker_available(), reason="Docker is not available or not running")
+def test_write_to_cloud_storage(cloud_storage_connection_settings):
+    write_settings = WriteSettings(
+        resource_path="s3://worker-test-bucket/func_test_write.parquet",
+        file_format="parquet",
+        write_mode="overwrite",
+        parquet_compression="snappy",
+    )
+    cloud_write_settings = CloudStorageWriteSettings(
+        connection=cloud_storage_connection_settings,
+        write_settings=write_settings,
+    )
+    lf = pl.LazyFrame({'value': [i for i in range(1000)]})
+    try:
+        write_to_cloud_storage(polars_serializable_object=lf.serialize(),
+                               progress=mp_context.Value('i', 0),
+                               error_message=mp_context.Array('c', 1024),
+                               queue=Queue(maxsize=1),
+                               file_path="",
+                               cloud_write_settings=cloud_write_settings
+                               )
+    except Exception as e:
+        pytest.fail(f"Write to cloud storage failed: {e}")
+
+
+@pytest.mark.skipif(not is_docker_available(), reason="Docker is not available or not running")
+def test_write_to_cloud_storage_partitioned_delta(cloud_storage_connection_settings):
+    from shared.delta_utils import get_delta_partition_columns
+
+    resource_path = "s3://worker-test-bucket/func_test_write_partitioned_delta"
+    write_settings = WriteSettings(
+        resource_path=resource_path,
+        file_format="delta",
+        write_mode="overwrite",
+        partition_by=["grp"],
+    )
+    cloud_write_settings = CloudStorageWriteSettings(
+        connection=cloud_storage_connection_settings,
+        write_settings=write_settings,
+    )
+    lf = pl.LazyFrame({"value": list(range(10)), "grp": ["a", "b"] * 5})
+    progress = mp_context.Value("i", 0)
+    error_message = mp_context.Array("c", 1024)
+
+    write_to_cloud_storage(
+        polars_serializable_object=lf.serialize(),
+        progress=progress,
+        error_message=error_message,
+        queue=Queue(maxsize=1),
+        file_path="",
+        cloud_write_settings=cloud_write_settings,
+    )
+
+    assert progress.value == 100, error_message[:].decode(errors="replace")
+    storage_options = cloud_storage_connection_settings.get_storage_options()
+    assert get_delta_partition_columns(resource_path, storage_options=storage_options) == ["grp"]
+
+
+def test_generic_task_error_returns_early(tmp_path):
+    """A failing func must set progress=-1 and not fall through to scan a missing IPC file."""
+    progress = mp_context.Value('i', 0)
+    error_message = mp_context.Array('c', 1024)
+    queue = Queue(maxsize=1)
+    missing_file = str(tmp_path / "never_written.arrow")
+
+    def boom():
+        raise ValueError("kaboom")
+
+    generic_task(boom, progress, error_message, queue, missing_file, 1, 1)
+    assert progress.value == -1
+    assert "kaboom" in error_message.value.decode().rstrip("\x00")
+    assert queue.empty()
+
+
+def test_fuzzy_join_task_error_returns_early(tmp_path):
+    """A failing fuzzy join must set progress=-1 and not fall through to scan a missing IPC file."""
+    progress = mp_context.Value('i', 0)
+    error_message = mp_context.Array('c', 1024)
+    queue = Queue(maxsize=1)
+    missing_file = str(tmp_path / "never_written.arrow")
+
+    # Undeserializable bytes make the task raise before any IPC file is written.
+    fuzzy_join_task(b"not-arrow", b"not-arrow", [], error_message, missing_file, progress, queue, 1, 1)
+    assert progress.value == -1
+    assert error_message.value.decode().rstrip("\x00") != ""
+    assert queue.empty()
+
+
+def test_fuzzy_join_task_with_an_empty_side_names_the_score_column(tmp_path):
+    """The library returns early on an empty side without naming the score columns; the task names them itself."""
+    from pl_fuzzy_frame_match import FuzzyMapping
+
+    progress = mp_context.Value('i', 0)
+    error_message = mp_context.Array('c', 1024)
+    file_path = str(tmp_path / "fuzzy.arrow")
+    left = pl.LazyFrame({"name": []}, schema={"name": pl.String})
+    right = pl.LazyFrame({"other": ["eduward"]})
+
+    fuzzy_join_task(left.serialize(), right.serialize(), [FuzzyMapping(left_col="name", right_col="other")],
+                    error_message, file_path, progress, Queue(maxsize=1), 1, 1)
+
+    assert progress.value == 100, error_message.value.decode(errors="replace")
+    assert pl.read_ipc(file_path).columns == ["name", "other", "name_vs_other_levenshtein"]

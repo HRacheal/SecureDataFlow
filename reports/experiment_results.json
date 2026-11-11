@@ -1,0 +1,539 @@
+{
+  "generated_at": "2026-11-11T18:36:34+00:00",
+  "runtime_seconds": 2.0,
+  "engine": "pandas",
+  "data_generation": {
+    "clean_records": 1000,
+    "historical_records": 5000
+  },
+  "attack_simulation": {
+    "total_rows": 1045,
+    "clean_rows": 1000,
+    "by_scenario": {
+      "LEGITIMATE": 982,
+      "S5_INVALID_TIMESTAMPS": 6,
+      "S7_IN_TRANSIT_TAMPERING": 8,
+      "S6_EXTREME_VALUES": 5,
+      "S4_DUPLICATE_IDS": 10,
+      "S9_RULE_VIOLATIONS": 6,
+      "S8_PLAUSIBLE_MANIPULATION": 10,
+      "S2_INVALID_TYPES": 6,
+      "S1_MISSING_FIELDS": 6,
+      "S3_NEGATIVE_VALUES": 6
+    }
+  },
+  "ingestion": {
+    "run_id": "20261111T183635Z-35aee6",
+    "ingested_at": "2026-11-11T18:36:35+00:00",
+    "source_file": "data\\attacked\\transactions_incoming_attacked.csv",
+    "source_label": "October 2026 multi-source batch (simulated)",
+    "sha256": "5df2e73d7f6e02e20c4b2cef1bfa5b94160b445397516a466ff0f30dbb0d7185",
+    "archive_file": "data\\archive\\20261111T183635Z-35aee6__transactions_incoming_attacked.csv",
+    "archive_verified": true,
+    "columns": [
+      "record_id",
+      "source_id",
+      "timestamp",
+      "category",
+      "quantity",
+      "unit_price",
+      "amount",
+      "currency",
+      "signature"
+    ],
+    "missing_columns": [],
+    "unexpected_columns": [],
+    "records_received": 1045
+  },
+  "security_summary": {
+    "received": 1045,
+    "accepted": 988,
+    "rejected": 50,
+    "flagged": 7,
+    "quarantined": 57,
+    "failures_by_reason_code": {
+      "NEGATIVE_VALUE": 12,
+      "SIGNATURE_INVALID": 11,
+      "DUPLICATE_REPLAY": 8,
+      "ANOMALY_AMOUNT": 7,
+      "MISSING_REQUIRED_FIELD": 7,
+      "INVALID_TYPE": 6,
+      "INVALID_TIMESTAMP": 4,
+      "ANOMALY_QUANTITY": 4,
+      "DUPLICATE_ID_CONFLICT": 4,
+      "DISALLOWED_VALUE": 3,
+      "TIMESTAMP_OUTSIDE_WINDOW": 2,
+      "ANOMALY_UNIT_PRICE": 2,
+      "OUT_OF_RANGE": 1,
+      "INVALID_FORMAT": 1,
+      "AMOUNT_INCONSISTENT": 1
+    },
+    "failures_by_control": {
+      "ranges_allowed_values": 17,
+      "anomaly_detection": 13,
+      "duplicates": 12,
+      "integrity": 11,
+      "required_fields": 7,
+      "timestamps": 6,
+      "data_types": 6,
+      "consistency": 1
+    },
+    "records_failing_each_control": {
+      "duplicates": 12,
+      "integrity": 11,
+      "ranges_allowed_values": 11,
+      "anomaly_detection": 7,
+      "timestamps": 6,
+      "data_types": 6,
+      "required_fields": 6,
+      "consistency": 1
+    }
+  },
+  "routing": {
+    "trusted_file": "data\\trusted\\trusted_transactions.csv",
+    "quarantine_file": "data\\quarantine\\quarantined_records.csv",
+    "quarantine_jsonl": "data\\quarantine\\quarantined_records.jsonl",
+    "trusted_count": 988,
+    "quarantine_count": 57
+  },
+  "downstream": {
+    "clean_ground_truth": {
+      "engine": "pandas",
+      "flow_file": null,
+      "records": 1000,
+      "total_revenue": 9042545.44,
+      "mean_amount": 9042.55,
+      "median_amount": 2634.97,
+      "max_amount": 252645.88,
+      "unparseable_amounts": 0,
+      "by_category": {
+        "Clothing": {
+          "revenue": 835014.13,
+          "records": 198,
+          "mean_amount": 4217.24
+        },
+        "Electronics": {
+          "revenue": 6200467.29,
+          "records": 160,
+          "mean_amount": 38752.92
+        },
+        "Groceries": {
+          "revenue": 545767.71,
+          "records": 334,
+          "mean_amount": 1634.04
+        },
+        "Household": {
+          "revenue": 1335710.56,
+          "records": 205,
+          "mean_amount": 6515.66
+        },
+        "Stationery": {
+          "revenue": 125585.75,
+          "records": 103,
+          "mean_amount": 1219.28
+        }
+      },
+      "matches_pandas_crosscheck": true
+    },
+    "experiment_A_no_controls": {
+      "engine": "pandas",
+      "flow_file": null,
+      "records": 1045,
+      "total_revenue": 18611383.96,
+      "mean_amount": 17861.21,
+      "median_amount": 2827.32,
+      "max_amount": 3420000.0,
+      "unparseable_amounts": 3,
+      "by_category": {
+        "(blank)": {
+          "revenue": 4800.0,
+          "records": 1,
+          "mean_amount": 4800.0
+        },
+        "Clothing": {
+          "revenue": 1351539.91,
+          "records": 207,
+          "mean_amount": 6592.88
+        },
+        "Crypto": {
+          "revenue": 75000.0,
+          "records": 1,
+          "mean_amount": 75000.0
+        },
+        "Electronics": {
+          "revenue": 10172379.03,
+          "records": 175,
+          "mean_amount": 58127.88
+        },
+        "Groceries": {
+          "revenue": 1526475.59,
+          "records": 337,
+          "mean_amount": 4529.6
+        },
+        "Household": {
+          "revenue": 4185208.22,
+          "records": 219,
+          "mean_amount": 19198.2
+        },
+        "Stationery": {
+          "revenue": 1295981.21,
+          "records": 105,
+          "mean_amount": 12342.68
+        }
+      },
+      "matches_pandas_crosscheck": true
+    },
+    "experiment_B_with_controls": {
+      "engine": "pandas",
+      "flow_file": null,
+      "records": 988,
+      "total_revenue": 8952346.17,
+      "mean_amount": 9061.08,
+      "median_amount": 2644.02,
+      "max_amount": 252645.88,
+      "unparseable_amounts": 0,
+      "by_category": {
+        "Clothing": {
+          "revenue": 830859.89,
+          "records": 196,
+          "mean_amount": 4239.08
+        },
+        "Electronics": {
+          "revenue": 6207631.26,
+          "records": 160,
+          "mean_amount": 38797.7
+        },
+        "Groceries": {
+          "revenue": 537126.0,
+          "records": 328,
+          "mean_amount": 1637.58
+        },
+        "Household": {
+          "revenue": 1250747.81,
+          "records": 201,
+          "mean_amount": 6222.63
+        },
+        "Stationery": {
+          "revenue": 125981.21,
+          "records": 103,
+          "mean_amount": 1223.12
+        }
+      },
+      "matches_pandas_crosscheck": true
+    }
+  },
+  "impact_attribution": {
+    "experiment_A": [
+      {
+        "scenario": "LEGITIMATE",
+        "records_counted": 982,
+        "revenue_effect": 0.0
+      },
+      {
+        "scenario": "S5_INVALID_TIMESTAMPS",
+        "records_counted": 6,
+        "revenue_effect": 49500.0
+      },
+      {
+        "scenario": "S7_IN_TRANSIT_TAMPERING",
+        "records_counted": 8,
+        "revenue_effect": 12995.34
+      },
+      {
+        "scenario": "S6_EXTREME_VALUES",
+        "records_counted": 5,
+        "revenue_effect": 8225000.0
+      },
+      {
+        "scenario": "S4_DUPLICATE_IDS",
+        "records_counted": 10,
+        "revenue_effect": 785747.77
+      },
+      {
+        "scenario": "S9_RULE_VIOLATIONS",
+        "records_counted": 6,
+        "revenue_effect": 736460.0
+      },
+      {
+        "scenario": "S8_PLAUSIBLE_MANIPULATION",
+        "records_counted": 10,
+        "revenue_effect": 13785.41
+      },
+      {
+        "scenario": "S2_INVALID_TYPES",
+        "records_counted": 6,
+        "revenue_effect": 13750.0
+      },
+      {
+        "scenario": "S1_MISSING_FIELDS",
+        "records_counted": 6,
+        "revenue_effect": 24000.0
+      },
+      {
+        "scenario": "S3_NEGATIVE_VALUES",
+        "records_counted": 6,
+        "revenue_effect": -292400.0
+      }
+    ],
+    "experiment_B": [
+      {
+        "scenario": "LEGITIMATE",
+        "records_counted": 978,
+        "revenue_effect": -77206.14
+      },
+      {
+        "scenario": "S5_INVALID_TIMESTAMPS",
+        "records_counted": 0,
+        "revenue_effect": 0.0
+      },
+      {
+        "scenario": "S7_IN_TRANSIT_TAMPERING",
+        "records_counted": 0,
+        "revenue_effect": -26778.54
+      },
+      {
+        "scenario": "S6_EXTREME_VALUES",
+        "records_counted": 0,
+        "revenue_effect": 0.0
+      },
+      {
+        "scenario": "S4_DUPLICATE_IDS",
+        "records_counted": 0,
+        "revenue_effect": 0.0
+      },
+      {
+        "scenario": "S9_RULE_VIOLATIONS",
+        "records_counted": 0,
+        "revenue_effect": 0.0
+      },
+      {
+        "scenario": "S8_PLAUSIBLE_MANIPULATION",
+        "records_counted": 10,
+        "revenue_effect": 13785.41
+      },
+      {
+        "scenario": "S2_INVALID_TYPES",
+        "records_counted": 0,
+        "revenue_effect": 0.0
+      },
+      {
+        "scenario": "S1_MISSING_FIELDS",
+        "records_counted": 0,
+        "revenue_effect": 0.0
+      },
+      {
+        "scenario": "S3_NEGATIVE_VALUES",
+        "records_counted": 0,
+        "revenue_effect": 0.0
+      }
+    ]
+  },
+  "evaluation": {
+    "by_scenario": [
+      {
+        "scenario": "LEGITIMATE",
+        "data_class": "legitimate",
+        "records": 982,
+        "accepted": 978,
+        "rejected": 2,
+        "flagged": 2,
+        "quarantined_pct": 0.4,
+        "controls_triggered": "duplicates (2), anomaly_detection (2)"
+      },
+      {
+        "scenario": "S1_MISSING_FIELDS",
+        "data_class": "invalid",
+        "records": 6,
+        "accepted": 0,
+        "rejected": 6,
+        "flagged": 0,
+        "quarantined_pct": 100.0,
+        "controls_triggered": "required_fields (6), integrity (2)"
+      },
+      {
+        "scenario": "S2_INVALID_TYPES",
+        "data_class": "invalid",
+        "records": 6,
+        "accepted": 0,
+        "rejected": 6,
+        "flagged": 0,
+        "quarantined_pct": 100.0,
+        "controls_triggered": "data_types (6)"
+      },
+      {
+        "scenario": "S3_NEGATIVE_VALUES",
+        "data_class": "invalid",
+        "records": 6,
+        "accepted": 0,
+        "rejected": 6,
+        "flagged": 0,
+        "quarantined_pct": 100.0,
+        "controls_triggered": "ranges_allowed_values (6)"
+      },
+      {
+        "scenario": "S4_DUPLICATE_IDS",
+        "data_class": "invalid",
+        "records": 10,
+        "accepted": 0,
+        "rejected": 10,
+        "flagged": 0,
+        "quarantined_pct": 100.0,
+        "controls_triggered": "duplicates (10)"
+      },
+      {
+        "scenario": "S5_INVALID_TIMESTAMPS",
+        "data_class": "invalid",
+        "records": 6,
+        "accepted": 0,
+        "rejected": 6,
+        "flagged": 0,
+        "quarantined_pct": 100.0,
+        "controls_triggered": "timestamps (6)"
+      },
+      {
+        "scenario": "S6_EXTREME_VALUES",
+        "data_class": "suspicious",
+        "records": 5,
+        "accepted": 0,
+        "rejected": 0,
+        "flagged": 5,
+        "quarantined_pct": 100.0,
+        "controls_triggered": "anomaly_detection (5)"
+      },
+      {
+        "scenario": "S7_IN_TRANSIT_TAMPERING",
+        "data_class": "plausible but manipulated",
+        "records": 8,
+        "accepted": 0,
+        "rejected": 8,
+        "flagged": 0,
+        "quarantined_pct": 100.0,
+        "controls_triggered": "integrity (8)"
+      },
+      {
+        "scenario": "S8_PLAUSIBLE_MANIPULATION",
+        "data_class": "plausible but manipulated",
+        "records": 10,
+        "accepted": 10,
+        "rejected": 0,
+        "flagged": 0,
+        "quarantined_pct": 0.0,
+        "controls_triggered": ""
+      },
+      {
+        "scenario": "S9_RULE_VIOLATIONS",
+        "data_class": "invalid",
+        "records": 6,
+        "accepted": 0,
+        "rejected": 6,
+        "flagged": 0,
+        "quarantined_pct": 100.0,
+        "controls_triggered": "ranges_allowed_values (5), integrity (1), consistency (1)"
+      }
+    ],
+    "totals": {
+      "legitimate_records": 982,
+      "manipulated_records": 63,
+      "manipulated_quarantined": 53,
+      "manipulated_missed": 10,
+      "detection_rate_pct": 84.1,
+      "detection_rate_excl_S8_pct": 100.0,
+      "legitimate_quarantined": 4,
+      "false_positive_rate_pct": 0.41
+    },
+    "missed_records": [
+      {
+        "row": 128,
+        "record_id": "TXN-2026-000122",
+        "scenario": "S8_PLAUSIBLE_MANIPULATION",
+        "description": "price inflated 60% but still typical; amount 423.09 -> 676.94; re-signed"
+      },
+      {
+        "row": 361,
+        "record_id": "TXN-2026-000345",
+        "scenario": "S8_PLAUSIBLE_MANIPULATION",
+        "description": "price inflated 60% but still typical; amount 817.97 -> 1308.75; re-signed"
+      },
+      {
+        "row": 404,
+        "record_id": "TXN-2026-000388",
+        "scenario": "S8_PLAUSIBLE_MANIPULATION",
+        "description": "price inflated 60% but still typical; amount 315.12 -> 504.20; re-signed"
+      },
+      {
+        "row": 628,
+        "record_id": "TXN-2026-000604",
+        "scenario": "S8_PLAUSIBLE_MANIPULATION",
+        "description": "price inflated 60% but still typical; amount 2490.90 -> 3985.44; re-signed"
+      },
+      {
+        "row": 649,
+        "record_id": "TXN-2026-000624",
+        "scenario": "S8_PLAUSIBLE_MANIPULATION",
+        "description": "price inflated 60% but still typical; amount 11939.95 -> 19103.92; re-signed"
+      },
+      {
+        "row": 752,
+        "record_id": "TXN-2026-000719",
+        "scenario": "S8_PLAUSIBLE_MANIPULATION",
+        "description": "price inflated 60% but still typical; amount 1543.58 -> 2469.73; re-signed"
+      },
+      {
+        "row": 834,
+        "record_id": "TXN-2026-000800",
+        "scenario": "S8_PLAUSIBLE_MANIPULATION",
+        "description": "price inflated 60% but still typical; amount 2065.14 -> 3304.22; re-signed"
+      },
+      {
+        "row": 909,
+        "record_id": "TXN-2026-000873",
+        "scenario": "S8_PLAUSIBLE_MANIPULATION",
+        "description": "price inflated 60% but still typical; amount 659.10 -> 1054.56; re-signed"
+      },
+      {
+        "row": 915,
+        "record_id": "TXN-2026-000879",
+        "scenario": "S8_PLAUSIBLE_MANIPULATION",
+        "description": "price inflated 60% but still typical; amount 1316.70 -> 2106.70; re-signed"
+      },
+      {
+        "row": 973,
+        "record_id": "TXN-2026-000935",
+        "scenario": "S8_PLAUSIBLE_MANIPULATION",
+        "description": "price inflated 60% but still typical; amount 1404.18 -> 2246.68; re-signed"
+      }
+    ],
+    "legitimate_records_quarantined": [
+      {
+        "row": 436,
+        "record_id": "TXN-2026-000419",
+        "status": "REJECTED",
+        "reasons": "TXN-2026-000419 appears in rows [436, 723] with different content; genuine version cannot be determined"
+      },
+      {
+        "row": 518,
+        "record_id": "TXN-2026-000499",
+        "status": "REJECTED",
+        "reasons": "TXN-2026-000499 appears in rows [518, 714] with different content; genuine version cannot be determined"
+      },
+      {
+        "row": 670,
+        "record_id": "TXN-2026-000643",
+        "status": "FLAGGED",
+        "reasons": "amount 70,569.96 has robust z=+3.54 vs Household history (median 4,140.74); |z|>3.5"
+      },
+      {
+        "row": 706,
+        "record_id": "TXN-2026-000678",
+        "status": "FLAGGED",
+        "reasons": "amount 79.27 has robust z=-4.01 vs Groceries history (median 1,266.01); |z|>3.5"
+      }
+    ]
+  },
+  "figures": {
+    "total_revenue": "reports\\figures\\fig1_total_revenue.png",
+    "revenue_by_category": "reports\\figures\\fig2_revenue_by_category.png",
+    "outcomes_by_scenario": "reports\\figures\\fig3_outcomes_by_scenario.png",
+    "failures_by_reason": "reports\\figures\\fig4_failures_by_reason.png"
+  }
+}

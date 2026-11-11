@@ -1,0 +1,145 @@
+<template>
+  <div class="app-layout">
+    <div class="app-layout__content">
+      <div class="app-layout__sidebar-wrapper" :class="{ minimized: isCollapse }">
+        <Sidebar :is-collapse="isCollapse" @toggle-collapse="toggleCollapse" />
+      </div>
+      <div class="app-layout__page">
+        <router-view />
+      </div>
+    </div>
+
+    <!-- Force password change modal -->
+    <ChangePasswordModal
+      :show="showPasswordModal"
+      :is-forced="true"
+      @close="showPasswordModal = false"
+      @success="handlePasswordChanged"
+    />
+
+    <!-- Interactive Tutorial Overlay -->
+    <TutorialOverlay />
+
+    <!-- Floating Tutorial Start Button -->
+    <TutorialStartButton />
+
+    <!-- One-time anonymous telemetry opt-in (shows itself only when undecided) -->
+    <TelemetryConsentModal />
+
+    <!-- Desktop-only new-release prompt (shows itself only when the feed offers one) -->
+    <UpdateAvailableModal />
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref, computed, watch, onMounted } from "vue";
+import Sidebar from "../components/layout/Sidebar/Sidebar.vue";
+import ChangePasswordModal from "../components/common/ChangePasswordModal/ChangePasswordModal.vue";
+import TutorialOverlay from "../components/tutorial/TutorialOverlay.vue";
+import TutorialStartButton from "../components/tutorial/TutorialStartButton.vue";
+import TelemetryConsentModal from "../components/settings/TelemetryConsentModal.vue";
+import UpdateAvailableModal from "../components/settings/UpdateAvailableModal.vue";
+import { installPopoutListeners } from "../composables/usePopout";
+import { useAuthStore } from "../stores/auth-store";
+import { useFlowSyncStore } from "../stores/flow-sync-store";
+import { useProjectStore } from "../stores/project-store";
+import { useTelemetryStore } from "../stores/telemetry-store";
+import { useUpdateStore } from "../stores/update-store";
+import authService from "../services/auth.service";
+
+const authStore = useAuthStore();
+const projectStore = useProjectStore();
+const telemetryStore = useTelemetryStore();
+const updateStore = useUpdateStore();
+
+onMounted(() => {
+  // Follows the active flow's change feed for the whole session (its own flowId watcher).
+  useFlowSyncStore();
+  // Follow pop-out windows closing or returning, and adopt the ones already open (desktop).
+  installPopoutListeners();
+  // Pick up the active project (if any) so the header sync pill is correct on boot.
+  projectStore.refreshActive();
+  // The consent modal only appears once this resolves.
+  void telemetryStore.loadStatus();
+  // Desktop-only, once per launch: the update modal shows itself if a release is offered.
+  void updateStore.checkOnStartup();
+});
+
+const isCollapse = ref(true);
+const showPasswordModal = ref(false);
+
+const mustShowPasswordModal = computed(() => {
+  return authStore.mustChangePassword && !authService.isInDesktopMode();
+});
+
+watch(
+  mustShowPasswordModal,
+  (newVal) => {
+    if (newVal) {
+      showPasswordModal.value = true;
+    }
+  },
+  { immediate: true },
+);
+
+const toggleCollapse = () => {
+  isCollapse.value = !isCollapse.value;
+};
+
+const handlePasswordChanged = () => {
+  authStore.clearMustChangePassword();
+  showPasswordModal.value = false;
+};
+</script>
+
+<style lang="scss">
+$tabletBreakPointPX: 1000;
+
+.app-layout {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+
+  &__content {
+    display: flex;
+    flex-grow: 1;
+    overflow: hidden;
+
+    @media screen and (max-width: $tabletBreakPointPX) {
+      .app-layout__sidebar-wrapper {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        z-index: 999;
+        overflow-y: auto;
+
+        &.minimized {
+          display: none;
+        }
+      }
+
+      .app-layout__page {
+        width: 100%;
+        background-color: var(--color-background-primary);
+      }
+    }
+  }
+
+  &__sidebar-wrapper {
+    width: 16rem;
+    background: var(--color-background-primary);
+    transition: width 0.3s ease-out;
+
+    &.minimized {
+      width: 4.5rem;
+    }
+  }
+
+  &__page {
+    flex-grow: 1;
+    overflow-y: auto;
+  }
+}
+</style>

@@ -1,0 +1,1501 @@
+// Node-related TypeScript interfaces and types
+
+import type { AuthMethod } from "../views/CloudConnectionView/CloudConnectionTypes";
+import type { DisplayOutput } from "./kernel.types";
+import type { FlowParameter } from "./flow.types";
+import type { AccessInfo } from "./sharing.types";
+
+// Data Type Definitions
+
+type DataTypeGroup = "Numeric" | "String" | "Date" | "Other" | "Boolean" | "Binary" | "Complex";
+
+// What the values mean beyond their storage dtype; core derives it from a declared
+// dtype only (a GeoArrow extension), never from sampled values.
+export type SemanticType = "geometry";
+
+// Column and Table Types
+
+// The statistics fields are null until actually computed — either never
+// (plain schema previews) or exactly, on demand, via GET /node/column_stats
+// (which returns the column's updated FileColumn).
+export interface FileColumn {
+  name: string;
+  data_type: string;
+  is_unique: boolean;
+  max_value: string | null;
+  min_value: string | null;
+  average_value: string | null;
+  number_of_empty_values: number | null;
+  number_of_filled_values: number | null;
+  number_of_unique_values: number | null;
+  size: number | null;
+  data_type_group: DataTypeGroup;
+  semantic_type?: SemanticType | null;
+}
+
+export interface TableExample {
+  node_id: string | number;
+  // null when the backend doesn't know the total (never fabricated).
+  number_of_records: number | null;
+  number_of_columns: number;
+  name: string;
+  table_schema: FileColumn[];
+  columns: string[];
+  data: Record<string, any>[];
+  has_example_data: boolean;
+  has_run_with_current_setup: boolean;
+}
+
+// Node Data Types
+
+export interface NodeData {
+  flow_id: string | number;
+  node_id: string | number;
+  flow_type: string;
+  left_input?: TableExample | null;
+  right_input?: TableExample | null;
+  main_input?: TableExample | null;
+  main_output?: TableExample;
+  left_output?: TableExample | null;
+  right_output?: TableExample | null;
+  has_run: boolean;
+  is_cached: boolean;
+  /** The live node's configuration state; setting_input may be a display-only proposal. */
+  is_setup?: boolean;
+  setting_input?: any | null;
+  /** The settings' digest when read; a save echoes it so core can refuse a save over a moved node (409). */
+  settings_fingerprint?: string | null;
+  /** Column prediction needs an un-run kernel node to run first; warning text to show. */
+  prediction_warning?: string | null;
+}
+
+export interface NodeValidationInput {
+  isValid: boolean;
+  error?: string;
+}
+
+export interface NodeValidation extends NodeValidationInput {
+  validationTime: number;
+  // "backend" entries are owned (set and cleared) by applySettingsValidation;
+  // entries without a source come from in-drawer config checks.
+  source?: "backend";
+}
+
+export interface NodeResult {
+  node_id: number;
+  node_name?: string;
+  start_timestamp: number;
+  end_timestamp: number;
+  success?: boolean;
+  error: string;
+  run_time_ms: number;
+  is_running: boolean;
+  // Deliberately skipped behind a closed gate: reported as success with a zero
+  // runtime, so the run stays green. Failure-driven skips emit no result at all.
+  skipped?: boolean;
+  // The class of the compute error that failed the node, "Refusal" when placement refused it.
+  compute_error?: string | null;
+  // The backend placement ran the node on; absent from an older core or with the protocol off.
+  backend_id?: string | null;
+  // The backend its settings name, when placement ran it on the default backend because that one cannot run it.
+  fallback_from?: string | null;
+  fallback_reason?: string | null;
+}
+
+// Node Description Types
+
+export interface NodeDescriptionResponse {
+  description: string;
+  is_auto_generated: boolean;
+}
+
+export interface NodeDescriptionEntry {
+  description: string;
+  is_auto_generated: boolean;
+}
+
+export interface NodeDescriptionDictionaryPerGraph {
+  [node_id: number]: NodeDescriptionEntry;
+}
+
+export interface NodeDescriptionDictionary {
+  [flow_id: number]: NodeDescriptionDictionaryPerGraph;
+}
+
+export interface NodeReferenceDictionaryPerGraph {
+  [node_id: number]: string;
+}
+
+export interface NodeReferenceDictionary {
+  [flow_id: number]: NodeReferenceDictionaryPerGraph;
+}
+
+export interface NodeTitleInfo {
+  title: string;
+  intro: string;
+  // Node reference section for the drawer's "Read more" link; absent for
+  // drawers opened outside the node palette.
+  docsUrl?: string;
+}
+
+// Expression Types
+
+export interface ExpressionRef {
+  name: string;
+  doc: string;
+}
+
+export interface ExpressionsOverview {
+  expression_type: string;
+  expressions: ExpressionRef[];
+}
+
+// Select Input Types
+
+export interface SelectInput {
+  old_name: string;
+  new_name: string;
+  keep: boolean;
+  data_type?: string;
+  join_key?: boolean;
+  is_altered: boolean;
+  data_type_change: boolean;
+  is_available: boolean;
+  position: number;
+  original_position: number;
+}
+
+export interface SelectInputs {
+  renames: SelectInput[];
+}
+
+export const createSelectInputFromName = (columnName: string, keep = true): SelectInput => {
+  return {
+    old_name: columnName,
+    new_name: columnName,
+    keep: keep,
+    is_altered: false,
+    data_type_change: false,
+    is_available: true,
+    position: 0,
+    original_position: 0,
+  };
+};
+
+// Input Table Settings
+
+export interface InputCsvTable {
+  file_type: "csv";
+  reference?: string;
+  starting_from_line: number;
+  delimiter: string;
+  has_headers: boolean;
+  encoding: string;
+  row_delimiter: string;
+  quote_char: string;
+  infer_schema_length: number;
+  infer_schema: boolean;
+  truncate_ragged_lines: boolean;
+  ignore_errors: boolean;
+}
+
+export interface InputJsonTable {
+  file_type: "json";
+  reference?: string;
+  starting_from_line: number;
+  delimiter: string;
+  has_headers: boolean;
+  encoding: string;
+  row_delimiter: string;
+  quote_char: string;
+  infer_schema_length: number;
+  infer_schema: boolean;
+  truncate_ragged_lines: boolean;
+  ignore_errors: boolean;
+}
+
+export interface InputParquetTable {
+  file_type: "parquet";
+}
+
+export interface InputExcelTable {
+  file_type: "excel";
+  sheet_name?: string;
+  start_row: number;
+  start_column: number;
+  end_row: number;
+  end_column: number;
+  has_headers: boolean;
+  type_inference: boolean;
+}
+
+export interface InputIpcTable {
+  file_type: "ipc";
+}
+
+export interface InputNdjsonTable {
+  file_type: "ndjson";
+}
+
+export interface InputAvroTable {
+  file_type: "avro";
+}
+
+export interface InputIpcStreamTable {
+  file_type: "ipc_stream";
+}
+
+export type InputTableSettings =
+  | InputCsvTable
+  | InputJsonTable
+  | InputParquetTable
+  | InputExcelTable
+  | InputIpcTable
+  | InputNdjsonTable
+  | InputAvroTable
+  | InputIpcStreamTable;
+
+export function isInputCsvTable(settings: InputTableSettings): settings is InputCsvTable {
+  return settings.file_type === "csv";
+}
+
+export function isInputExcelTable(settings: InputTableSettings): settings is InputExcelTable {
+  return settings.file_type === "excel";
+}
+
+export function isInputParquetTable(settings: InputTableSettings): settings is InputParquetTable {
+  return settings.file_type === "parquet";
+}
+
+export function isInputIpcTable(settings: InputTableSettings): settings is InputIpcTable {
+  return settings.file_type === "ipc";
+}
+
+export function isInputNdjsonTable(settings: InputTableSettings): settings is InputNdjsonTable {
+  return settings.file_type === "ndjson";
+}
+
+export function isInputAvroTable(settings: InputTableSettings): settings is InputAvroTable {
+  return settings.file_type === "avro";
+}
+
+export function isInputIpcStreamTable(
+  settings: InputTableSettings,
+): settings is InputIpcStreamTable {
+  return settings.file_type === "ipc_stream";
+}
+
+// Output Table Settings
+
+export interface OutputCsvTable {
+  delimiter: string;
+  encoding: string;
+  file_type: string;
+}
+
+export interface OutputParquetTable {
+  file_type: string;
+  compression?: string;
+}
+
+export interface OutputExcelTable {
+  sheet_name: string;
+  file_type: string;
+}
+
+export interface OutputIpcTable {
+  file_type: string;
+  compression?: string;
+}
+
+export interface OutputNdjsonTable {
+  file_type: string;
+  compression?: string;
+}
+
+export interface OutputAvroTable {
+  file_type: string;
+  compression?: string;
+}
+
+export type OutputTableSettings =
+  | OutputCsvTable
+  | OutputParquetTable
+  | OutputExcelTable
+  | OutputIpcTable
+  | OutputNdjsonTable
+  | OutputAvroTable;
+
+export function isOutputCsvTable(settings: OutputTableSettings): settings is OutputCsvTable {
+  return settings.file_type === "csv";
+}
+
+export function isOutputParquetTable(
+  settings: OutputTableSettings,
+): settings is OutputParquetTable {
+  return settings.file_type === "parquet";
+}
+
+export function isOutputExcelTable(settings: OutputTableSettings): settings is OutputExcelTable {
+  return settings.file_type === "excel";
+}
+
+export function isOutputIpcTable(settings: OutputTableSettings): settings is OutputIpcTable {
+  return settings.file_type === "ipc";
+}
+
+export function isOutputNdjsonTable(settings: OutputTableSettings): settings is OutputNdjsonTable {
+  return settings.file_type === "ndjson";
+}
+
+export function isOutputAvroTable(settings: OutputTableSettings): settings is OutputAvroTable {
+  return settings.file_type === "avro";
+}
+
+export interface OutputSettings {
+  name: string;
+  directory: string;
+  file_type: "parquet" | "csv" | "excel" | "ipc" | "ndjson" | "avro";
+  fields?: string[];
+  write_mode: "overwrite" | "append" | "new file" | "create" | "update";
+  table_settings: OutputTableSettings;
+  /** Resolved by core from directory + name (a relative directory resolves against its cwd). */
+  abs_file_path?: string | null;
+}
+
+// Field Types
+
+export interface MinimalFieldInput {
+  name: string;
+  data_type: string;
+}
+
+export interface FieldInput {
+  name: string;
+  data_type?: string;
+}
+
+export interface FormulaInput {
+  field: FieldInput;
+  function: string;
+}
+
+/** A one-click fix offered beside an issue: swap `[from]` for `[to]` in the expression. */
+export interface FormulaChainSuggestion {
+  kind: "replace_column";
+  from: string;
+  to: string;
+}
+
+export interface FormulaChainIssue {
+  message: string;
+  kind: string;
+  /** Absent on an older core. */
+  suggestion?: FormulaChainSuggestion | null;
+}
+
+export interface FormulaChainEntryResult {
+  issue: FormulaChainIssue | null;
+  /** Accumulated schema AFTER this entry. */
+  columns: MinimalFieldInput[];
+}
+
+export interface FormulaChainCheck {
+  /** False when the input schema is unknown; issues are then all null. */
+  available: boolean;
+  base_columns: MinimalFieldInput[];
+  entries: FormulaChainEntryResult[];
+}
+
+// Filter Types
+
+/**
+ * Supported filter comparison operators.
+ */
+export type FilterOperator =
+  | "equals"
+  | "not_equals"
+  | "greater_than"
+  | "greater_than_or_equals"
+  | "less_than"
+  | "less_than_or_equals"
+  | "contains"
+  | "not_contains"
+  | "starts_with"
+  | "ends_with"
+  | "is_null"
+  | "is_not_null"
+  | "in"
+  | "not_in"
+  | "between";
+
+/**
+ * Mapping from UI-friendly labels to FilterOperator values.
+ */
+export const FILTER_OPERATOR_LABELS: Record<string, FilterOperator> = {
+  Equals: "equals",
+  "Does not equal": "not_equals",
+  "Greater than": "greater_than",
+  "Greater than or equals": "greater_than_or_equals",
+  "Less than": "less_than",
+  "Less than or equals": "less_than_or_equals",
+  Contains: "contains",
+  "Does not contain": "not_contains",
+  "Starts with": "starts_with",
+  "Ends with": "ends_with",
+  "Is null": "is_null",
+  "Is not null": "is_not_null",
+  In: "in",
+  "Not in": "not_in",
+  Between: "between",
+};
+
+/**
+ * Reverse mapping from FilterOperator to label.
+ */
+export const FILTER_OPERATOR_REVERSE_LABELS: Record<FilterOperator, string> = {
+  equals: "Equals",
+  not_equals: "Does not equal",
+  greater_than: "Greater than",
+  greater_than_or_equals: "Greater than or equals",
+  less_than: "Less than",
+  less_than_or_equals: "Less than or equals",
+  contains: "Contains",
+  not_contains: "Does not contain",
+  starts_with: "Starts with",
+  ends_with: "Ends with",
+  is_null: "Is null",
+  is_not_null: "Is not null",
+  in: "In",
+  not_in: "Not in",
+  between: "Between",
+};
+
+/**
+ * Get the label for a filter operator.
+ */
+export function getFilterOperatorLabel(operator: FilterOperator): string {
+  return FILTER_OPERATOR_REVERSE_LABELS[operator] || operator;
+}
+
+/**
+ * Operators that require a value input.
+ */
+export const OPERATORS_WITH_VALUE: FilterOperator[] = [
+  "equals",
+  "not_equals",
+  "greater_than",
+  "greater_than_or_equals",
+  "less_than",
+  "less_than_or_equals",
+  "contains",
+  "not_contains",
+  "starts_with",
+  "ends_with",
+  "in",
+  "not_in",
+  "between",
+];
+
+/**
+ * Operators that require a second value (value2).
+ */
+export const OPERATORS_WITH_VALUE2: FilterOperator[] = ["between"];
+
+/**
+ * Operators that don't require any value.
+ */
+export const OPERATORS_NO_VALUE: FilterOperator[] = ["is_null", "is_not_null"];
+
+export interface BasicFilter {
+  field: string;
+  operator: FilterOperator | string;
+  value: string;
+  value2?: string; // For BETWEEN operator
+  // Legacy fields for backward compatibility
+  filter_type?: string;
+  filter_value?: string;
+}
+
+export type FilterMode = "basic" | "advanced";
+
+export interface FilterInput {
+  mode: FilterMode;
+  basic_filter?: BasicFilter;
+  advanced_filter?: string;
+  // Legacy field for backward compatibility
+  filter_type?: string;
+}
+
+// Aggregation Types
+
+export interface AggColl {
+  old_name: string;
+  agg: string;
+  new_name?: string;
+  output_type?: string;
+}
+
+export interface GroupByInput {
+  agg_cols: AggColl[];
+}
+
+// Window Function Types
+
+export type WindowFunctionName =
+  | "rolling_sum"
+  | "rolling_mean"
+  | "rolling_min"
+  | "rolling_max"
+  | "rolling_std"
+  | "cum_sum"
+  | "cum_count"
+  | "cum_min"
+  | "cum_max"
+  | "rank"
+  | "tile"
+  | "mean"
+  | "sum"
+  | "min"
+  | "max"
+  | "count"
+  | "std"
+  | "median";
+
+export type RankMethod = "ordinal" | "dense" | "min" | "max" | "average";
+
+export type RollingEdgeBehavior = "require_full" | "partial" | "fill_zero";
+
+export interface WindowFunctionInput {
+  column?: string | null;
+  function: WindowFunctionName;
+  new_column_name: string;
+  window_size?: number | null;
+  min_periods?: number | null;
+  edge_behavior?: RollingEdgeBehavior | null;
+  number_of_groups?: number | null;
+  rank_method?: RankMethod | null;
+  output_type?: string | null;
+}
+
+export interface WindowFunctionsInput {
+  partition_by: string[];
+  order_by: SortByInput[];
+  window_functions: WindowFunctionInput[];
+}
+
+export type AggOption =
+  | "sum"
+  | "max"
+  | "median"
+  | "min"
+  | "count"
+  | "n_unique"
+  | "mean"
+  | "concat"
+  | "first"
+  | "last";
+export type GroupByOption = "groupby";
+
+export interface PivotInput {
+  index_columns: string[];
+  pivot_column?: string | null;
+  value_col?: string | null;
+  aggregations: AggOption[];
+}
+
+export type DataTypeSelector = "float" | "all" | "date" | "numeric" | "string";
+export type DataSelectorMode = "data_type" | "column";
+
+export interface UnpivotInput {
+  index_columns: string[];
+  value_columns: string[];
+  data_type_selector?: DataTypeSelector | null;
+  data_type_selector_mode: DataSelectorMode;
+}
+
+export type UniqueSorttrategy = "first" | "last" | "any" | "none";
+
+export interface UniqueInput {
+  columns: string[];
+  strategy: UniqueSorttrategy;
+}
+
+// Data Cleansing Types
+
+export type CleansingCaseMode = "none" | "uppercase" | "lowercase" | "titlecase";
+export type CleansingSelectionMode = "all" | "list";
+
+export interface DataCleansingInput {
+  remove_null_rows: boolean;
+  remove_null_columns: boolean;
+  selection_mode: CleansingSelectionMode;
+  selected_columns: string[];
+  replace_nulls_with_blank: boolean;
+  replace_nulls_with_zero: boolean;
+  trim_whitespace: boolean;
+  normalize_whitespace: boolean;
+  remove_all_whitespace: boolean;
+  remove_letters: boolean;
+  remove_numbers: boolean;
+  remove_punctuation: boolean;
+  case_mode: CleansingCaseMode;
+}
+
+// Join Types
+
+export interface JoinMap {
+  left_col: string;
+  right_col: string;
+}
+
+export interface CrossJoinInput {
+  left_select: SelectInputs;
+  right_select: SelectInputs;
+  how: string;
+}
+
+export interface FuzzyMap {
+  left_col: string;
+  right_col: string;
+  threshold_score: number;
+  fuzzy_type: string;
+  valid: boolean;
+}
+
+export interface FuzzyJoinSettings {
+  join_mapping: FuzzyMap[];
+  left_select: SelectInputs;
+  right_select: SelectInputs;
+  aggregate_output: boolean;
+}
+
+// Sort Types
+
+export interface SortByInput {
+  column: string;
+  how: string;
+}
+
+// Text Operations Types
+
+export interface TextToRowsInput {
+  column_to_split: string;
+  output_column_name?: string;
+  split_by_fixed_value?: boolean;
+  split_fixed_value?: string;
+  split_by_column?: string;
+}
+
+export interface RecordIdInput {
+  output_column_name: string;
+  offset: number;
+  group_by: boolean;
+  group_by_columns: string[];
+}
+
+// Dynamic Rename Types
+
+export type RenameMode = "prefix" | "suffix" | "formula" | "first_row";
+export type ColumnSelectionMode = "all" | "list" | "data_type";
+export type ReadableDataTypeGroup =
+  | "Numeric"
+  | "String"
+  | "Date"
+  | "Other"
+  | "Boolean"
+  | "Binary"
+  | "Complex";
+
+export interface DynamicRenameInput {
+  rename_mode: RenameMode;
+  prefix: string;
+  suffix: string;
+  formula: string;
+  selection_mode: ColumnSelectionMode;
+  selected_columns: string[];
+  selected_data_type: ReadableDataTypeGroup | null;
+}
+
+// Multi-Field Formula Types
+
+export type MultiFieldOutputMode = "replace" | "new";
+
+export interface MultiFieldFormulaInput {
+  formula: string;
+  selection_mode: ColumnSelectionMode;
+  selected_columns: string[];
+  selected_data_type: ReadableDataTypeGroup | null;
+  output_mode: MultiFieldOutputMode;
+  output_prefix: string;
+  output_suffix: string;
+  output_data_type: string;
+}
+
+// Explode Hierarchy Types
+
+export type HierarchyOutputDetail = "totals" | "levels" | "paths";
+
+export interface ExplodeHierarchyInput {
+  parent_column: string;
+  child_column: string;
+  quantity_column: string | null;
+  output_detail: HierarchyOutputDetail;
+  top_level_only: boolean;
+  include_self: boolean;
+  max_depth: number | null;
+}
+
+// Graph Solver Types
+
+export interface GraphSolverInput {
+  col_from: string;
+  col_to: string;
+  output_column_name: string;
+}
+
+// Polars Code Types
+
+export interface PolarsCodeInput {
+  polars_code: string;
+}
+
+// Python Script Types
+
+export interface CellOutput {
+  stdout: string;
+  stderr: string;
+  display_outputs: DisplayOutput[];
+  error: string | null;
+  execution_time_ms: number;
+  execution_count: number;
+  /** The failing line (1-based) when the run names one. */
+  line?: number | null;
+}
+
+export interface NotebookCell {
+  id: string;
+  code: string;
+  output?: CellOutput | null;
+}
+
+export interface PythonScriptInput {
+  code: string;
+  kernel_id: string | null;
+  cells?: NotebookCell[];
+}
+
+// Union Types
+
+export interface UnionInput {
+  mode: "selective" | "relaxed";
+}
+
+// Gate Types
+
+export type GateOperator =
+  | "equals"
+  | "not_equals"
+  | "in"
+  | "not_in"
+  | "is_true"
+  | "is_false"
+  | "is_set";
+
+export const GATE_OPERATOR_LABELS: Readonly<Record<GateOperator, string>> = {
+  equals: "equals",
+  not_equals: "not equals",
+  in: "is one of",
+  not_in: "is not one of",
+  is_true: "is true",
+  is_false: "is false",
+  is_set: "is set",
+};
+
+// Operators that compare against `value`; the rest read the parameter alone.
+export const GATE_OPERATORS_WITH_VALUE: readonly GateOperator[] = [
+  "equals",
+  "not_equals",
+  "in",
+  "not_in",
+];
+
+export interface GateInput {
+  condition_source: "parameter" | "formula";
+  parameter: string;
+  operator: GateOperator;
+  value: string;
+  formula: string;
+}
+
+// Raw Data Types
+
+export interface RawDataFormat {
+  columns?: MinimalFieldInput[] | null;
+  data: unknown[][];
+}
+
+// Received/File Table Types
+
+export type ScanMode = "single_file" | "directory";
+
+export interface ReceivedTable {
+  id?: number;
+  name?: string;
+  path: string;
+  directory?: string;
+  analysis_file_available?: boolean;
+  status?: string;
+  fields?: MinimalFieldInput[];
+  abs_file_path?: string;
+  file_type: "csv" | "json" | "parquet" | "excel" | "ipc" | "ndjson" | "avro" | "ipc_stream";
+  table_settings: InputTableSettings;
+  scan_mode?: ScanMode;
+  include_file_paths?: string | null;
+}
+
+// Database Types
+
+interface BaseConnection {
+  host?: string;
+  port?: number;
+  database?: string;
+  url?: string;
+}
+
+export interface DatabaseConnection extends BaseConnection {
+  // Dialect names come from the backend registry (GET /db_dialects).
+  database_type: string;
+  username?: string;
+  password_ref?: string; // Unused by file-based databases (sqlite, duckdb)
+}
+export type ConnectionModeOption = "inline" | "reference";
+export type IfExistAction = "append" | "replace" | "fail";
+
+export interface DatabaseSettings {
+  connection_mode: ConnectionModeOption;
+  database_connection?: DatabaseConnection;
+  database_connection_name?: string;
+  query_mode: "query" | "table";
+  schema_name?: string;
+  table_name?: string;
+  query: string;
+}
+
+export interface DatabaseWriteSettings {
+  connection_mode: ConnectionModeOption;
+  database_connection?: DatabaseConnection;
+  database_connection_name?: string;
+  schema_name?: string;
+  table_name?: string;
+  if_exists: IfExistAction;
+}
+
+// Cloud Storage Types
+
+interface CloudStorageSettings {
+  auth_mode: AuthMethod;
+  connection_name?: string;
+  resource_path: string;
+}
+
+export type FileFormat = "csv" | "parquet" | "json" | "delta" | "iceberg";
+export type CsvEncoding = "utf8" | "utf8-lossy";
+export type ParquetCompression = "snappy" | "gzip" | "brotli" | "lz4" | "zstd";
+export type WriteMode = "overwrite" | "append" | "error" | "upsert" | "update" | "delete";
+
+export interface CloudStorageReadSettings extends CloudStorageSettings {
+  scan_mode: ScanMode;
+  file_format?: FileFormat | undefined;
+  csv_has_header?: boolean;
+  csv_delimiter?: string;
+  csv_encoding?: CsvEncoding;
+  delta_version?: number;
+  // A bare path has no cursor store, so there is no since_last_run.
+  cdc_mode?: Exclude<CdcMode, "since_last_run">;
+  cdc_from_version?: number | string | null;
+  cdc_from_timestamp?: string | null;
+  cdc_include_preimage?: boolean;
+}
+
+export interface CloudStorageWriteSettings extends CloudStorageSettings {
+  write_mode: WriteMode;
+  file_format: FileFormat;
+  parquet_compression: ParquetCompression;
+  csv_delimiter: string;
+  csv_encoding: CsvEncoding;
+  partition_by?: string[] | null;
+  merge_keys?: string[];
+  track_changes?: boolean;
+}
+
+// External Source Types
+
+interface ExternalSource {
+  orientation: string;
+  fields?: MinimalFieldInput[];
+}
+
+export interface SampleUsers extends ExternalSource {
+  SAMPLE_USERS: boolean;
+  size: number;
+}
+
+// Node Base Types
+
+export interface OutputFieldInfo {
+  name: string;
+  data_type: string;
+  default_value?: string | null;
+}
+
+export interface OutputFieldConfig {
+  enabled: boolean;
+  validation_mode_behavior:
+    | "add_missing"
+    | "add_missing_keep_extra"
+    | "raise_on_missing"
+    | "select_only";
+  fields: OutputFieldInfo[];
+  validate_data_types: boolean;
+}
+
+export interface NodeBase {
+  flow_id: string | number;
+  node_id: number;
+  cache_results: boolean;
+  pos_x: number;
+  pos_y: number;
+  is_setup?: boolean;
+  description?: string;
+  node_reference?: string; // Unique reference identifier for code generation (lowercase, no spaces)
+  is_user_defined?: boolean;
+  output_field_config?: OutputFieldConfig | null;
+  execution_location?: string; // "auto" (the flow's backend) or a backend id; saved with the node
+}
+
+export interface NodeSingleInput extends NodeBase {
+  depending_on_id?: string | number;
+}
+
+export interface NodeMultiInput extends NodeBase {
+  depending_on_ids: number[] | null;
+}
+
+// Specific Node Types
+
+export interface NodeRead extends NodeBase {
+  received_file: ReceivedTable;
+}
+
+export interface NodeOutput extends NodeBase {
+  output_settings: OutputSettings;
+}
+
+export type CatalogWriteMode =
+  | "overwrite"
+  | "error"
+  | "append"
+  | "upsert"
+  | "update"
+  | "delete"
+  | "scd2"
+  | "virtual";
+
+export type Scd2OutputMode = "input" | "changed" | "current";
+
+export type CdcMode = "off" | "since_last_run" | "since_version" | "since_timestamp";
+
+export type CdcStart = "now" | "beginning";
+
+export interface Scd2Settings {
+  compare_columns: string[];
+  full_snapshot: boolean;
+  surrogate_key_column: string;
+  valid_from_column: string;
+  valid_to_column: string;
+  is_current_column: string;
+  partition_on_current: boolean;
+  output_mode: Scd2OutputMode;
+}
+
+export const DEFAULT_SCD2_SETTINGS: Scd2Settings = {
+  compare_columns: [],
+  full_snapshot: false,
+  surrogate_key_column: "sk",
+  valid_from_column: "valid_from",
+  valid_to_column: "valid_to",
+  is_current_column: "is_current",
+  partition_on_current: true,
+  output_mode: "input",
+};
+
+export interface CatalogWriteSettings {
+  table_name: string;
+  namespace_id: number | null;
+  namespace_full_name?: string | null;
+  description: string | null;
+  write_mode: CatalogWriteMode;
+  merge_keys: string[];
+  partition_by: string[];
+  scd2: Scd2Settings | null;
+  // Enable-only: turns the Delta change data feed on, never off.
+  track_changes: boolean;
+}
+
+export interface NodeCatalogWriter extends NodeBase {
+  catalog_write_settings: CatalogWriteSettings;
+}
+
+export interface NodeCatalogReader extends NodeBase {
+  catalog_table_id: number | null;
+  catalog_full_table_name: string | null;
+  catalog_table_name: string | null;
+  catalog_namespace_id: number | null;
+  delta_version: number | null;
+  scd2_view: "active" | "all" | "active_at" | null;
+  scd2_as_of: string | null;
+  sql_query: string | null;
+  cdc_mode: CdcMode;
+  cdc_from_version: number | string | null;
+  cdc_from_timestamp: string | null;
+  cdc_consumer_name: string | null;
+  cdc_start: CdcStart;
+  cdc_include_preimage: boolean;
+}
+
+/** Change-feed read settings; the cursor fields exist only on the catalog reader. */
+export type CdcReaderSettings = Pick<
+  NodeCatalogReader,
+  "cdc_mode" | "cdc_from_version" | "cdc_from_timestamp" | "cdc_include_preimage"
+> &
+  Partial<Pick<NodeCatalogReader, "cdc_consumer_name" | "cdc_start">>;
+
+export const DEFAULT_CDC_SETTINGS: Required<CdcReaderSettings> = {
+  cdc_mode: "off",
+  cdc_from_version: null,
+  cdc_from_timestamp: null,
+  cdc_consumer_name: null,
+  cdc_start: "now",
+  cdc_include_preimage: false,
+};
+
+export interface NodeInputData extends NodeBase {
+  file_ref: string;
+}
+
+export interface NodeManualInput extends NodeBase {
+  raw_data_format: RawDataFormat;
+}
+
+// Flows-in-flows Nodes
+
+// Mirrors the backend: NodeFlowInput extends NodeManualInput, so the optional
+// sample data rides on the inherited raw_data_format field.
+export interface NodeFlowInput extends NodeManualInput {
+  input_name: string;
+}
+
+export interface NodeFlowOutput extends NodeSingleInput {
+  output_name: string;
+}
+
+export interface RunFlowReference {
+  registration_id: number;
+  flow_uuid: string | null;
+  flow_path: string | null;
+  namespace?: string | null;
+  name?: string | null;
+}
+
+export type RunFlowBindingSource = "default" | "constant" | "column";
+
+export interface RunFlowParameterBinding {
+  parameter_name: string;
+  source: RunFlowBindingSource;
+  constant_value: string | null;
+  column_name: string | null;
+}
+
+export type RunFlowIterationMode = "first_value" | "iterate";
+
+export interface NodeRunFlow extends NodeBase {
+  flow_reference: RunFlowReference;
+  input_slots: string[];
+  output_slots: string[];
+  parameter_specs: FlowParameter[];
+  parameter_bindings: RunFlowParameterBinding[];
+  iteration_mode: RunFlowIterationMode;
+  append_run_metadata: boolean;
+}
+
+export interface NodeSelect extends NodeSingleInput {
+  keep_missing: boolean;
+  select_input: SelectInput[];
+  sorted_by?: "none" | "asc" | "desc";
+}
+
+export interface NodeFilter extends NodeSingleInput {
+  filter_input: FilterInput;
+  split_mode?: boolean;
+}
+
+export interface NodeGroupBy extends NodeSingleInput {
+  groupby_input: GroupByInput;
+}
+
+export interface NodeWindowFunctions extends NodeSingleInput {
+  window_input: WindowFunctionsInput;
+}
+
+export interface NodePivot extends NodeSingleInput {
+  pivot_input: PivotInput;
+  output_fields: FieldInput[];
+}
+
+export interface NodeUnpivot extends NodeSingleInput {
+  unpivot_input: UnpivotInput;
+}
+
+export interface NodeJoin extends NodeMultiInput {
+  join_input: FuzzyJoinSettings;
+}
+
+export interface NodeCrossJoin extends NodeMultiInput {
+  auto_generate_selection: boolean;
+  verify_integrity: boolean;
+  cross_join_input: CrossJoinInput;
+}
+
+export interface NodeSort extends NodeSingleInput {
+  sort_input: SortByInput[];
+}
+
+export interface NodeTextToRows extends NodeSingleInput {
+  text_to_rows_input: TextToRowsInput;
+}
+
+export interface NodeRecordId extends NodeSingleInput {
+  record_id_input: RecordIdInput;
+}
+
+export interface NodeDynamicRename extends NodeSingleInput {
+  dynamic_rename_input: DynamicRenameInput;
+}
+
+export interface NodeMultiFieldFormula extends NodeSingleInput {
+  multi_field_formula_input: MultiFieldFormulaInput;
+}
+
+export type SampleMethod = "first" | "random" | "random_fraction";
+
+export interface NodeSample extends NodeBase {
+  sample_method: SampleMethod;
+  sample_size: number;
+  fraction: number;
+  seed: number | null;
+}
+
+export interface NodeListFiles extends NodeBase {
+  path: string;
+  file_types: string[];
+  recursive: boolean;
+  max_depth: number;
+  include_hidden: boolean;
+  include_files: boolean;
+  include_directories: boolean;
+  max_files: number | null;
+}
+
+export interface RandomSplitGroup {
+  name: string;
+  percentage: number;
+}
+
+export interface NodeRandomSplit extends NodeBase {
+  splits: RandomSplitGroup[];
+  seed: number | null;
+}
+
+export interface NodePolarsCode extends NodeSingleInput {
+  polars_code_input: PolarsCodeInput;
+}
+
+export interface SqlQueryInput {
+  sql_code: string;
+}
+
+export interface NodeSqlQuery extends NodeMultiInput {
+  sql_query_input: SqlQueryInput;
+}
+
+export interface NodePythonScript extends NodeMultiInput {
+  python_script_input: PythonScriptInput;
+  output_names?: string[];
+}
+
+export interface NodeUnique extends NodeSingleInput {
+  unique_input: UniqueInput;
+}
+
+export interface NodeDataCleansing extends NodeSingleInput {
+  cleansing_input: DataCleansingInput;
+}
+
+export interface NodeGraphSolver extends NodeSingleInput {
+  graph_solver_input: GraphSolverInput;
+}
+
+export interface NodeExplodeHierarchy extends NodeSingleInput {
+  explode_hierarchy_input: ExplodeHierarchyInput;
+}
+
+export interface NodeUserDefined extends NodeMultiInput {
+  settings: any;
+  kernel_id?: string | null;
+  output_names?: string[];
+}
+
+export interface NodeFormula extends NodeSingleInput {
+  /** Legacy single-entry field; the backend only emits it when there is exactly one entry. */
+  function?: FormulaInput | null;
+  functions: FormulaInput[];
+}
+
+export interface NodeUnion extends NodeBase {
+  union_input: UnionInput;
+}
+
+export interface NodeGate extends NodeSingleInput {
+  gate_input: GateInput;
+  // Adds the "else" output (output-1): live when the condition does not hold.
+  else_output?: boolean;
+}
+
+export interface NodeExternalSource extends NodeBase {
+  identifier: string;
+  source_settings: SampleUsers;
+}
+
+export interface NodeDatabaseReader extends NodeBase {
+  database_settings: DatabaseSettings;
+  fields?: MinimalFieldInput[];
+}
+
+export interface NodeDatabaseWriter extends NodeSingleInput {
+  database_write_settings: DatabaseWriteSettings;
+}
+
+export interface NodeCloudStorageReader extends NodeBase {
+  cloud_storage_settings: CloudStorageReadSettings;
+  fields?: MinimalFieldInput[];
+}
+
+export interface NodeCloudStorageWriter extends NodeBase {
+  cloud_storage_settings: CloudStorageWriteSettings;
+}
+
+export interface KafkaSourceSettings {
+  kafka_connection_id: number | null;
+  kafka_connection_name: string | null;
+  topic_name: string;
+  value_format: "json";
+  sync_name: string;
+  start_offset: "earliest" | "latest";
+  max_messages: number;
+  poll_timeout_seconds: number;
+}
+
+export interface NodeKafkaSource extends NodeBase {
+  kafka_settings: KafkaSourceSettings;
+  fields?: MinimalFieldInput[] | null;
+}
+
+export interface GoogleAnalyticsFilter {
+  field: string;
+  // Dimensions: equals, not_equals, contains, begins_with, ends_with, regex, in_list, not_in_list
+  // Metrics: equals, not_equals, less_than, less_equal, greater_than, greater_equal, between
+  operator: string;
+  value: string;
+  case_sensitive: boolean;
+}
+
+export interface GoogleAnalyticsOrderBy {
+  field: string;
+  descending: boolean;
+}
+
+export interface GoogleAnalyticsSettings {
+  ga_connection_name: string;
+  property_id: string;
+  start_date: string;
+  end_date: string;
+  metrics: string[];
+  dimensions: string[];
+  limit: number | null;
+  filters: GoogleAnalyticsFilter[];
+  order_bys: GoogleAnalyticsOrderBy[];
+}
+
+export interface NodeGoogleAnalyticsReader extends NodeBase {
+  google_analytics_settings: GoogleAnalyticsSettings;
+  fields?: MinimalFieldInput[] | null;
+}
+
+// REST API Reader
+
+export interface RestApiAuthSettings {
+  auth_type: "none" | "api_key" | "bearer" | "basic";
+  api_key_name: string;
+  api_key_location: "header" | "query";
+  basic_username: string;
+  // Reference to a reusable secret in the user's secret store (empty = none).
+  secret_name: string;
+  // Optional inline plaintext for programmatic (read_api) use only.
+  secret?: string | null;
+}
+
+export interface RestApiPaginationSettings {
+  pagination_type: "none" | "offset" | "page" | "cursor";
+  offset_param: string;
+  limit_param: string;
+  page_size: number;
+  page_param: string;
+  start_page: number;
+  cursor_param: string;
+  cursor_location: "body" | "header";
+  cursor_response_path: string;
+  initial_cursor: string;
+  max_pages: number;
+  max_records: number | null;
+  page_delay_seconds: number;
+}
+
+export interface RestApiSettings {
+  url: string;
+  method: "GET" | "POST";
+  headers: Record<string, string>;
+  query_params: Record<string, string>;
+  json_body: unknown | null;
+  auth: RestApiAuthSettings;
+  pagination: RestApiPaginationSettings;
+  record_path: string;
+  timeout_seconds: number;
+  max_retries: number;
+}
+
+export interface NodeRestApiReader extends NodeBase {
+  rest_api_settings: RestApiSettings;
+  fields?: MinimalFieldInput[] | null;
+}
+
+// ML Nodes
+
+export type MLParamType = "boolean" | "number" | "integer" | "select";
+
+export interface MLParamSpec {
+  name: string;
+  type: MLParamType;
+  label: string;
+  default: boolean | number | string;
+  description?: string | null;
+  min?: number | null;
+  max?: number | null;
+  step?: number | null;
+  options?: string[] | null;
+}
+
+export interface MLAlgorithmSpec {
+  model_type: string;
+  label: string;
+  task_type: "regression" | "classification";
+  output_dtype: string;
+  params: MLParamSpec[];
+  description?: string | null;
+}
+
+export interface TrainModelSettings {
+  target_column: string;
+  feature_columns: string[];
+  model_type: string;
+  params: Record<string, unknown>;
+  publish_to_catalog: boolean;
+  model_name: string;
+  namespace_id?: number | null;
+  namespace_full_name?: string | null;
+  catalog_description?: string | null;
+  catalog_tags: string[];
+}
+
+export interface NodeTrainModel extends NodeSingleInput {
+  train_input: TrainModelSettings;
+}
+
+export type ApplyModelSource = "upstream" | "catalog";
+
+export interface ApplyModelSettings {
+  source: ApplyModelSource;
+  upstream_node_id: number | null;
+  model_name: string;
+  model_version: number | null;
+  namespace_id?: number | null;
+  namespace_full_name?: string | null;
+  output_column: string;
+}
+
+export interface UpstreamTrainModelOption {
+  node_id: number;
+  description: string;
+  target_column: string;
+  feature_columns: string[];
+  model_type: string;
+  publish_to_catalog: boolean;
+  model_name: string;
+}
+
+export interface CatalogNamespaceOut {
+  id: number;
+  name: string;
+  parent_id: number | null;
+  level: number;
+  description?: string | null;
+  access?: AccessInfo | null;
+}
+
+export interface CatalogNamespaceTree extends CatalogNamespaceOut {
+  children?: CatalogNamespaceTree[];
+}
+
+export interface NamespaceOption {
+  id: number;
+  label: string;
+  full: string; // portable "catalog.schema" reference (id is install-local)
+}
+
+export interface NodeApplyModel extends NodeSingleInput {
+  apply_input: ApplyModelSettings;
+}
+
+export type EvaluateModelTaskType = "auto" | "regression" | "classification";
+
+export interface EvaluateModelSettings {
+  actual_column: string;
+  predicted_column: string;
+  task_type: EvaluateModelTaskType;
+  upstream_train_node_id: number | null;
+}
+
+export interface NodeEvaluateModel extends NodeSingleInput {
+  evaluate_input: EvaluateModelSettings;
+}
+
+export interface MLArtifactListItem {
+  id: number;
+  name: string;
+  namespace_id?: number | null;
+  version: number;
+  python_type?: string | null;
+  size_bytes?: number | null;
+  created_at: string;
+  tags: string[];
+}

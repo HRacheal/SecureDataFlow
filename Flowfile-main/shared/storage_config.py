@@ -1,0 +1,480 @@
+"""
+Centralized storage configuration for Flowfile.
+This module can be imported by both core and worker without creating dependencies.
+"""
+
+import os
+from pathlib import Path
+from typing import Literal
+
+DirectoryOptions = Literal[
+    "temp_directory",
+    "logs_directory",
+    "system_logs_directory",
+    "database_directory",
+    "cache_directory",
+    "flows_directory",
+    "user_defined_nodes_directory",
+    "global_artifacts_directory",
+    "artifact_staging_directory",
+    "catalog_tables_directory",
+    "catalog_virtual_results_directory",
+    "notebooks_directory",
+]
+
+
+def _is_docker_mode() -> bool:
+    """Check if running in Docker mode based on FLOWFILE_MODE."""
+    return os.environ.get("FLOWFILE_MODE") == "docker"
+
+
+class FlowfileStorage:
+    """Centralized storage manager for Flowfile applications."""
+
+    def __init__(self):
+        self._base_dir: Path | None = None
+        self._user_data_dir: Path | None = None
+        self._ensure_directories()
+
+    @property
+    def base_directory(self) -> Path:
+        """Get the base Flowfile storage directory (for internal container communication)."""
+        if self._base_dir is None:
+            if _is_docker_mode():
+                base_path = os.environ.get("FLOWFILE_STORAGE_DIR", "/app/internal_storage")
+            else:
+                base_path = os.environ.get("FLOWFILE_STORAGE_DIR")
+                if not base_path:
+                    home_dir = Path.home()
+                    base_path = home_dir / ".flowfile"
+
+            self._base_dir = Path(base_path)
+        return self._base_dir
+
+    @property
+    def user_data_directory(self) -> Path:
+        """Get the user data directory (completely separate from application code)."""
+        if self._user_data_dir is None:
+            if _is_docker_mode():
+                user_data_path = os.environ.get("FLOWFILE_USER_DATA_DIR", "/data/user")
+            else:
+                user_data_path = Path.home()
+
+            self._user_data_dir = Path(user_data_path)
+        return self._user_data_dir
+
+    @property
+    def cache_directory(self) -> Path:
+        """Cache directory for worker-core communication (internal)."""
+        return self.base_directory / "cache"
+
+    def get_flow_cache_directory(self, flow_id: int) -> Path:
+        """Get or create a cache directory for a specific flow (internal)."""
+        flow_cache_dir = self.cache_directory / str(flow_id)
+        flow_cache_dir.mkdir(parents=True, exist_ok=True)
+        return flow_cache_dir
+
+    @property
+    def system_logs_directory(self) -> Path:
+        """Directory for system logs (internal)."""
+        return self.base_directory / "system_logs"
+
+    @property
+    def flows_directory(self) -> Path:
+        """Directory for flow storage (user-accessible)."""
+        if _is_docker_mode():
+            return self.user_data_directory / "flows"
+        else:
+            return self.base_directory / "flows"
+
+    @property
+    def unnamed_flows_directory(self) -> Path:
+        """Directory for quick-created unnamed flows (persistent, user-accessible)."""
+        return self.flows_directory / "unnamed_flows"
+
+    @property
+    def python_editor_flows_directory(self) -> Path:
+        """Directory for Python-built flows registered via the FlowFrame API."""
+        return self.flows_directory / "python_editor_flows"
+
+    def is_scratch_flow_path(self, flow_path: str | None) -> bool:
+        """Whether ``flow_path`` is an app-named throwaway flow (quick-create / python editor).
+
+        These files get machine-generated stems ("Unnamed_flow_20260730_181546_493427479"),
+        so unlike a path the user chose, the filename is not a usable display name.
+        """
+        if not flow_path:
+            return False
+        roots = (
+            str(self.unnamed_flows_directory.resolve()) + os.sep,
+            str(self.python_editor_flows_directory.resolve()) + os.sep,
+        )
+        return str(flow_path).startswith(roots)
+
+    @property
+    def uploads_directory(self) -> Path:
+        """Directory for user uploads (user-accessible)."""
+        if _is_docker_mode():
+            return self.user_data_directory / "uploads"
+        else:
+            return self.base_directory / "uploads"
+
+    @property
+    def user_defined_nodes_directory(self) -> Path:
+        """Directory for user-defined custom nodes (user-accessible)."""
+        if _is_docker_mode():
+            return self.user_data_directory / "user_defined_nodes"
+        else:
+            return self.base_directory / "user_defined_nodes"
+
+    @property
+    def user_defined_nodes_icons(self) -> Path:
+        """Directory for user-defined custom node icon (user-accessible)."""
+        return self.user_defined_nodes_directory / "icons"
+
+    @property
+    def user_defined_nodes_screenshots(self) -> Path:
+        """Parent for per-node publish-prep screenshot folders.
+
+        Deliberately NOT created in ``_ensure_directories`` — created lazily
+        where used (only when a user actually uploads a publish screenshot),
+        mirroring the ``local_model_directory`` opt-in precedent.
+        """
+        return self.user_defined_nodes_directory / "screenshots"
+
+    @property
+    def outputs_directory(self) -> Path:
+        """Directory for user outputs (user-accessible)."""
+        if _is_docker_mode():
+            return self.user_data_directory / "outputs"
+        else:
+            return self.base_directory / "outputs"
+
+    @property
+    def database_directory(self) -> Path:
+        """Directory for local database files (internal)."""
+        return self.base_directory / "database"
+
+    @property
+    def logs_directory(self) -> Path:
+        """Directory for application logs (internal).
+
+        ``TESTING=True`` redirects to a disposable temp subdir so test runs never
+        write into — or expire — a developer's real logs (mirrors get_database_url).
+        """
+        if os.environ.get("TESTING") == "True":
+            return self.temp_directory / "test_logs"
+        return self.base_directory / "logs"
+
+    @property
+    def temp_directory(self) -> Path:
+        """Directory for temporary files (internal)."""
+        return self.base_directory / "temp"
+
+    @property
+    def temp_directory_for_flows(self) -> Path:
+        """Directory for temporary files specific to flows (internal)."""
+        return self.temp_directory / "flows"
+
+    @property
+    def shared_directory(self) -> Path:
+        """Directory shared between core, worker, and kernel containers.
+
+        Lives under internal storage so it's on the same volume that
+        core and worker already share (flowfile-internal-storage).
+        Can be overridden via FLOWFILE_SHARED_DIR environment variable.
+        """
+        shared_dir = os.environ.get("FLOWFILE_SHARED_DIR")
+        if shared_dir:
+            return Path(shared_dir)
+        return self.temp_directory / "kernel_shared"
+
+    @property
+    def global_artifacts_directory(self) -> Path:
+        """Directory for permanent storage of global artifacts.
+
+        Must be under the kernel's shared volume so Docker containers can
+        access artifact files.  When FLOWFILE_SHARED_DIR is set (e.g. tests),
+        that path is used directly; otherwise we default to the same
+        ``temp/kernel_shared`` directory that KernelManager mounts.
+        """
+        shared_dir = os.environ.get("FLOWFILE_SHARED_DIR")
+        if shared_dir:
+            return Path(shared_dir) / "global_artifacts"
+        # Must match KernelManager default shared volume path
+        return self.temp_directory / "kernel_shared" / "global_artifacts"
+
+    @property
+    def template_data_directory(self) -> Path:
+        """Directory for cached template CSV data files."""
+        return self.base_directory / "template_data"
+
+    @property
+    def local_model_directory(self) -> Path:
+        """Directory for the optional on-demand local LLM (llama.cpp binary + GGUF).
+
+        Internal engine artifact kept under ``base_directory`` (``~/.flowfile/
+        local_model`` locally). Deliberately NOT created eagerly in
+        ``_ensure_directories`` — the local-model manager creates it only when
+        the user opts into the install, so users who never want it pay nothing.
+        """
+        return self.base_directory / "local_model"
+
+    @property
+    def ai_sessions_directory(self) -> Path:
+        """Directory for disk-persisted AI agent sessions (per-user, sidecar).
+
+        Docker → ``user_data_directory / "ai_sessions"`` so multi-tenant
+        deployments keep per-user separation. Local → ``base_directory /
+        "ai_sessions"`` (``~/.flowfile/ai_sessions/``) so we don't write into
+        the user's HOME root (``Path.home() / "ai_sessions"`` would be
+        intrusive — same precedent as the prompt-log path deviation).
+        Mirrors the existing ``flows_directory`` / ``outputs_directory``
+        resolution shape exactly.
+        """
+        if _is_docker_mode():
+            return self.user_data_directory / "ai_sessions"
+        return self.base_directory / "ai_sessions"
+
+    @property
+    def catalog_tables_directory(self) -> Path:
+        """Directory for materialized catalog table Parquet files."""
+        if _is_docker_mode():
+            return self.user_data_directory / "catalog_tables"
+        return self.base_directory / "catalog_tables"
+
+    @property
+    def catalog_virtual_results_directory(self) -> Path:
+        """Worker-side IPC cache for materialised flow-virtual tables."""
+        if _is_docker_mode():
+            return self.user_data_directory / "catalog_virtual_results"
+        return self.base_directory / "catalog_virtual_results"
+
+    @property
+    def notebooks_directory(self) -> Path:
+        """Root for catalog notebook content files (the versioned artifact).
+
+        Cells live on disk keyed by ``notebook_uuid``; the DB row holds only
+        metadata. The per-owner ``<owner_id>/`` subdir is resolved by the
+        notebook store, not here."""
+        if _is_docker_mode():
+            return self.user_data_directory / "notebooks"
+        return self.base_directory / "notebooks"
+
+    @property
+    def artifact_staging_directory(self) -> Path:
+        """Directory for staging artifact uploads before finalization.
+
+        Must be under the kernel's shared volume so Docker containers can
+        write blobs here.  Uses the same resolution logic as
+        ``global_artifacts_directory``.
+        """
+        shared_dir = os.environ.get("FLOWFILE_SHARED_DIR")
+        if shared_dir:
+            return Path(shared_dir) / "artifact_staging"
+        return self.temp_directory / "kernel_shared" / "artifact_staging"
+
+    @property
+    def shared_virtual_results_directory(self) -> Path:
+        """Kernel-readable IPC cache for materialised virtual tables (views).
+
+        Must be under the kernel's shared volume so Docker kernels can scan
+        the files.  Uses the same resolution logic as
+        ``artifact_staging_directory``.
+        """
+        shared_dir = os.environ.get("FLOWFILE_SHARED_DIR")
+        if shared_dir:
+            return Path(shared_dir) / "catalog_virtual_results"
+        return self.temp_directory / "kernel_shared" / "catalog_virtual_results"
+
+    def _ensure_directories(self) -> None:
+        """Create all necessary directories if they don't exist."""
+        internal_directories = [
+            self.cache_directory,
+            self.database_directory,
+            self.logs_directory,
+            self.temp_directory,
+            self.system_logs_directory,
+            self.temp_directory_for_flows,
+            self.shared_directory,
+            self.artifact_staging_directory,
+            self.shared_virtual_results_directory,
+        ]
+
+        user_directories = [
+            self.flows_directory,
+            self.unnamed_flows_directory,
+            self.python_editor_flows_directory,
+            self.uploads_directory,
+            self.outputs_directory,
+            self.user_defined_nodes_directory,
+            self.user_defined_nodes_icons,
+            self.global_artifacts_directory,
+            self.catalog_tables_directory,
+            self.catalog_virtual_results_directory,
+            self.template_data_directory,
+            self.notebooks_directory,
+        ]
+
+        for directory in internal_directories + user_directories:
+            directory.mkdir(parents=True, exist_ok=True)
+
+    def get_cache_file_path(self, filename: str) -> Path:
+        """Get full path for a cache file (internal)."""
+        return self.cache_directory / filename
+
+    def get_flow_file_path(self, filename: str) -> Path:
+        """Get full path for a flow file (user-accessible)."""
+        return self.flows_directory / filename
+
+    def get_upload_file_path(self, filename: str) -> Path:
+        """Get full path for an uploaded file (user-accessible)."""
+        return self.uploads_directory / filename
+
+    def get_output_file_path(self, filename: str) -> Path:
+        """Get full path for an output file (user-accessible)."""
+        return self.outputs_directory / filename
+
+    def get_log_file_path(self, filename: str) -> Path:
+        """Get full path for an application log file (internal)."""
+        return self.logs_directory / filename
+
+    def get_system_log_file_path(self, filename: str) -> Path:
+        """Get full path for a system log file (internal)."""
+        return self.system_logs_directory / filename
+
+    def get_temp_file_path(self, filename: str) -> Path:
+        """Get full path for a temporary file (internal)."""
+        return self.temp_directory / filename
+
+    def cleanup_directory(self, directory_option: DirectoryOptions, storage_duration_hours: int = 24) -> None:
+        """Clean up any directory of the folder"""
+        import shutil
+        import time
+
+        if not hasattr(self, directory_option):
+            raise Exception(f"Directory does not exist in {self.base_directory}")
+
+        directory = getattr(self, directory_option)
+        if not isinstance(directory, Path):
+            raise Exception(f"Directory attribute {directory_option} is not a Path object")
+
+        if not directory.exists():
+            return
+
+        current_time = time.time()
+        cutoff_time = current_time - (storage_duration_hours * 60 * 60)
+
+        for item in directory.iterdir():
+            try:
+                if item.stat().st_mtime < cutoff_time:
+                    if item.is_file():
+                        item.unlink()
+                    elif item.is_dir():
+                        shutil.rmtree(item)
+            except (OSError, FileNotFoundError):
+                continue
+
+    def cleanup_directories(self) -> None:
+        """Clean up temporary files older than specified hours."""
+        self.cleanup_directory("temp_directory", storage_duration_hours=24)
+        self.cleanup_directory("cache_directory", storage_duration_hours=1)
+        # logs_directory is deliberately absent: run/flow log retention is owned by
+        # shared.run_logs.cleanup_old_logs (FLOWFILE_RUN_LOG_RETENTION_DAYS).
+        self.cleanup_directory("system_logs_directory", storage_duration_hours=168)
+
+
+storage = FlowfileStorage()
+
+
+# Convenience functions for backward compatibility
+def get_cache_directory() -> str:
+    """Get cache directory path as string."""
+    return str(storage.cache_directory)
+
+
+def get_temp_directory() -> str:
+    """Get temp directory path as string."""
+    return str(storage.temp_directory)
+
+
+def get_flows_directory() -> str:
+    """Get flows directory path as string."""
+    return str(storage.flows_directory)
+
+
+def get_uploads_directory() -> str:
+    """Get uploads directory path as string."""
+    return str(storage.uploads_directory)
+
+
+def get_outputs_directory() -> str:
+    """Get outputs directory path as string."""
+    return str(storage.outputs_directory)
+
+
+def get_logs_directory() -> str:
+    """Get application logs directory path as string."""
+    return str(storage.logs_directory)
+
+
+def get_system_logs_directory() -> str:
+    """Get system logs directory path as string."""
+    return str(storage.system_logs_directory)
+
+
+def get_shared_directory() -> str:
+    """Get shared directory path as string."""
+    return str(storage.shared_directory)
+
+
+def get_global_artifacts_directory() -> str:
+    """Get global artifacts directory path as string."""
+    return str(storage.global_artifacts_directory)
+
+
+def get_artifact_staging_directory() -> str:
+    """Get artifact staging directory path as string."""
+    return str(storage.artifact_staging_directory)
+
+
+def get_template_data_directory() -> str:
+    """Get template data directory path as string."""
+    return str(storage.template_data_directory)
+
+
+def get_database_url() -> str:
+    """Resolve the database URL for the Flowfile catalog.
+
+    Priority:
+    1. ``FLOWFILE_DATABASE_URL`` env var (full SQLAlchemy URL)
+    2. ``FLOWFILE_DB_PATH`` env var (path or full URL)
+    3. ``TESTING=True`` env var → temp directory test DB
+    4. Default: ``<storage.database_directory>/flowfile_catalog.db``
+    """
+    custom = os.environ.get("FLOWFILE_DATABASE_URL") or os.environ.get("FLOWFILE_DB_PATH")
+    if custom:
+        return custom if "://" in custom else f"sqlite:///{custom}"
+
+    if os.environ.get("TESTING") == "True":
+        return f"sqlite:///{storage.temp_directory / 'test_flowfile_catalog.db'}"
+
+    return f"sqlite:///{storage.database_directory / 'flowfile_catalog.db'}"
+
+
+def get_legacy_database_path() -> Path | None:
+    """Return the path to the old ``flowfile.db`` if it exists, else ``None``.
+
+    Used only during the one-time data migration from ``flowfile.db`` →
+    ``flowfile_catalog.db``. Returns ``None`` when ``FLOWFILE_DATABASE_URL``
+    or ``FLOWFILE_DB_PATH`` is set (the user manages the database location).
+    """
+    if os.environ.get("FLOWFILE_DATABASE_URL") or os.environ.get("FLOWFILE_DB_PATH"):
+        return None
+
+    if os.environ.get("TESTING") == "True":
+        legacy = storage.temp_directory / "test_flowfile.db"
+    else:
+        legacy = storage.database_directory / "flowfile.db"
+
+    return legacy if legacy.exists() else None

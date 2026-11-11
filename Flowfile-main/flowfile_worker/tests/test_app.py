@@ -1,0 +1,426 @@
+import os
+import time
+
+from base64 import b64decode
+from io import BytesIO
+
+import polars as pl
+import pytest
+from fastapi.testclient import TestClient
+from polars_grouper import graph_solver, hierarchy_paths
+
+from flowfile_worker import main, models
+from flowfile_worker.external_sources.s3_source.models import (
+    WriteSettings,
+)
+from flowfile_worker.secrets import encrypt_secret
+from tests.conftest import INTERNAL_AUTH_HEADERS
+
+client = TestClient(main.app, headers=INTERNAL_AUTH_HEADERS)
+
+
+try:
+    # noinspection PyUnresolvedReferences
+    from test_utils.s3.fixtures import get_minio_client
+    from tests.utils import cloud_storage_connection_settings, find_parent_directory, is_docker_available
+except ModuleNotFoundError:
+    import os
+    import sys
+    sys.path.append(os.path.dirname(os.path.abspath("flowfile_worker/tests/utils.py")))
+    sys.path.append(os.path.dirname(os.path.abspath("test_utils/s3/fixtures.py")))
+    # noinspection PyUnresolvedReferences
+    from utils import find_parent_directory, is_docker_available
+
+
+@pytest.mark.worker
+def test_internal_token_required():
+    """Every router endpoint is gated on X-Flowfile-Internal; /docs deliberately is not."""
+    unauthenticated = TestClient(main.app)
+    assert unauthenticated.get("/status/does-not-exist").status_code == 401
+    assert unauthenticated.get("/status/does-not-exist", headers={"X-Flowfile-Internal": "wrong"}).status_code == 401
+    assert client.get("/status/does-not-exist").status_code != 401
+    assert unauthenticated.get("/docs").status_code == 200
+
+
+@pytest.fixture
+def pw():
+    return encrypt_secret('testpass')
+
+
+@pytest.fixture
+def create_fuzzy_data() -> models.FuzzyJoinInput:
+    fuzzy_maps = [
+        models.FuzzyMapping(left_col='name', right_col='name_right', threshold_score=60.0,
+                            fuzzy_type='levenshtein'),
+        models.FuzzyMapping(left_col='city', right_col='city_right', threshold_score=60.0, fuzzy_type='levenshtein')
+    ]
+
+    left_df = pl.LazyFrame(
+        data=[
+            ('John', 'weert'),
+            ('Johan', 'eindhoven'),
+            ('Johannes', 'eindhoven'),
+            ('Edward', 'denbosch'),
+            ('Edwin', 'utrecht')
+        ],
+        orient='row',
+        schema=['name', 'city']
+    )
+
+    right_df = pl.LazyFrame(
+        data=[
+            ('John', 'weert'),
+            ('Johan', 'eindhoven'),
+            ('Johannes', 'eindhoven'),
+            ('Edward', 'denbosch'),
+            ('Edwin', 'utrecht')
+        ],
+        orient='row',
+        schema=['name_right', 'city_right']
+    )
+
+    # Serialize DataFrames - use raw bytes, Pydantic handles base64 for JSON transport
+    left_serializable_object = models.PolarsOperation(
+        operation=left_df.serialize(),
+        flowfile_flow_id=1
+    )
+    right_serializable_object = models.PolarsOperation(
+        operation=right_df.serialize(),
+        flowfile_flow_id=1
+    )
+
+    return models.FuzzyJoinInput(
+        left_df_operation=left_serializable_object,
+        right_df_operation=right_serializable_object,
+        fuzzy_maps=fuzzy_maps
+    )
+
+
+@pytest.fixture
+def create_grouper_data():
+    df = pl.DataFrame(
+        {
+            "from": ["A", "B", "C", "E", "F", "G", "I", "I", 'AA'],
+            "to": ["B", "C", "D", "F", "G", "J", "K", "J", 'Z']
+        }
+    )
+    return df.select(graph_solver(pl.col("from"), pl.col("to")).alias('group')).lazy()
+
+
+def test_external_package(create_grouper_data):
+    df = create_grouper_data
+    headers = {
+        "Content-Type": "application/octet-stream",
+        "X-Operation-Type": "store",
+        "X-Flow-Id": "1",
+        "X-Node-Id": "-1",
+    }
+    v = client.post('/submit_query/', content=df.serialize(), headers=headers)
+    assert v.status_code == 200, v.text
+    assert models.Status.model_validate(v.json()), 'Error with parsing the response to Status'
+    status: models.Status = models.Status.model_validate(v.json())
+    r = client.get(f'/status/{status.background_task_id}')
+    status = models.Status.model_validate(r.json())
+    if status.error_message is not None:
+        raise Exception(f'Error message: {status.error_message}')
+    # Results are base64-encoded string in JSON response, decode once
+    result_df = pl.LazyFrame.deserialize(BytesIO(b64decode(status.results))).collect()
+    assert result_df.equals(df.collect()), f'Expected:\n{df.collect()}\n\nResult:\n{result_df}'
+
+
+def test_status_404s_when_the_result_file_is_gone(create_grouper_data):
+    """A deleted .arrow must make /status 404, so core's results_exists tells the truth.
+
+    The old guard was pl.scan_ipc(), which is lazy and succeeds on a path that no
+    longer exists — every cache-validity check downstream of it always said yes.
+    """
+    df = create_grouper_data
+    headers = {
+        "Content-Type": "application/octet-stream",
+        "X-Operation-Type": "store",
+        "X-Flow-Id": "1",
+        "X-Node-Id": "-1",
+    }
+    v = client.post('/submit_query/', content=df.serialize(), headers=headers)
+    assert v.status_code == 200, v.text
+    task_id = models.Status.model_validate(v.json()).background_task_id
+
+    for _ in range(100):
+        r = client.get(f'/status/{task_id}')
+        assert r.status_code == 200, r.text
+        status = models.Status.model_validate(r.json())
+        if status.status == 'Completed':
+            break
+        time.sleep(0.1)
+    assert status.status == 'Completed', f'task did not complete: {status.status}'
+
+    os.remove(status.file_ref)
+    assert client.get(f'/status/{task_id}').status_code == 404
+
+
+def _store_and_wait(lf: pl.LazyFrame | bytes) -> models.Status:
+    """Submit a serialized plan as a store job and poll until it leaves the in-flight states."""
+    headers = {
+        "Content-Type": "application/octet-stream",
+        "X-Operation-Type": "store",
+        "X-Flow-Id": "1",
+        "X-Node-Id": "-1",
+    }
+    content = lf if isinstance(lf, bytes) else lf.serialize()
+    v = client.post('/submit_query/', content=content, headers=headers)
+    assert v.status_code == 200, v.text
+    task_id = models.Status.model_validate(v.json()).background_task_id
+    for _ in range(100):
+        status = models.Status.model_validate(client.get(f'/status/{task_id}').json())
+        if status.status not in ('Processing', 'Starting'):
+            return status
+        time.sleep(0.1)
+    raise AssertionError(f'task did not finish: {status.status}')
+
+
+def _exploded_bom(edges: dict) -> pl.LazyFrame:
+    return (
+        pl.LazyFrame(edges)
+        .select(hierarchy_paths(pl.col("parent"), pl.col("child"), pl.col("qty"), top_level_only=True).alias("h"))
+        .unnest("h")
+    )
+
+
+def test_hierarchy_plan_round_trips_through_the_worker():
+    """An explode_hierarchy plan serializes (plugin path included) and runs in a worker child."""
+    lf = _exploded_bom({
+        "parent": ["bike", "bike", "frame", "wheel", "wheel"],
+        "child": ["frame", "wheel", "screw", "spoke", "screw"],
+        "qty": [1.0, 2.0, 6.0, 32.0, 2.0],
+    })
+    status = _store_and_wait(lf)
+    assert status.error_message is None, status.error_message
+    result_df = pl.LazyFrame.deserialize(BytesIO(b64decode(status.results))).collect()
+    assert result_df.equals(lf.collect()), f'Expected:\n{lf.collect()}\n\nResult:\n{result_df}'
+    screws = result_df.filter(pl.col("descendant") == "screw")
+    assert screws["quantity"].sum() == 10.0
+
+
+def test_hierarchy_cycle_reports_the_cycle_from_the_worker():
+    lf = _exploded_bom({"parent": ["a", "b", "c", "c"], "child": ["b", "c", "a", "d"], "qty": [1.0] * 4})
+    status = _store_and_wait(lf)
+    assert status.status == 'Error'
+    assert "a -> b -> c -> a" in status.error_message
+    assert status.error_kind == 'task'
+
+
+def test_plan_the_worker_cannot_load_is_an_environment_failure_over_rest(unloadable_plan):
+    status = _store_and_wait(unloadable_plan)
+    assert status.status == 'Error'
+    assert status.error_kind == 'environment'
+    assert status.error_message.startswith('ModuleNotFoundError:'), status.error_message
+
+
+def test_add_fuzzy_join(create_fuzzy_data):
+    load = create_fuzzy_data
+    # Use model_dump_json() - Pydantic handles single base64 encoding for bytes in JSON
+    v = client.post('/add_fuzzy_join', data=load.model_dump_json(), headers={"Content-Type": "application/json"})
+    assert v.status_code == 200, v.text
+    assert models.Status.model_validate(v.json()), 'Error with parsing the response to Status'
+    status: models.Status = models.Status.model_validate(v.json())
+    r = client.get(f'/status/{status.background_task_id}')
+    status = models.Status.model_validate(r.json())
+    if status.error_message is not None:
+        raise Exception(f'Error message: {status.error_message}')
+    # Results are base64-encoded string in JSON response, decode once
+    pl.LazyFrame.deserialize(BytesIO(b64decode(status.results))).collect()
+
+
+def test_sample():
+    lf = pl.LazyFrame({'value': [i for i in range(1000)]})
+    headers = {
+        "Content-Type": "application/octet-stream",
+        "X-Operation-Type": "store_sample",
+        "X-Sample-Size": "10",
+        "X-Flow-Id": "1",
+        "X-Node-Id": "-1",
+    }
+    v = client.post('/store_sample/', content=lf.serialize(), headers=headers)
+    assert v.status_code == 200, v.text
+    assert models.Status.model_validate(v.json()), 'Error with parsing the response to Status'
+    status: models.Status = models.Status.model_validate(v.json())
+    r = client.get(f'/status/{status.background_task_id}')
+    status = models.Status.model_validate(r.json())
+    if status.error_message is not None:
+        raise Exception(f'Error message: {status.error_message}')
+    result_df = pl.read_ipc(status.file_ref)
+    assert result_df.equals(lf.collect().limit(10)), f'Expected:\n{lf.collect()}\n\nResult:\n{result_df}'
+
+
+def test_polars_transformation():
+    df = (pl.DataFrame([{'a': 1, 'b': 2}, {'a': 3, 'b': 4}]).lazy()
+          .select((pl.col('a') + pl.col('b')).alias('total'))
+          )
+    headers = {
+        "Content-Type": "application/octet-stream",
+        "X-Operation-Type": "store",
+        "X-Flow-Id": "1",
+        "X-Node-Id": "-1",
+    }
+    v = client.post('/submit_query/', content=df.serialize(), headers=headers)
+    assert v.status_code == 200, v.text
+    assert models.Status.model_validate(v.json()), 'Error with parsing the response to Status'
+    status: models.Status = models.Status.model_validate(v.json())
+    r = client.get(f'/status/{status.background_task_id}')
+    status = models.Status.model_validate(r.json())
+    if status.error_message is not None:
+        raise Exception(f'Error message: {status.error_message}')
+    # Results are base64-encoded string in JSON response, decode once
+    result_df = pl.LazyFrame.deserialize(BytesIO(b64decode(status.results))).collect()
+    assert result_df.equals(df.collect()), f'Expected:\n{df.collect()}\n\nResult:\n{result_df}'
+
+
+def test_create_func():
+    file_type = 'csv'
+    from flowfile_core.schemas import input_schema
+    path = str(find_parent_directory("Flowfile") / "flowfile_core/tests/inputFile/Mall_Customers.csv")
+    received_table = input_schema.ReceivedTable(name="Mall_Customers.csv",
+                                                path=path,
+                                                file_type="csv",
+                                                table_settings=input_schema.InputCsvTable(
+                                                    delimiter=",",
+                                                    has_headers=True,
+                                                    encoding="ISO-8859-1",
+                                                    infer_schema_length=260000,
+                                                    truncate_ragged_lines=False,
+                                                    ignore_errors=False
+                                                )).model_dump()
+
+    v = client.post(f'/create_table/{file_type}', json=received_table)
+    assert v.status_code == 200, v.text
+    assert models.Status.model_validate(v.json()), 'Error with parsing the response to Status'
+    status: models.Status = models.Status.model_validate(v.json())
+    r = client.get(f'/status/{status.background_task_id}')
+    status = models.Status.model_validate(r.json())
+    if status.error_message is not None:
+        raise Exception(f'Error message: {status.error_message}')
+    # Results are base64-encoded string in JSON response, decode once
+    try:
+        result_df = pl.LazyFrame.deserialize(BytesIO(b64decode(status.results)))
+    except Exception:
+        raise Exception('Error with deserializing the DataFrame')
+
+
+def test_write_output_csv():
+    lf = pl.LazyFrame({'a': [1, 2, 3], 'b': [4, 5, 6]})
+    # Use raw bytes - Pydantic model handles JSON serialization with single base64 encoding
+    polars_script_write = models.PolarsScriptWrite(
+        operation=lf.serialize(),
+        data_type='csv',
+        path="flowfile_core/tests/inputFile/Mall_Customers.csv",
+        write_mode='overwrite',
+        sheet_name='Sheet1',
+        delimiter=','
+    )
+    v = client.post('/write_results/', data=polars_script_write.model_dump_json(), headers={"Content-Type": "application/json"})
+    assert v.status_code == 200, v.text
+    assert models.Status.model_validate(v.json()), 'Error with parsing the response to Status'
+    status: models.Status = models.Status.model_validate(v.json())
+    r = client.get(f'/status/{status.background_task_id}')
+    status = models.Status.model_validate(r.json())
+    if status.error_message is not None:
+        raise Exception(f'Error message: {status.error_message}')
+    df = pl.read_csv(status.file_ref)
+    assert df.count()[0, 0] == 3, f'Expected 3 records, got {df.count()[0, 0]}'
+
+
+@pytest.mark.skipif(not is_docker_available(), reason="Docker is not available or not running")
+def test_store_sql_result(pw):
+    database_connection = dict(host='localhost', password=pw, username='testuser', port=5433, database='testdb')
+    sql_source_settings = dict(connection=database_connection, query='SELECT * FROM public.movies')
+    v = client.post('/store_database_read_result', json=sql_source_settings)
+    assert v.status_code == 200, v.text
+    assert models.Status.model_validate(v.json()), 'Error with parsing the response to Status'
+    status = models.Status.model_validate(v.json())
+    assert status.status == 'Starting', 'Expected status to be Starting'
+    r = client.get(f'/status/{status.background_task_id}')
+    assert r.status_code == 200, r.text
+    status = models.Status.model_validate(r.json())
+    if status.error_message is not None:
+        raise Exception(f'Error message: {status.error_message}')
+    assert status.status == 'Completed', 'Expected status to be Completed'
+    # Results are base64-encoded string in JSON response, decode once
+    try:
+        result_df = pl.LazyFrame.deserialize(BytesIO(b64decode(status.results))).collect()
+    except Exception:
+        raise Exception('Error with deserializing the DataFrame')
+    assert result_df.shape[0] > 0, 'Expected to get some data from the database'
+
+
+@pytest.mark.skipif(not is_docker_available(), reason="Docker is not available or not running")
+def test_store_in_database(pw):
+    lf = pl.LazyFrame({'a': [1, 2, 3], 'b': [4, 5, 6]})
+    # Use raw bytes - Base64Bytes will encode to base64 string for JSON
+    from base64 import b64encode
+    settings_data = {
+        'connection': {'username': 'testuser', 'password': pw, 'host': 'localhost', 'port': 5433,
+                       'database': 'testdb', 'database_type': 'postgresql', 'url': None},
+        'table_name': 'public.test_output',
+        'if_exists': 'replace',
+        'flowfile_flow_id': 1,
+        'flowfile_node_id': -1,
+        'operation': b64encode(lf.serialize()).decode('ascii')  # Base64 string for JSON
+    }
+    v = client.post('/store_database_write_result/', json=settings_data)
+    assert v.status_code == 200, v.text
+    assert models.Status.model_validate(v.json()), 'Error with parsing the response to Status'
+    status = models.Status.model_validate(v.json())
+    assert status.status == 'Starting', 'Expected status to be Starting'
+    r = client.get(f'/status/{status.background_task_id}')
+    assert r.status_code == 200, r.text
+    status = models.Status.model_validate(r.json())
+    if status.error_message is not None:
+        raise Exception(f'Error message: {status.error_message}')
+    assert status.status == 'Completed', 'Expected status to be Completed'
+
+
+@pytest.mark.skipif(not is_docker_available(), reason="Docker is not available or not running")
+def test_store_in_cloud_storage(cloud_storage_connection_settings):
+    lf = pl.LazyFrame({'a': [1, 2, 3], 'b': [4, 5, 6]})
+    # Create model - Base64Bytes type handles encoding automatically
+    cloud_write_settings = models.CloudStorageScriptWrite(
+        connection=cloud_storage_connection_settings,
+        write_settings=WriteSettings(
+            resource_path="s3://worker-test-bucket/write_test.parquet",
+            file_format="parquet",
+            write_mode="overwrite",
+            parquet_compression="snappy"
+        ),
+        operation=lf.serialize()
+    )
+    # Use model_dump and manually handle SecretStr to preserve secret values
+    # Note: operation is already base64-encoded by Base64Bytes serializer
+    settings_data = cloud_write_settings.model_dump()
+    settings_data["connection"]["aws_secret_access_key"] = (
+        settings_data["connection"]["aws_secret_access_key"].get_secret_value()
+        if hasattr(settings_data["connection"]["aws_secret_access_key"], 'get_secret_value')
+        else settings_data["connection"]["aws_secret_access_key"]
+    )
+    v = client.post('/write_data_to_cloud/', json=settings_data)
+    assert v.status_code == 200, v.text
+    assert models.Status.model_validate(v.json()), 'Error with parsing the response to Status'
+    status: models.Status = models.Status.model_validate(v.json())
+    r = client.get(f'/status/{status.background_task_id}')
+    status = models.Status.model_validate(r.json())
+    if status.error_message is not None:
+        raise Exception(f'Error message: {status.error_message}')
+    assert status.status == 'Completed', 'Expected status to be Completed'
+
+
+def test_create_table_refuses_directory_scan_mode():
+    """Directory reads are core-side only: no worker reader can execute a glob, so the route
+    must refuse instead of stat'ing a pattern as if it were a file."""
+    from flowfile_worker.create.models import ReceivedTable
+
+    received_table = ReceivedTable(
+        name="folder", path="/data/**/*.csv", file_type="csv", scan_mode="directory", table_settings=None
+    ).model_dump()
+
+    v = client.post("/create_table/csv", json=received_table)
+    assert v.status_code == 422
+    assert "Directory scan mode" in v.json()["detail"]
